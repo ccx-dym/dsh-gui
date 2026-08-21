@@ -1,3 +1,5 @@
+mod domain;
+
 /// 启动 DSH Desktop 的单一 Tauri 窗口。
 ///
 /// # 返回
