@@ -22,6 +22,7 @@ Windows 桌面软件的使用习惯。
 - 独立桌面窗口与系统托盘；
 - 关闭主窗口时隐藏到托盘，托盘“退出”才终止 DSH；
 - 官方 WebUI 原样运行，并叠加可关闭的沉浸式皮肤适配层；
+- 原创鲸鱼主题应用图标及 Windows 多尺寸图标集；
 - 软件预定义且与命令行版隔离的数据目录；
 - 精简在线安装包，首次运行时下载签名的兼容运行时；
 - 桌面壳更新、官方版本发现、兼容版 DSH 更新和失败回滚；
@@ -173,6 +174,25 @@ API Key、模型、会话和工作区信息继续由官方 DSH 管理。桌面�
 检查失败时撤销沉浸样式并回到官方界面。设置页显示当前版本“已验证”或“未验证”。
 任何皮肤错误只能降低视觉效果，不能阻断 DSH 启动或 Agent 操作。
 
+### 6.4 应用图标
+
+应用采用原创鲸鱼主题图标：独立的深蓝鲸鱼轮廓配青色尾鳍和腹部装饰，鲸身内置
+圆润的白色 `H`，表达 Harness。图标不复制 DeepSeek 官方鲸鱼的具体线条、比例
+或构图，也不使用官方文字标识。关于页需要明确标注本项目是非官方社区桌面客户端。
+
+图标使用透明背景和居中的方形构图。鲸鱼轮廓是 16×16 和托盘尺寸的主要识别
+元素；`H` 在极小尺寸下允许退化为辅助高光，不依赖其保持可读。项目资产包括：
+
+- `assets/icons/dsh-desktop-source.png`：1254×1254 RGBA 源图；
+- `assets/icons/dsh-desktop.ico`：包含 16、20、24、32、40、48、64、128 和
+  256 像素的 Windows ICO；
+- `assets/icons/icon-<size>.png`：上述各尺寸的独立 PNG，用于托盘、通知、窗口、
+  安装器和自动化视觉检查。
+
+发布前需要在 Windows 浅色与深色主题、100% 与高 DPI 缩放、开始菜单、任务栏、
+托盘和通知中分别检查轮廓与边缘。任何后续图标重制都必须保留原创性，并重新生成
+完整尺寸集，不能让 Windows 在运行时从单一大图临时缩放全部尺寸。
+
 ## 7. 更新与通知
 
 ### 7.1 更新通道
@@ -313,4 +333,3 @@ Bootstrapper 安装共享 Runtime。首个安装包只包含桌面壳、图标�
 - [Tauri Windows 安装器](https://v2.tauri.app/distribute/windows-installer/)
 - [Microsoft WebView2 概览](https://learn.microsoft.com/en-us/microsoft-edge/webview2/)
 - [Microsoft WebView2 进程模型](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-model)
-
