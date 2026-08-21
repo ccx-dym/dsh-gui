@@ -25,6 +25,54 @@ pub struct AppPaths {
     pub webview_data: PathBuf,
 }
 
+/// 已安装运行时、数据 generation 与激活指针的固定目录布局。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeLayout {
+    runtime_root: PathBuf,
+    generation_root: PathBuf,
+    deployment_file: PathBuf,
+}
+
+impl RuntimeLayout {
+    /// 从应用目录创建版本化运行时布局。
+    ///
+    /// :param paths: 已由系统根目录推导出的应用路径。
+    /// :return: 运行时、generation 与激活指针的路径值对象。
+    /// :raises: 此函数仅计算路径，不访问文件系统。
+    pub fn from_paths(paths: &AppPaths) -> Self {
+        Self {
+            runtime_root: paths.runtimes.join("dsh"),
+            generation_root: paths.dsh_home.join("generations"),
+            deployment_file: paths.settings.join("deployment.json"),
+        }
+    }
+
+    /// 返回某个已验证版本对应的不可变运行时目录。
+    ///
+    /// :param runtime: 已通过严格 semver 校验的运行时标识。
+    /// :return: `runtimes/dsh/<version>` 下的绝对目录。
+    /// :raises: 版本已在构造时校验，此函数不产生错误。
+    pub fn runtime_dir(
+        &self,
+        runtime: &crate::runtime::install_state::InstalledRuntime,
+    ) -> PathBuf {
+        self.runtime_root.join(runtime.version.to_string())
+    }
+
+    /// 返回某个已验证 generation 对应的数据目录。
+    ///
+    /// :param data: 不包含路径分隔符的 generation 标识。
+    /// :return: `dsh-home/generations/<id>` 下的绝对目录。
+    /// :raises: generation 已在构造时校验，此函数不产生错误。
+    pub fn generation_dir(&self, data: &crate::runtime::install_state::DataGeneration) -> PathBuf {
+        self.generation_root.join(&data.id)
+    }
+
+    pub(crate) fn deployment_file(&self) -> &Path {
+        &self.deployment_file
+    }
+}
+
 impl AppPaths {
     /// 根据 Windows 漫游目录与本地目录计算应用的固定目录布局。
     ///

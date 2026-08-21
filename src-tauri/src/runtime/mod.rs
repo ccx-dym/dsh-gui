@@ -1,5 +1,6 @@
 pub mod command;
 pub mod health;
+pub mod install_state;
 #[cfg(windows)]
 pub mod process;
 
