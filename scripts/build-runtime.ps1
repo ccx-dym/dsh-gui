@@ -38,8 +38,11 @@ $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $lockDirectory = Join-Path $repositoryRoot "runtime\locks\dsh-$DshVersion"
 $lockPath = Join-Path $lockDirectory 'package-lock.json'
 $packagePath = Join-Path $lockDirectory 'package.json'
+$installScriptsPath = Join-Path $lockDirectory 'install-scripts.json'
 
-if (-not (Test-Path -LiteralPath $lockPath) -or -not (Test-Path -LiteralPath $packagePath)) {
+if (-not (Test-Path -LiteralPath $lockPath) -or
+    -not (Test-Path -LiteralPath $packagePath) -or
+    -not (Test-Path -LiteralPath $installScriptsPath)) {
     throw "缺少已审查的 runtime lock：dsh-$DshVersion"
 }
 
@@ -48,6 +51,41 @@ $rootVersion = $lock['packages']['']['dependencies']['@deepseek-ai/dsh']
 $resolvedVersion = $lock['packages']['node_modules/@deepseek-ai/dsh']['version']
 if ($rootVersion -ne $DshVersion -or $resolvedVersion -ne $DshVersion) {
     throw 'package-lock root 或已解析 DSH 版本与 DshVersion 不符。'
+}
+
+# install scripts 能编译/下载原生组件，必须在接触发布输入或执行 npm 前与人工审查集合完全一致。
+$allowlist = Get-Content -Raw -LiteralPath $installScriptsPath | ConvertFrom-Json -AsHashtable -Depth 20
+if ($allowlist.Count -ne 2 -or $allowlist['schema'] -ne 1 -or $allowlist['packages'] -isnot [System.Collections.IList]) {
+    throw 'install-scripts allowlist 结构无效。'
+}
+$actualInstallScripts = @($lock['packages'].GetEnumerator() | Where-Object {
+    $_.Value['hasInstallScript'] -eq $true
+} | ForEach-Object {
+    $packageName = $_.Value['name']
+    if ([string]::IsNullOrEmpty($packageName)) {
+        $packageName = $_.Key.Substring($_.Key.LastIndexOf('node_modules/') + 13)
+    }
+    [ordered]@{
+        path = $_.Key
+        name = $packageName
+        version = $_.Value['version']
+        integrity = $_.Value['integrity']
+    }
+} | Sort-Object { $_['path'] })
+$approvedInstallScripts = @($allowlist['packages'] | Sort-Object { $_['path'] })
+if ($actualInstallScripts.Count -ne $approvedInstallScripts.Count) {
+    throw 'install-scripts allowlist 与 package-lock 不完全匹配。'
+}
+for ($index = 0; $index -lt $actualInstallScripts.Count; $index++) {
+    $actual = $actualInstallScripts[$index]
+    $approved = $approvedInstallScripts[$index]
+    if ($approved.Count -ne 4 -or
+        $actual.path -cne $approved['path'] -or
+        $actual.name -cne $approved['name'] -or
+        $actual.version -cne $approved['version'] -or
+        $actual.integrity -cne $approved['integrity']) {
+        throw 'install-scripts allowlist 与 package-lock 不完全匹配。'
+    }
 }
 
 $archivePath = [System.IO.Path]::GetFullPath($NodeArchive)
@@ -85,9 +123,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $nodeRoot 'node.exe') -PathType Leaf
 
 $appRoot = Join-Path $stageRoot 'app'
 New-Item -ItemType Directory -Path $appRoot | Out-Null
-Copy-Item -LiteralPath $packagePath, $lockPath -Destination $appRoot
+Copy-Item -LiteralPath $packagePath, $lockPath, $installScriptsPath -Destination $appRoot
 $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
-& (Join-Path $nodeRoot 'node.exe') $npmCli ci --prefix $appRoot --omit=dev --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+& (Join-Path $nodeRoot 'node.exe') $npmCli ci --prefix $appRoot --omit=dev --no-audit --no-fund --legacy-peer-deps
 if ($LASTEXITCODE -ne 0) { throw 'npm ci 安装 runtime 失败。' }
 
 $installedPackagePath = Join-Path $appRoot 'node_modules\@deepseek-ai\dsh\package.json'
@@ -116,7 +154,7 @@ $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
 $startInfo.Environment['DSH_HOME'] = $smokeHome
 $startInfo.Environment['NO_COLOR'] = '1'
-foreach ($argument in @($dshBin, 'web', '--host', '127.0.0.1', '--port', $smokePort.ToString())) {
+foreach ($argument in @($dshBin, 'web', '--host', '127.0.0.1', '--port', $smokePort.ToString(), '--no-open')) {
     $startInfo.ArgumentList.Add($argument)
 }
 $smokeProcess = [System.Diagnostics.Process]::Start($startInfo)

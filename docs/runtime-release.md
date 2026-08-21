@@ -23,6 +23,13 @@ SHA-256。制作阶段只执行 `npm ci`，不会用 `latest`、`npx`、全局�
 - 完整传递依赖的许可证。MIT 标识并不自动覆盖所有传递依赖，发布者仍需复核生成的
   `THIRD_PARTY_NOTICES.json`，并补充许可证正文或其他法务要求。
 
+不能用 `--ignore-scripts`：`node-pty`、`koffi` 和 DSH subprocess 等组件依赖安装脚本
+保留完整功能。每次 lock 变更都必须同时审查 `hasInstallScript=true` 的完整集合，并将
+package path、name、version、integrity 精确记录到 `install-scripts.json`。打包脚本会在
+`npm ci` 前严格比较两个集合；任何新增、删除、版本或 integrity 变化都会拒绝发布。
+这是供应链执行边界，发布 runner 必须隔离、无长期凭据，并预装与 Node 原生模块兼容的
+Visual C++ Build Tools。allowlist 只表示“已人工审查并允许执行”，不表示脚本天然安全。
+
 lock 审查完成后才能提交。发布制作不得再次运行 `npm install`。
 
 ## 制作与验证
@@ -39,7 +46,7 @@ pwsh -NoProfile -File scripts/build-runtime.ps1 `
   -WhatIf
 ```
 
-去掉 `-WhatIf` 才会创建固定 staging、运行 `npm ci --omit=dev`、核对已安装包、执行
+去掉 `-WhatIf` 才会创建固定 staging、运行允许安装脚本的 `npm ci --omit=dev`、核对已安装包、执行
 CLI help 与短时回环 Web smoke，最后生成 `inventory.json`、
 `THIRD_PARTY_NOTICES.json` 和 ZIP。输出目录必须为空，避免静默覆盖历史制品。
 

@@ -8,6 +8,8 @@ const lockPath = path.resolve(
 );
 const lock = JSON.parse(await readFile(lockPath, "utf8"));
 const packages = lock.packages;
+const allowlistPath = path.join(path.dirname(lockPath), "install-scripts.json");
+const allowlist = JSON.parse(await readFile(allowlistPath, "utf8"));
 
 assert.equal(lock.lockfileVersion, 3);
 assert.equal(packages[""].dependencies["@deepseek-ai/dsh"], "0.1.1-rc.1");
@@ -28,4 +30,19 @@ for (const [packagePath, metadata] of Object.entries(packages)) {
 }
 assert.deepEqual(missing, [], `lock 缺少 required dependency 条目:\n${missing.join("\n")}`);
 
-console.log(`runtime lock closure passed: ${Object.keys(packages).length} package entries`);
+const actualInstallScripts = Object.entries(packages)
+  .filter(([, metadata]) => metadata.hasInstallScript === true)
+  .map(([packagePath, metadata]) => ({
+    path: packagePath,
+    name: metadata.name ?? packagePath.slice(packagePath.lastIndexOf("node_modules/") + 13),
+    version: metadata.version,
+    integrity: metadata.integrity,
+  }))
+  .sort((left, right) => left.path.localeCompare(right.path));
+const approvedInstallScripts = [...allowlist.packages]
+  .sort((left, right) => left.path.localeCompare(right.path));
+assert.equal(allowlist.schema, 1);
+assert.equal(approvedInstallScripts.length, 5);
+assert.deepEqual(approvedInstallScripts, actualInstallScripts);
+
+console.log(`runtime lock closure passed: ${Object.keys(packages).length} package entries, ${actualInstallScripts.length} install scripts`);

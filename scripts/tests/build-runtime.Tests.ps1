@@ -52,11 +52,26 @@ Set-Content -LiteralPath $nodeArchive -Value 'not-a-real-node-archive' -NoNewlin
 Set-Content -LiteralPath (Join-Path $testLock 'package.json') -Value '{"private":true,"dependencies":{"@deepseek-ai/dsh":"0.1.1-rc.1"}}' -NoNewline
 $validLock = '{"lockfileVersion":3,"packages":{"":{"dependencies":{"@deepseek-ai/dsh":"0.1.1-rc.1"}},"node_modules/@deepseek-ai/dsh":{"name":"@deepseek-ai/dsh","version":"0.1.1-rc.1"}}}'
 Set-Content -LiteralPath (Join-Path $testLock 'package-lock.json') -Value $validLock -NoNewline
+Set-Content -LiteralPath (Join-Path $testLock 'install-scripts.json') -Value '{"schema":1,"packages":[]}' -NoNewline
 Assert-FailsWith -TargetScript $isolatedScript -Arguments @('-DshVersion', '0.1.1-rc.1', '-NodeArchive', $nodeArchive, '-NodeSha256', ('0' * 64), '-OutputDirectory', (Join-Path $testRoot 'out'), '-WhatIf') -Pattern '摘要不符'
 
 $wrongLock = $validLock.Replace('"0.1.1-rc.1"}}}', '"0.1.2"}}}')
 Set-Content -LiteralPath (Join-Path $testLock 'package-lock.json') -Value $wrongLock -NoNewline
 Assert-FailsWith -TargetScript $isolatedScript -Arguments @('-DshVersion', '0.1.1-rc.1', '-NodeArchive', $nodeArchive, '-NodeSha256', ('0' * 64), '-OutputDirectory', (Join-Path $testRoot 'out'), '-WhatIf') -Pattern 'lock|版本'
+
+$scriptedLock = '{"lockfileVersion":3,"packages":{"":{"dependencies":{"@deepseek-ai/dsh":"0.1.1-rc.1"}},"node_modules/@deepseek-ai/dsh":{"name":"@deepseek-ai/dsh","version":"0.1.1-rc.1"},"node_modules/native-addon":{"name":"native-addon","version":"1.0.0","integrity":"sha512-test","hasInstallScript":true}}}'
+Set-Content -LiteralPath (Join-Path $testLock 'package-lock.json') -Value $scriptedLock -NoNewline
+$approvedNative = '{"path":"node_modules/native-addon","name":"native-addon","version":"1.0.0","integrity":"sha512-test"}'
+$validNativeAllowlist = "{`"schema`":1,`"packages`":[${approvedNative}]}"
+foreach ($mismatchedAllowlist in @(
+    '{"schema":1,"packages":[]}',
+    "{`"schema`":1,`"packages`":[${approvedNative},{`"path`":`"node_modules/extra`",`"name`":`"extra`",`"version`":`"1.0.0`",`"integrity`":`"sha512-extra`"}]}",
+    $validNativeAllowlist.Replace('"version":"1.0.0"', '"version":"2.0.0"'),
+    $validNativeAllowlist.Replace('sha512-test', 'sha512-tampered')
+)) {
+    Set-Content -LiteralPath (Join-Path $testLock 'install-scripts.json') -Value $mismatchedAllowlist -NoNewline
+    Assert-FailsWith -TargetScript $isolatedScript -Arguments @('-DshVersion', '0.1.1-rc.1', '-NodeArchive', $nodeArchive, '-NodeSha256', ('0' * 64), '-OutputDirectory', (Join-Path $testRoot 'out'), '-WhatIf') -Pattern 'install|白名单|allowlist'
+}
 
 # 极小假 Node 只模拟发布脚本依赖的三个外部边界：npm ci、CLI help、回环 Web 200。
 $fakeRoot = Join-Path $testRoot 'fake-node-archive\node-v24.15.0-win-x64'
@@ -74,6 +89,7 @@ fn main() {
     if args.get(0).is_some_and(|value| value.ends_with("npm-cli.js"))
         && args.get(1).is_some_and(|value| value == "ci")
     {
+        if args.iter().any(|value| value == "--ignore-scripts") { std::process::exit(10); }
         let prefix = PathBuf::from(&args[args.iter().position(|value| value == "--prefix").unwrap() + 1]);
         let package = prefix.join("node_modules").join("@deepseek-ai").join("dsh");
         fs::create_dir_all(package.join("lib")).unwrap();
@@ -83,6 +99,7 @@ fn main() {
     }
     if args.iter().any(|value| value == "--help") { return; }
     if args.iter().any(|value| value == "web") {
+        if !args.iter().any(|value| value == "--no-open") { std::process::exit(11); }
         let port: u16 = args[args.iter().position(|value| value == "--port").unwrap() + 1].parse().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let (mut stream, _) = listener.accept().unwrap();
@@ -104,6 +121,7 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $fakeArchive) | Out-Null
 [System.IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $testRoot 'fake-node-archive'), $fakeArchive)
 $fakeDigest = (Get-FileHash -LiteralPath $fakeArchive -Algorithm SHA256).Hash
 Set-Content -LiteralPath (Join-Path $testLock 'package-lock.json') -Value $validLock -NoNewline
+Set-Content -LiteralPath (Join-Path $testLock 'install-scripts.json') -Value '{"schema":1,"packages":[]}' -NoNewline
 $runtimeOutput = Join-Path $testRoot 'runtime-out'
 $built = Invoke-BuildRuntimeTest -TargetScript $isolatedScript -Arguments @('-DshVersion', '0.1.1-rc.1', '-NodeArchive', $fakeArchive, '-NodeSha256', $fakeDigest, '-OutputDirectory', $runtimeOutput)
 if ($built.ExitCode -ne 0) {
@@ -114,7 +132,7 @@ if (-not (Test-Path -LiteralPath $runtimeZip -PathType Leaf)) {
     throw '端到端制作必须输出固定命名 ZIP'
 }
 $zipEntries = [System.IO.Compression.ZipFile]::OpenRead($runtimeZip).Entries.FullName
-foreach ($requiredEntry in @('inventory.json', 'THIRD_PARTY_NOTICES.json', 'app/package-lock.json')) {
+foreach ($requiredEntry in @('inventory.json', 'THIRD_PARTY_NOTICES.json', 'app/package-lock.json', 'app/install-scripts.json')) {
     if ($requiredEntry -notin $zipEntries) {
         throw "runtime ZIP 缺少 $requiredEntry"
     }
