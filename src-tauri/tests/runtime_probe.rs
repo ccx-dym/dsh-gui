@@ -1,14 +1,17 @@
 #![cfg(windows)]
 
+use dsh_desktop_lib::app_controller::ProbeLease;
 use dsh_desktop_lib::paths::{AppPaths, RuntimeLayout};
 use dsh_desktop_lib::runtime::command::RuntimeLaunchSpec;
 use dsh_desktop_lib::runtime::health::ReadyProbe;
-use dsh_desktop_lib::runtime::install_state::{DataGeneration, InstalledRuntime};
+use dsh_desktop_lib::runtime::install_state::{
+    ActiveDeployment, DataGeneration, InstallStateStore, InstalledRuntime,
+};
 use dsh_desktop_lib::runtime::process::StopOutcome;
 use dsh_desktop_lib::runtime::{ProcessLauncher, ReadinessSignal, RuntimeError, RuntimeProcess};
 use dsh_desktop_lib::update::probe::{
-    ProbeCancellation, ProbeErrorKind, ProbePhase, ProbePolicy, ProbeStorageInspector,
-    ProbeWorkspace, RuntimeProbe, RuntimeStoppedState,
+    ProbeCancellation, ProbeErrorKind, ProbePermissionInspector, ProbePhase, ProbePolicy,
+    ProbeStorageInspector, ProbeWorkspace, RuntimeProbe, read_passed_generation_state,
 };
 use semver::Version;
 use std::fs;
@@ -112,12 +115,38 @@ impl ProbeStorageInspector for PlentyOfSpace {
     }
 }
 
+struct SafePermissions;
+
+impl ProbePermissionInspector for SafePermissions {
+    fn ensure_private(&self, _path: &Path) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+}
+
+fn test_probe_with_dependencies(
+    policy: ProbePolicy,
+    launcher: Arc<dyn ProcessLauncher>,
+    health: Arc<dyn ReadyProbe>,
+    storage: Arc<dyn ProbeStorageInspector>,
+) -> Result<RuntimeProbe, dsh_desktop_lib::update::probe::ProbeError> {
+    RuntimeProbe::with_inspectors(policy, launcher, health, storage, Arc::new(SafePermissions))
+}
+
 struct NoSpace;
 
 impl ProbeStorageInspector for NoSpace {
     fn available_bytes(&self, _path: &Path) -> Result<u64, std::io::Error> {
         std::thread::sleep(Duration::from_millis(15));
         Ok(0)
+    }
+}
+
+struct SlowStorage;
+
+impl ProbeStorageInspector for SlowStorage {
+    fn available_bytes(&self, _path: &Path) -> Result<u64, std::io::Error> {
+        std::thread::sleep(Duration::from_millis(60));
+        Ok(u64::MAX)
     }
 }
 
@@ -169,14 +198,20 @@ impl Fixture {
     }
 
     fn workspace(&self) -> ProbeWorkspace {
+        InstallStateStore::new(self.layout.clone())
+            .save(&ActiveDeployment::new(
+                self.runtime.clone(),
+                self.active.clone(),
+                "2026-08-22T00:00:00Z".to_owned(),
+            ))
+            .expect("active deployment");
         ProbeWorkspace::new(
             self.layout.clone(),
             self.runtime.clone(),
             Version::parse("24.15.0").expect("node version"),
             self.candidate.clone(),
-            Some(self.active.clone()),
             self.workspace.clone(),
-            RuntimeStoppedState::ConfirmedStopped,
+            &ProbeLease::for_test(),
         )
         .expect("probe workspace")
     }
@@ -187,9 +222,8 @@ impl Fixture {
             self.runtime.clone(),
             Version::parse("24.15.0").expect("node version"),
             self.candidate.clone(),
-            None,
             self.workspace.clone(),
-            RuntimeStoppedState::ConfirmedStopped,
+            &ProbeLease::for_test(),
         )
         .expect("fresh probe workspace")
     }
@@ -205,7 +239,7 @@ fn probe(
 ) {
     let stops = Arc::new(AtomicUsize::new(0));
     let specs = Arc::new(Mutex::new(Vec::new()));
-    let probe = RuntimeProbe::with_dependencies(
+    let probe = test_probe_with_dependencies(
         ProbePolicy {
             timeout: Duration::from_millis(80),
             poll_interval: Duration::from_millis(10),
@@ -254,8 +288,11 @@ async fn empty_candidate_requires_both_readiness_gates_and_is_reclaimed() {
     );
     assert!(
         fixture
-            .candidate_dir
-            .join("generation-state-passed.json")
+            .layout
+            .generation_root()
+            .join(".state")
+            .join(&fixture.candidate.id)
+            .join("passed.json")
             .is_file()
     );
     let serialized = serde_json::to_value(&report).expect("safe report json");
@@ -279,6 +316,36 @@ async fn empty_candidate_requires_both_readiness_gates_and_is_reclaimed() {
     let text = serialized.to_string();
     assert!(!text.contains("http://"));
     assert!(!text.contains("secret.txt"));
+}
+
+#[tokio::test]
+async fn project_workspace_is_canonicalized_before_launch() {
+    let fixture = Fixture::new("canonical-workspace");
+    let workspace = ProbeWorkspace::new(
+        fixture.layout.clone(),
+        fixture.runtime.clone(),
+        Version::parse("24.15.0").expect("node version"),
+        fixture.candidate.clone(),
+        fixture.workspace.join("."),
+        &ProbeLease::for_test(),
+    )
+    .expect("workspace");
+    let (probe, _, specs) = probe(ProcessMode::Ready, true);
+
+    let report = probe
+        .probe(
+            workspace,
+            "trace_canonical_workspace".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("probe");
+
+    assert_eq!(report.phase, ProbePhase::Passed);
+    assert_eq!(
+        specs.lock().expect("specs")[0].cwd,
+        fixture.workspace.canonicalize().expect("canonical")
+    );
 }
 
 #[tokio::test]
@@ -341,7 +408,11 @@ async fn cancellation_interrupts_wait_and_reclaims_process_tree() {
     let fixture = Fixture::new("cancel");
     let (probe, stops, _) = probe(ProcessMode::NoStdout, false);
     let cancellation = ProbeCancellation::new();
-    cancellation.cancel();
+    let cancelling = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancelling.cancel();
+    });
 
     let report = probe
         .probe(fixture.workspace(), "trace_cancel".to_owned(), cancellation)
@@ -380,7 +451,7 @@ async fn insufficient_space_is_a_failed_report_before_any_process_starts() {
     let fixture = Fixture::new("no-space");
     let stops = Arc::new(AtomicUsize::new(0));
     let specs = Arc::new(Mutex::new(Vec::new()));
-    let probe = RuntimeProbe::with_dependencies(
+    let probe = test_probe_with_dependencies(
         ProbePolicy {
             timeout: Duration::from_millis(50),
             poll_interval: Duration::from_millis(10),
@@ -414,10 +485,91 @@ async fn insufficient_space_is_a_failed_report_before_any_process_starts() {
     assert!(specs.lock().expect("spec lock").is_empty());
     assert!(
         fixture
-            .candidate_dir
-            .join("generation-state-failed.json")
+            .layout
+            .generation_root()
+            .join(".state")
+            .join(&fixture.candidate.id)
+            .join("failed.json")
             .is_file()
     );
+}
+
+#[tokio::test]
+async fn cancellation_during_preflight_is_reported_without_launching() {
+    let fixture = Fixture::new("cancel-preflight");
+    let specs = Arc::new(Mutex::new(Vec::new()));
+    let probe = test_probe_with_dependencies(
+        ProbePolicy {
+            timeout: Duration::from_millis(200),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(FakeLauncher {
+            mode: ProcessMode::Ready,
+            stops: Arc::new(AtomicUsize::new(0)),
+            specs: Arc::clone(&specs),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(SlowStorage),
+    )
+    .expect("probe");
+    let cancellation = ProbeCancellation::new();
+    let cancelling = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancelling.cancel();
+    });
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_cancel_preflight".to_owned(),
+            cancellation,
+        )
+        .await
+        .expect("cancel report");
+
+    assert_eq!(report.error_kind, Some(ProbeErrorKind::Cancelled));
+    assert!(specs.lock().expect("specs").is_empty());
+}
+
+#[tokio::test]
+async fn total_deadline_includes_slow_preflight() {
+    let fixture = Fixture::new("deadline-preflight");
+    let specs = Arc::new(Mutex::new(Vec::new()));
+    let probe = test_probe_with_dependencies(
+        ProbePolicy {
+            timeout: Duration::from_millis(20),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(FakeLauncher {
+            mode: ProcessMode::Ready,
+            stops: Arc::new(AtomicUsize::new(0)),
+            specs: Arc::clone(&specs),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(SlowStorage),
+    )
+    .expect("probe");
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_deadline_preflight".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("deadline report");
+
+    assert_eq!(report.error_kind, Some(ProbeErrorKind::ReadinessTimeout));
+    assert!(specs.lock().expect("specs").is_empty());
 }
 
 #[tokio::test]
@@ -451,12 +603,12 @@ async fn empty_directory_fanout_counts_toward_candidate_entry_limit() {
     fs::create_dir_all(fixture.candidate_dir.join("two")).expect("second directory");
     let stops = Arc::new(AtomicUsize::new(0));
     let specs = Arc::new(Mutex::new(Vec::new()));
-    let probe = RuntimeProbe::with_dependencies(
+    let probe = test_probe_with_dependencies(
         ProbePolicy {
             timeout: Duration::from_millis(50),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
-            // Candidate 状态文件与两个空目录已经超过此总 entry 上限。
+            // 状态文件位于 candidate 外；两个空目录恰好不应超过此上限。
             max_files: 2,
             max_candidate_bytes: 1024,
             required_free_bytes: 1,
@@ -480,18 +632,29 @@ async fn empty_directory_fanout_counts_toward_candidate_entry_limit() {
         .await
         .expect("entry limit is reported");
 
-    assert_eq!(report.error_kind, Some(ProbeErrorKind::CandidateRejected));
-    assert!(specs.lock().expect("spec lock").is_empty());
+    assert_eq!(report.phase, ProbePhase::Passed);
+    assert_eq!(specs.lock().expect("spec lock").len(), 1);
 }
 
 #[tokio::test]
-async fn malformed_existing_candidate_state_is_not_treated_as_trusted() {
+async fn candidate_marker_from_a_different_trace_is_not_reused() {
     let fixture = Fixture::new("bad-state");
+    fs::create_dir_all(
+        fixture
+            .layout
+            .generation_root()
+            .join(".state")
+            .join(&fixture.candidate.id),
+    )
+    .expect("state dir");
     fs::write(
         fixture
-            .candidate_dir
-            .join("generation-state-candidate.json"),
-        br#"{"schema":99,"state":"candidate","trace_id":"old"}"#,
+            .layout
+            .generation_root()
+            .join(".state")
+            .join(&fixture.candidate.id)
+            .join("candidate.json"),
+        br#"{"schema":1,"candidate_id":"candidate-001","runtime_version":"0.1.1-rc.1","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"candidate","trace_id":"old"}"#,
     )
     .expect("bad state");
     let (probe, stops, specs) = probe(ProcessMode::Ready, true);
@@ -503,7 +666,7 @@ async fn malformed_existing_candidate_state_is_not_treated_as_trusted() {
             ProbeCancellation::new(),
         )
         .await
-        .expect_err("unknown state schema must fail closed");
+        .expect_err("a candidate marker cannot be rebound to a different trace");
 
     assert!(matches!(
         error,
@@ -511,6 +674,170 @@ async fn malformed_existing_candidate_state_is_not_treated_as_trusted() {
     ));
     assert_eq!(stops.load(Ordering::SeqCst), 0);
     assert!(specs.lock().expect("spec lock").is_empty());
+}
+
+struct UnsafePermissions;
+
+impl ProbePermissionInspector for UnsafePermissions {
+    fn ensure_private(&self, _path: &Path) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "broad write",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn unsafe_candidate_acl_is_rejected_before_process_launch() {
+    let fixture = Fixture::new("unsafe-acl");
+    let specs = Arc::new(Mutex::new(Vec::new()));
+    let probe = RuntimeProbe::with_inspectors(
+        ProbePolicy {
+            timeout: Duration::from_millis(80),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(FakeLauncher {
+            mode: ProcessMode::Ready,
+            stops: Arc::new(AtomicUsize::new(0)),
+            specs: Arc::clone(&specs),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(PlentyOfSpace),
+        Arc::new(UnsafePermissions),
+    )
+    .expect("policy");
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_acl".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("acl failure report");
+
+    assert_eq!(report.error_kind, Some(ProbeErrorKind::CandidateRejected));
+    assert!(specs.lock().expect("specs").is_empty());
+}
+
+#[tokio::test]
+async fn passed_state_reader_rejects_runtime_or_trace_substitution() {
+    let fixture = Fixture::new("passed-reader");
+    let (probe, _, _) = probe(ProcessMode::Ready, true);
+    let trace = "trace_passed_reader";
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            trace.to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("probe");
+    assert_eq!(report.phase, ProbePhase::Passed);
+    assert!(
+        read_passed_generation_state(&fixture.layout, &fixture.candidate, &fixture.runtime, trace,)
+            .is_ok()
+    );
+    let other = InstalledRuntime::new("0.1.2", "b".repeat(64)).expect("runtime");
+    assert!(
+        read_passed_generation_state(&fixture.layout, &fixture.candidate, &other, trace).is_err()
+    );
+    assert!(
+        read_passed_generation_state(
+            &fixture.layout,
+            &fixture.candidate,
+            &fixture.runtime,
+            "trace_other",
+        )
+        .is_err()
+    );
+}
+
+struct PanicHealth;
+
+impl ReadyProbe for PanicHealth {
+    fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<String, RuntimeError> {
+        panic!("health worker panic")
+    }
+}
+
+struct DropTrackedProcess {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for DropTrackedProcess {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl RuntimeProcess for DropTrackedProcess {
+    fn id(&self) -> u32 {
+        7
+    }
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError> {
+        Ok(None)
+    }
+    fn stop(&mut self, _grace: Duration) -> Result<StopOutcome, RuntimeError> {
+        Ok(StopOutcome::Terminated)
+    }
+    fn wait_for_readiness(
+        &mut self,
+        port: u16,
+        _timeout: Duration,
+    ) -> Result<ReadinessSignal, RuntimeError> {
+        Ok(ReadinessSignal::Web { port })
+    }
+}
+
+struct DropTrackedLauncher {
+    drops: Arc<AtomicUsize>,
+}
+
+impl ProcessLauncher for DropTrackedLauncher {
+    fn spawn(&self, _spec: &RuntimeLaunchSpec) -> Result<Box<dyn RuntimeProcess>, RuntimeError> {
+        Ok(Box::new(DropTrackedProcess {
+            drops: Arc::clone(&self.drops),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn panicking_health_worker_still_drops_managed_process() {
+    let fixture = Fixture::new("panic-drop");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let probe = test_probe_with_dependencies(
+        ProbePolicy {
+            timeout: Duration::from_millis(80),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(DropTrackedLauncher {
+            drops: Arc::clone(&drops),
+        }),
+        Arc::new(PanicHealth),
+        Arc::new(PlentyOfSpace),
+    )
+    .expect("probe");
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_panic".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("panic is stable report");
+
+    assert_eq!(report.error_kind, Some(ProbeErrorKind::WorkerFailed));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -533,9 +860,8 @@ fn candidate_directory_reparse_point_is_rejected_at_workspace_boundary() {
         fixture.runtime,
         Version::parse("24.15.0").expect("node version"),
         candidate,
-        Some(fixture.active),
         fixture.workspace,
-        RuntimeStoppedState::ConfirmedStopped,
+        &ProbeLease::for_test(),
     )
     .expect_err("candidate reparse point must fail closed");
 
@@ -546,8 +872,35 @@ fn candidate_directory_reparse_point_is_rejected_at_workspace_boundary() {
 }
 
 #[test]
+fn active_candidate_is_loaded_from_trusted_deployment_and_rejected() {
+    let fixture = Fixture::new("active-derived");
+    InstallStateStore::new(fixture.layout.clone())
+        .save(&ActiveDeployment::new(
+            fixture.runtime.clone(),
+            fixture.candidate.clone(),
+            "2026-08-22T00:00:00Z".to_owned(),
+        ))
+        .expect("active deployment");
+
+    let error = ProbeWorkspace::new(
+        fixture.layout,
+        fixture.runtime,
+        Version::parse("24.15.0").expect("node version"),
+        fixture.candidate,
+        fixture.workspace,
+        &ProbeLease::for_test(),
+    )
+    .expect_err("trusted active candidate must be rejected");
+
+    assert!(matches!(
+        error,
+        dsh_desktop_lib::update::probe::ProbeError::CandidateIsActive
+    ));
+}
+
+#[test]
 fn policy_rejects_unbounded_deadlines_before_health_probe_can_overflow() {
-    let result = RuntimeProbe::with_dependencies(
+    let result = test_probe_with_dependencies(
         ProbePolicy {
             timeout: Duration::MAX,
             poll_interval: Duration::MAX,
@@ -565,5 +918,30 @@ fn policy_rejects_unbounded_deadlines_before_health_probe_can_overflow() {
     assert!(matches!(
         result,
         Err(dsh_desktop_lib::update::probe::ProbeError::InvalidPolicy { field: "timeout" })
+    ));
+}
+
+#[test]
+fn policy_rejects_poll_intervals_above_cancellation_latency_bound() {
+    let result = test_probe_with_dependencies(
+        ProbePolicy {
+            timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(1_001),
+            ..ProbePolicy::default()
+        },
+        Arc::new(FakeLauncher {
+            mode: ProcessMode::Ready,
+            stops: Arc::new(AtomicUsize::new(0)),
+            specs: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(PlentyOfSpace),
+    );
+
+    assert!(matches!(
+        result,
+        Err(dsh_desktop_lib::update::probe::ProbeError::InvalidPolicy {
+            field: "poll_interval"
+        })
     ));
 }

@@ -185,9 +185,15 @@ create `src-tauri/tests/runtime_probe.rs`。
 2. probe 不负责复制数据，只接收 activator 在停止当前 DSH 后创建的一致 candidate
    generation；全新安装由 activator 创建空 generation。candidate 位于漫游数据根，
    继承当前用户 ACL，不放在可随意清理的 updates cache。
-3. 创建前检查磁盘空间、复制大小上限、reparse point 和敏感文件权限；candidate/旧
-   generation 明确标为 active、inactive 或 failed。阶段 2 不删除含凭据的 generation，
-   后续设置页清理必须列出精确目录并再次确认。
+3. Task 8 只验证 activator 已创建的 candidate；创建前空间/ACL 与快照职责属于 Task 9。
+   probe 会再次检查大小上限、reparse/hardlink、敏感文件 DACL，并以不共享 DELETE 的
+   目录句柄固定 candidate 身份。状态文件不写入 `DSH_HOME`，而是追加到固定的
+   `generations/.state/<candidate>/` 元数据目录；schema 1 严格绑定 candidate id、runtime
+   version、manifest digest、trace_id 与 state，同一次重试不得复用不同 trace 的 marker。
+   `ProbeLease` 由 `AppController` 原子签发；Task 9 必须保留原 lease 直到 deployment
+   提交完成，probe 内部的 clone 则覆盖完整 async 生命周期与最终状态落盘。
+   candidate/旧 generation 明确标为 active、inactive 或 failed。阶段 2 不删除含凭据的
+   generation，后续设置页清理必须列出精确目录并再次确认。
 4. `ProbeReport` 只含版本、阶段、耗时、重试、错误类型、trace_id，不含 prompt/key。
 5. Run：`cargo test --manifest-path src-tauri/Cargo.toml runtime_probe`。
 6. Commit：`feat: probe compatible runtimes on isolated data`。

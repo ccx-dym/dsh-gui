@@ -232,6 +232,43 @@ pub struct AppController {
     runtime: Arc<dyn RuntimeLifecycle>,
     status: Arc<RwLock<RuntimeStatus>>,
     exit_requested: AtomicBool,
+    operation_gate: Arc<AtomicBool>,
+}
+
+/// 独占一次已停止 runtime 的更新/探活窗口。
+///
+/// 值只能由 `AppController` 在原子确认 Idle/Failed 后签发；离开作用域时自动
+/// 释放门禁，避免调用方伪造“已停止”快照或在异步探活中途启动第二个 DSH。
+#[derive(Clone, Debug)]
+pub struct ProbeLease {
+    _guard: Arc<OperationGuard>,
+}
+
+#[derive(Debug)]
+struct OperationGuard {
+    gate: Arc<AtomicBool>,
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        self.gate.store(false, Ordering::Release);
+    }
+}
+
+impl ProbeLease {
+    /// 创建仅供 debug/integration 测试使用的独立 lease。
+    ///
+    /// 正式 release 构建不会编译此入口，生产 lease 只能由 `AppController` 签发。
+    ///
+    /// :return: 与独立测试门禁绑定的 lease。
+    /// :raises: 此测试构造器不产生错误。
+    #[cfg(debug_assertions)]
+    pub fn for_test() -> Self {
+        let gate = Arc::new(AtomicBool::new(true));
+        Self {
+            _guard: Arc::new(OperationGuard { gate }),
+        }
+    }
 }
 
 impl AppController {
@@ -263,6 +300,7 @@ impl AppController {
             runtime,
             status,
             exit_requested: AtomicBool::new(false),
+            operation_gate: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -272,6 +310,7 @@ impl AppController {
             runtime,
             status: Arc::new(RwLock::new(initial_runtime_status(true))),
             exit_requested: AtomicBool::new(false),
+            operation_gate: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -291,6 +330,7 @@ impl AppController {
     /// :return: 启动任务成功提交到后台线程时返回 `Ok(())`。
     /// :raises RuntimeError: 正式构建调用、目录创建、端口申请或重复启动时返回。
     pub fn start_mock_runtime(&self) -> Result<(), RuntimeError> {
+        let _guard = self.acquire_operation()?;
         self.runtime.start()
     }
 
@@ -307,6 +347,11 @@ impl AppController {
     /// :return: 运行时已完整停止时返回 `Ok(())`。
     /// :raises RuntimeError: 运行时停止失败时原样返回。
     pub fn stop(&self) -> Result<(), RuntimeError> {
+        let _guard = self.acquire_operation()?;
+        self.stop_under_gate()
+    }
+
+    fn stop_under_gate(&self) -> Result<(), RuntimeError> {
         self.runtime.stop()?;
         let mut status = self
             .status
@@ -325,8 +370,9 @@ impl AppController {
     /// :return: 新启动任务成功提交时返回 `Ok(())`。
     /// :raises RuntimeError: 停止或重新启动任一步失败时返回，后一步不会越过前一步。
     pub fn restart(&self) -> Result<(), RuntimeError> {
-        self.stop()?;
-        self.start_mock_runtime()
+        let _guard = self.acquire_operation()?;
+        self.stop_under_gate()?;
+        self.runtime.start()
     }
 
     /// 请求显式退出；只有运行时停止成功后才开放窗口/应用退出。
@@ -334,7 +380,8 @@ impl AppController {
     /// :return: 运行时已停止且退出标志已提交时返回 `Ok(())`。
     /// :raises RuntimeError: 停止失败时返回且退出标志保持 false。
     pub fn request_exit(&self) -> Result<(), RuntimeError> {
-        self.stop()?;
+        let _guard = self.acquire_operation()?;
+        self.stop_under_gate()?;
         self.exit_requested.store(true, Ordering::Release);
         Ok(())
     }
@@ -347,24 +394,32 @@ impl AppController {
         self.exit_requested.load(Ordering::Acquire)
     }
 
-    /// 只读确认当前控制器状态允许隔离 runtime 探活。
+    /// 原子确认当前控制器状态并独占隔离 runtime 探活窗口。
     ///
     /// Task 9 的激活器负责先执行 stop；此门禁只阻止在 Starting、Ready 或 Stopping
     /// 状态下误启第二个 DSH，不会自行停止进程，也不会触发 WebView 导航。
     ///
     /// :return: Idle/Failed 快照返回已确认停止的值对象。
     /// :raises RuntimeError: 当前 runtime 可能正在启动、运行或停止时拒绝探活。
-    pub fn runtime_stopped_for_probe(
-        &self,
-    ) -> Result<crate::update::probe::RuntimeStoppedState, RuntimeError> {
+    pub fn runtime_stopped_for_probe(&self) -> Result<ProbeLease, RuntimeError> {
+        let guard = self.acquire_operation()?;
         match self.status().phase {
-            crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => {
-                Ok(crate::update::probe::RuntimeStoppedState::ConfirmedStopped)
-            }
+            crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => Ok(ProbeLease {
+                _guard: Arc::new(guard),
+            }),
             crate::domain::AppPhase::Starting
             | crate::domain::AppPhase::Ready
             | crate::domain::AppPhase::Stopping => Err(RuntimeError::ProbeRequiresStoppedRuntime),
         }
+    }
+
+    fn acquire_operation(&self) -> Result<OperationGuard, RuntimeError> {
+        self.operation_gate
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| RuntimeError::ProbeOperationInProgress)?;
+        Ok(OperationGuard {
+            gate: Arc::clone(&self.operation_gate),
+        })
     }
 }
 
@@ -395,6 +450,7 @@ mod tests {
     };
     use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
     use crate::runtime::{RuntimeError, RuntimeEventSink};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 
     #[derive(Default)]
@@ -504,12 +560,10 @@ mod tests {
     fn probe_gate_allows_only_a_stopped_runtime_snapshot() {
         let runtime = Arc::new(RecordingRuntime::default());
         let controller = AppController::for_test(runtime);
-        assert_eq!(
-            controller
-                .runtime_stopped_for_probe()
-                .expect("idle is stopped"),
-            crate::update::probe::RuntimeStoppedState::ConfirmedStopped
-        );
+        let lease = controller
+            .runtime_stopped_for_probe()
+            .expect("idle is stopped");
+        drop(lease);
 
         controller.status.write().expect("status lock").phase = AppPhase::Ready;
         assert!(matches!(
@@ -528,6 +582,79 @@ mod tests {
 
         assert_eq!(controller.status().phase, AppPhase::Idle);
         assert!(controller.runtime_stopped_for_probe().is_ok());
+    }
+
+    #[test]
+    fn active_probe_lease_blocks_start_and_releases_on_drop() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime.clone());
+        let lease = controller
+            .runtime_stopped_for_probe()
+            .expect("idle controller should issue one lease");
+
+        assert!(matches!(
+            controller.start_mock_runtime(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        assert!(matches!(
+            controller.runtime_stopped_for_probe(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        assert!(runtime.calls.lock().expect("calls").is_empty());
+
+        let retained_for_activation = lease.clone();
+        drop(lease);
+        assert!(matches!(
+            controller.start_mock_runtime(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        drop(retained_for_activation);
+        controller
+            .start_mock_runtime()
+            .expect("dropping lease must reopen lifecycle operations");
+        assert_eq!(*runtime.calls.lock().expect("calls"), vec!["start"]);
+    }
+
+    #[test]
+    fn restart_cannot_stop_a_runtime_while_probe_lease_is_active() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime.clone());
+        let _lease = controller.runtime_stopped_for_probe().expect("lease");
+
+        assert!(matches!(
+            controller.restart(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        assert!(runtime.calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn exit_request_holds_operation_gate_until_exit_flag_is_committed() {
+        struct InspectingRuntime {
+            gate: Arc<AtomicBool>,
+        }
+        impl RuntimeLifecycle for InspectingRuntime {
+            fn start(&self) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+            fn stop(&self) -> Result<(), RuntimeError> {
+                assert!(self.gate.load(Ordering::Acquire));
+                Ok(())
+            }
+        }
+        let gate = Arc::new(AtomicBool::new(false));
+        let controller = AppController {
+            runtime: Arc::new(InspectingRuntime {
+                gate: Arc::clone(&gate),
+            }),
+            status: Arc::new(RwLock::new(initial_runtime_status(true))),
+            exit_requested: AtomicBool::new(false),
+            operation_gate: Arc::clone(&gate),
+        };
+
+        controller.request_exit().expect("exit");
+        assert!(controller.exit_requested());
+        assert!(!gate.load(Ordering::Acquire));
     }
 
     #[derive(Default)]

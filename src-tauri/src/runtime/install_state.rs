@@ -51,14 +51,45 @@ pub struct DataGeneration {
 impl DataGeneration {
     /// 校验并创建单段 generation 标识。
     ///
-    /// :param id: 仅含 ASCII 字母、数字、点、下划线或连字符的目录名。
+    /// :param id: 仅含 ASCII 字母、数字、点、下划线或连字符，且不占用内部
+    ///   `.state`/`.dsh-internal-*` 命名空间的目录名。
     /// :return: 不可能逃逸 generation 根目录的数据标识。
     /// :raises InstallStateError: 标识为空、是保留路径段或含其他字符时返回
     ///   `InvalidGeneration`。
     pub fn new(id: &str) -> Result<Self, InstallStateError> {
+        let windows_stem = id.split('.').next().unwrap_or_default();
+        let reserved_device = matches!(
+            windows_stem.to_ascii_uppercase().as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        );
         let valid = !id.is_empty()
             && id != "."
             && id != ".."
+            && !id.ends_with('.')
+            && !id.eq_ignore_ascii_case(".state")
+            && !id.to_ascii_lowercase().starts_with(".dsh-internal-")
+            && !reserved_device
             && id
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
@@ -512,7 +543,21 @@ mod tests {
 
     #[test]
     fn generation_id_rejects_path_components() {
-        for invalid in ["", ".", "..", "a/b", r"a\b", "C:escape"] {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            ".state",
+            ".STATE",
+            ".state.",
+            ".dsh-internal-x",
+            ".DSH-INTERNAL-x",
+            "CON",
+            "nul.json",
+            "a/b",
+            r"a\b",
+            "C:escape",
+        ] {
             assert!(matches!(
                 DataGeneration::new(invalid),
                 Err(InstallStateError::InvalidGeneration { .. })

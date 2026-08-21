@@ -52,6 +52,8 @@ pub enum RuntimeError {
     InvalidLoopbackPort { port: u16 },
     #[error("探活前必须先完整停止当前 DSH")]
     ProbeRequiresStoppedRuntime,
+    #[error("运行时更新或探活操作正在进行")]
+    ProbeOperationInProgress,
 }
 
 impl RuntimeError {
@@ -76,6 +78,7 @@ impl RuntimeError {
             Self::InvalidLaunchPath { .. } => "invalid_launch_path",
             Self::InvalidLoopbackPort { .. } => "invalid_loopback_port",
             Self::ProbeRequiresStoppedRuntime => "probe_requires_stopped_runtime",
+            Self::ProbeOperationInProgress => "probe_operation_in_progress",
         }
     }
 }
@@ -88,6 +91,9 @@ pub enum ReadinessSignal {
 }
 
 /// 抽象受管子进程，使状态机测试不依赖真实 Windows 进程。
+///
+/// 实现必须在 `Drop` 中尽力回收完整进程树；调用方可在正常路径显式调用
+/// `stop` 获取结果，但 worker panic 或提前返回时仍不得遗留后台进程。
 pub trait RuntimeProcess: Send {
     fn id(&self) -> u32;
     fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError>;
