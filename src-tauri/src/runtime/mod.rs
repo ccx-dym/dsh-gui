@@ -50,6 +50,8 @@ pub enum RuntimeError {
     },
     #[error("无效的动态回环端口: {port}")]
     InvalidLoopbackPort { port: u16 },
+    #[error("探活前必须先完整停止当前 DSH")]
+    ProbeRequiresStoppedRuntime,
 }
 
 impl RuntimeError {
@@ -73,6 +75,7 @@ impl RuntimeError {
             Self::OutputReadinessTimeout { .. } => "output_readiness_timeout",
             Self::InvalidLaunchPath { .. } => "invalid_launch_path",
             Self::InvalidLoopbackPort { .. } => "invalid_loopback_port",
+            Self::ProbeRequiresStoppedRuntime => "probe_requires_stopped_runtime",
         }
     }
 }

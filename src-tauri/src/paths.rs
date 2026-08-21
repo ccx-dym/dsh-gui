@@ -68,6 +68,22 @@ impl RuntimeLayout {
         self.generation_root.join(&data.id)
     }
 
+    /// 返回所有隔离数据 generation 的固定根目录。
+    ///
+    /// :return: `dsh-home/generations` 路径。
+    /// :raises: 此只读访问不产生错误。
+    pub fn generation_root(&self) -> &Path {
+        &self.generation_root
+    }
+
+    /// 返回所有不可变 DSH runtime 的固定根目录。
+    ///
+    /// :return: `runtimes/dsh` 路径。
+    /// :raises: 此只读访问不产生错误。
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+
     pub(crate) fn deployment_file(&self) -> &Path {
         &self.deployment_file
     }

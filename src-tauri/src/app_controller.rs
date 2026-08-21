@@ -307,7 +307,17 @@ impl AppController {
     /// :return: 运行时已完整停止时返回 `Ok(())`。
     /// :raises RuntimeError: 运行时停止失败时原样返回。
     pub fn stop(&self) -> Result<(), RuntimeError> {
-        self.runtime.stop()
+        self.runtime.stop()?;
+        let mut status = self
+            .status
+            .write()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        *status = RuntimeStatus {
+            phase: crate::domain::AppPhase::Idle,
+            message: "DSH 已停止".to_owned(),
+            ..RuntimeStatus::default()
+        };
+        Ok(())
     }
 
     /// 先完整停止旧运行时，再重新生成启动参数并启动。
@@ -335,6 +345,26 @@ impl AppController {
     /// :raises: 原子只读操作不产生错误。
     pub fn exit_requested(&self) -> bool {
         self.exit_requested.load(Ordering::Acquire)
+    }
+
+    /// 只读确认当前控制器状态允许隔离 runtime 探活。
+    ///
+    /// Task 9 的激活器负责先执行 stop；此门禁只阻止在 Starting、Ready 或 Stopping
+    /// 状态下误启第二个 DSH，不会自行停止进程，也不会触发 WebView 导航。
+    ///
+    /// :return: Idle/Failed 快照返回已确认停止的值对象。
+    /// :raises RuntimeError: 当前 runtime 可能正在启动、运行或停止时拒绝探活。
+    pub fn runtime_stopped_for_probe(
+        &self,
+    ) -> Result<crate::update::probe::RuntimeStoppedState, RuntimeError> {
+        match self.status().phase {
+            crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => {
+                Ok(crate::update::probe::RuntimeStoppedState::ConfirmedStopped)
+            }
+            crate::domain::AppPhase::Starting
+            | crate::domain::AppPhase::Ready
+            | crate::domain::AppPhase::Stopping => Err(RuntimeError::ProbeRequiresStoppedRuntime),
+        }
     }
 }
 
@@ -468,6 +498,36 @@ mod tests {
                 error_code: None,
             }
         );
+    }
+
+    #[test]
+    fn probe_gate_allows_only_a_stopped_runtime_snapshot() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime);
+        assert_eq!(
+            controller
+                .runtime_stopped_for_probe()
+                .expect("idle is stopped"),
+            crate::update::probe::RuntimeStoppedState::ConfirmedStopped
+        );
+
+        controller.status.write().expect("status lock").phase = AppPhase::Ready;
+        assert!(matches!(
+            controller.runtime_stopped_for_probe(),
+            Err(RuntimeError::ProbeRequiresStoppedRuntime)
+        ));
+    }
+
+    #[test]
+    fn successful_stop_changes_ready_snapshot_to_probe_safe_idle() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime);
+        controller.status.write().expect("status lock").phase = AppPhase::Ready;
+
+        controller.stop().expect("stop succeeds");
+
+        assert_eq!(controller.status().phase, AppPhase::Idle);
+        assert!(controller.runtime_stopped_for_probe().is_ok());
     }
 
     #[derive(Default)]
