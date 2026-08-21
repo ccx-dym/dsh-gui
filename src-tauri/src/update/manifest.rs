@@ -1,7 +1,9 @@
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
 use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 use thiserror::Error;
 use url::Url;
 
@@ -95,6 +97,47 @@ impl ManifestVerifier {
     /// :return: 类型化清单及同一原始字节的 SHA-256 摘要。
     /// :raises ManifestError: 签名、JSON 结构或任一安全字段不符合约束时返回。
     pub fn verify(
+        &self,
+        manifest_bytes: &[u8],
+        signature_hex: &str,
+    ) -> Result<VerifiedManifest, ManifestError> {
+        self.verify_with_context(
+            manifest_bytes,
+            signature_hex,
+            &DiagnosticContext::noop(TraceKind::Update),
+        )
+    }
+
+    /// 使用调用方操作上下文验证清单，使同一 trace 可贯穿后续下载与激活。
+    ///
+    /// :param manifest_bytes: 网络返回的原始清单字节，不进入诊断事件。
+    /// :param signature_hex: detached signature，不进入诊断事件。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 签名与字段均通过验证的清单。
+    /// :raises ManifestError: 与 `verify` 相同的稳定验证错误。
+    pub fn verify_with_context(
+        &self,
+        manifest_bytes: &[u8],
+        signature_hex: &str,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<VerifiedManifest, ManifestError> {
+        let started = Instant::now();
+        diagnostics.record(DiagnosticStage::ManifestVerify, 0, 0, None, None);
+        let result = self.verify_inner(manifest_bytes, signature_hex);
+        diagnostics.record(
+            DiagnosticStage::ManifestVerify,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
+    }
+
+    fn verify_inner(
         &self,
         manifest_bytes: &[u8],
         signature_hex: &str,

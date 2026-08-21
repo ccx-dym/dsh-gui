@@ -1,6 +1,7 @@
 use crate::app_controller::AppController;
 use crate::diagnostics::{
-    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, DiagnosticTraceId,
+    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, FileDiagnosticSink,
+    OperationTrace, TraceKind,
 };
 use crate::runtime::RuntimeError;
 use tauri::menu::MenuBuilder;
@@ -195,7 +196,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), RuntimeError> {
 
 /// 仅把可信托盘动作与稳定错误码送入结构化日志，不传递底层错误正文。
 fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: DiagnosticErrorKind) {
-    let Some(sink) = app.try_state::<DiagnosticSink>() else {
+    let Some(sink) = app.try_state::<FileDiagnosticSink>() else {
         return;
     };
     let stage = match action {
@@ -204,12 +205,9 @@ fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: Diagnost
         TrayAction::Restart => DiagnosticStage::TrayRestart,
         TrayAction::Exit => DiagnosticStage::TrayExit,
     };
-    let trace_id = format!("desktop-{}", std::process::id());
-    let Ok(trace_id) = DiagnosticTraceId::parse(&trace_id) else {
-        return;
-    };
+    let trace = OperationTrace::begin(TraceKind::Runtime);
     let event = DiagnosticEvent::new(
-        trace_id,
+        &trace,
         stage,
         0,
         0,

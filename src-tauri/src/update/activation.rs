@@ -28,6 +28,7 @@ impl RuntimeBusyProvider for UnknownRuntimeBusyProvider {
 }
 
 use crate::app_controller::{ActivationSession, ProbeLease};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 use crate::paths::RuntimeLayout;
 use crate::runtime::RuntimeError;
 use crate::runtime::atomic_file::replace_file;
@@ -100,6 +101,35 @@ pub trait ActivationProbe: Send + Sync {
         trace_id: &'a str,
         lease: ProbeLease,
     ) -> BoxFuture<'a, Result<(), ActivationError>>;
+
+    /// 使用共享诊断上下文执行 probe；第三方实现默认保持原行为。
+    ///
+    /// :param layout: 固定 runtime/data 布局。
+    /// :param runtime: 目标运行时描述。
+    /// :param candidate: 隔离数据 generation。
+    /// :param project_workspace: 已验证项目目录。
+    /// :param lease: 激活事务持有的 probe lease。
+    /// :param diagnostics: 同一次激活共享的诊断上下文。
+    /// :return: probe 通过时返回空结果。
+    /// :raises ActivationError: workspace 或探活失败时返回。
+    fn probe_with_context<'a>(
+        &'a self,
+        layout: &'a RuntimeLayout,
+        runtime: &'a InstalledRuntime,
+        candidate: &'a DataGeneration,
+        project_workspace: &'a Path,
+        lease: ProbeLease,
+        diagnostics: &'a DiagnosticContext,
+    ) -> BoxFuture<'a, Result<(), ActivationError>> {
+        self.probe(
+            layout,
+            runtime,
+            candidate,
+            project_workspace,
+            diagnostics.trace_str(),
+            lease,
+        )
+    }
 }
 
 /// 将 Task 8 的真实异步 probe 接入激活事务。
@@ -148,6 +178,62 @@ impl ActivationProbe for RuntimeProbeAdapter {
             Ok(())
         }
         .boxed()
+    }
+
+    fn probe_with_context<'a>(
+        &'a self,
+        layout: &'a RuntimeLayout,
+        runtime: &'a InstalledRuntime,
+        candidate: &'a DataGeneration,
+        project_workspace: &'a Path,
+        lease: ProbeLease,
+        diagnostics: &'a DiagnosticContext,
+    ) -> BoxFuture<'a, Result<(), ActivationError>> {
+        async move {
+            let workspace = ProbeWorkspace::new(
+                layout.clone(),
+                runtime.clone(),
+                runtime.node_version.clone(),
+                candidate.clone(),
+                project_workspace.to_path_buf(),
+                &lease,
+            )?;
+            let report = self
+                .probe
+                .probe_with_context(workspace, ProbeCancellation::new(), diagnostics)
+                .await?;
+            if report.phase != ProbePhase::Passed {
+                return Err(ActivationError::ProbeRejected);
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+struct ContextualActivationProbe<'a> {
+    inner: &'a dyn ActivationProbe,
+    diagnostics: &'a DiagnosticContext,
+}
+
+impl ActivationProbe for ContextualActivationProbe<'_> {
+    fn probe<'a>(
+        &'a self,
+        layout: &'a RuntimeLayout,
+        runtime: &'a InstalledRuntime,
+        candidate: &'a DataGeneration,
+        project_workspace: &'a Path,
+        _trace_id: &'a str,
+        lease: ProbeLease,
+    ) -> BoxFuture<'a, Result<(), ActivationError>> {
+        self.inner.probe_with_context(
+            layout,
+            runtime,
+            candidate,
+            project_workspace,
+            lease,
+            self.diagnostics,
+        )
     }
 }
 
@@ -521,6 +607,54 @@ impl RuntimeActivator {
         }
     }
 
+    /// 使用同一类型化 trace 执行 snapshot、probe、commit 与回滚事务。
+    ///
+    /// :param session: 已取得的独占激活会话。
+    /// :param request: 目标 runtime/data；旧 trace 会被安全覆盖。
+    /// :param probe: 隔离运行时探活边界。
+    /// :param checkpoints: 崩溃点测试与 journal 边界。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 激活、回滚或 fresh 失败终态。
+    /// :raises ActivationError: snapshot、probe、pointer 或恢复失败时返回。
+    pub async fn activate_with_context(
+        &self,
+        session: ActivationSession,
+        mut request: ActivationRequest,
+        probe: &dyn ActivationProbe,
+        checkpoints: &dyn ActivationCheckpointSink,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<ActivationOutcome, ActivationError> {
+        request.trace_id = diagnostics.trace_str().to_owned();
+        let started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::ActivationPrepare, 0, 0, None, None);
+        diagnostics.record(DiagnosticStage::SnapshotPrepare, 0, 0, None, None);
+        let contextual_probe = ContextualActivationProbe {
+            inner: probe,
+            diagnostics,
+        };
+        let result = self
+            .activate(session, request, &contextual_probe, checkpoints)
+            .await;
+        let stage = match &result {
+            Ok(ActivationOutcome::Activated) => DiagnosticStage::ActivationCommit,
+            Ok(ActivationOutcome::RolledBack { .. })
+            | Ok(ActivationOutcome::FreshInstallFailed { .. })
+            | Err(_) => DiagnosticStage::ActivationRollback,
+            Ok(_) => DiagnosticStage::ActivationCommit,
+        };
+        diagnostics.record(
+            stage,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
+    }
+
     /// 恢复唯一未完成 journal；不删除 runtime、generation 或 journal。
     ///
     /// :param session: 启动阶段取得的独占激活会话。
@@ -622,6 +756,33 @@ impl RuntimeActivator {
             .clone()
             .unwrap_or_else(ActivationFailure::interrupted_resume);
         Err(self.recovery_required(&mut journal, failure, "pointer_mismatch"))
+    }
+
+    /// 使用类型化上下文恢复未完成 journal，且不记录 journal 内容或路径。
+    ///
+    /// :param session: 启动恢复阶段取得的独占会话。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 恢复后的明确终态。
+    /// :raises ActivationError: journal、pointer 或 runtime 恢复失败时返回。
+    pub async fn recover_with_context(
+        &self,
+        session: ActivationSession,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<ActivationOutcome, ActivationError> {
+        let started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::ActivationRecovery, 0, 0, None, None);
+        let result = self.recover(session).await;
+        diagnostics.record(
+            DiagnosticStage::ActivationRecovery,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
     }
 
     async fn rollback_failed_start(

@@ -249,14 +249,16 @@ describe("启动页", () => {
     expect(retry.getAttribute("aria-busy")).toBe("true");
   });
 
-  it("运行时重试失败时显示错误并恢复按钮", async () => {
+  it("运行时重试失败时不显示 bridge 返回的敏感正文", async () => {
     tauriMocks.invoke
       .mockResolvedValueOnce({
         phase: "failed",
         message: "启动超时",
         errorCode: "health_timeout",
       })
-      .mockRejectedValueOnce('<img src=x onerror="alert(1)">');
+      .mockRejectedValueOnce(
+        "Authorization: Bearer sk-proj-secret https://host/?api_key=x C:\\用户\\私密.json",
+      );
 
     await import("./main");
     const retry = await vi.waitFor(() => {
@@ -271,13 +273,34 @@ describe("启动页", () => {
     await vi.waitFor(() => {
       expect(
         document.querySelector("[data-status-message]")?.textContent,
-      ).toBe('重试失败：<img src=x onerror="alert(1)">');
+      ).toBe("重试失败，请稍后再试");
     });
     const restored = document.querySelector<HTMLButtonElement>(
       "[data-action='retry']",
     );
     expect(restored?.disabled).toBe(false);
     expect(restored?.hasAttribute("aria-busy")).toBe(false);
-    expect(document.querySelector("img[src='x']")).toBeNull();
+    expect(document.body.textContent).not.toContain("Authorization");
+    expect(document.body.textContent).not.toContain("api_key");
+    expect(document.body.textContent).not.toContain("用户");
+  });
+
+  it("状态初始化失败时不显示 bridge 返回的敏感正文", async () => {
+    tauriMocks.invoke.mockRejectedValueOnce(
+      new Error(
+        "AKIAIOSFODNN7EXAMPLE https://host/?token=x C:\\用户\\私密.json",
+      ),
+    );
+
+    await import("./main");
+
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector("[data-status-message]")?.textContent,
+      ).toBe("暂时无法读取运行状态");
+    });
+    expect(document.body.textContent).not.toContain("AKIA");
+    expect(document.body.textContent).not.toContain("token");
+    expect(document.body.textContent).not.toContain("用户");
   });
 });

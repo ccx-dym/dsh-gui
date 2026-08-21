@@ -19,6 +19,7 @@ use super::{
     manifest::VerifiedManifest,
     version_source::{CompatibilitySource, OfficialVersionSource, SourceError},
 };
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
 use crate::domain::UpdateNotice;
 
 const UPDATE_STATE_SCHEMA: u32 = 1;
@@ -289,31 +290,93 @@ impl UpdateCoordinator {
         &self,
         current: Option<&Version>,
     ) -> Result<UpdateCheckResult, UpdateStateError> {
+        self.check_with_context(current, &DiagnosticContext::noop(TraceKind::Update))
+            .await
+    }
+
+    /// 使用共享诊断上下文执行官方与兼容检查。
+    ///
+    /// :param current: 当前已安装版本，首次安装为 None。
+    /// :param diagnostics: 同一次更新操作共享的类型化上下文。
+    /// :return: 更新通知、受信清单与持久化调度结果。
+    /// :raises UpdateStateError: 状态或时钟失败时返回稳定错误。
+    pub async fn check_with_context(
+        &self,
+        current: Option<&Version>,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<UpdateCheckResult, UpdateStateError> {
+        let started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::UpdateCheck, 0, 0, None, None);
         let _guard = self.check_lock.lock().await;
-        let state = self.state_store.load().await?;
-        self.check_with_state(current, state).await
+        let result = match self.state_store.load().await {
+            Ok(state) => self.check_with_state(current, state, diagnostics).await,
+            Err(error) => Err(error),
+        };
+        diagnostics.record(
+            DiagnosticStage::UpdateCheck,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
     }
 
     async fn check_with_state(
         &self,
         current: Option<&Version>,
         mut state: PersistedUpdateState,
+        diagnostics: &DiagnosticContext,
     ) -> Result<UpdateCheckResult, UpdateStateError> {
-        let (notice, manifest) = match self.official.latest().await {
+        let official_started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::OfficialCheck, 0, 0, None, None);
+        let official_result = self.official.latest().await;
+        diagnostics.record(
+            DiagnosticStage::OfficialCheck,
+            official_started.elapsed().as_millis() as u64,
+            0,
+            None,
+            official_result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        let (notice, manifest) = match official_result {
             Err(error) => (failed_notice(current, None, &error), None),
-            Ok(official) => match self.compatibility.latest_compatible().await {
-                Err(error) => (
-                    failed_notice(current, Some(&official.version), &error),
+            Ok(official) => {
+                let compatibility_started = std::time::Instant::now();
+                diagnostics.record(DiagnosticStage::CompatibilityCheck, 0, 0, None, None);
+                let compatibility_result = self
+                    .compatibility
+                    .latest_compatible_with_context(diagnostics)
+                    .await;
+                diagnostics.record(
+                    DiagnosticStage::CompatibilityCheck,
+                    compatibility_started.elapsed().as_millis() as u64,
+                    0,
                     None,
-                ),
-                Ok(manifest) => {
-                    let compatible = manifest.as_ref().map(|item| &item.manifest.dsh_version);
-                    (
-                        decide_notice(current, &official.version, compatible),
-                        manifest,
-                    )
+                    compatibility_result
+                        .as_ref()
+                        .err()
+                        .map(|_| DiagnosticErrorKind::UpdateFailure),
+                );
+                match compatibility_result {
+                    Err(error) => (
+                        failed_notice(current, Some(&official.version), &error),
+                        None,
+                    ),
+                    Ok(manifest) => {
+                        let compatible = manifest.as_ref().map(|item| &item.manifest.dsh_version);
+                        (
+                            decide_notice(current, &official.version, compatible),
+                            manifest,
+                        )
+                    }
                 }
-            },
+            }
         };
         let key = notification_key(&self.channel, &notice);
         let should_notify = state.notification_keys.insert(key);
@@ -369,7 +432,8 @@ impl UpdateCoordinator {
                 next_check_epoch_secs: state.next_check_epoch_secs,
             });
         }
-        self.check_with_state(current, state)
+        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
+        self.check_with_state(current, state, &diagnostics)
             .await
             .map(Box::new)
             .map(ScheduledCheckResult::Checked)

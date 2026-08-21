@@ -110,11 +110,10 @@ root.addEventListener("click", (event: MouseEvent) => {
   retry.disabled = true;
   retry.setAttribute("aria-busy", "true");
   retry.textContent = "正在重试…";
-  void invoke<void>("retry_runtime").catch((error: unknown) => {
-    const detail = error instanceof Error ? error.message : String(error);
+  void invoke<void>("retry_runtime").catch(() => {
     renderRuntimeStatus(root, {
       phase: "failed",
-      message: `重试失败：${detail}`,
+      message: "重试失败，请稍后再试",
       errorCode: "retry_failed",
     });
   });
@@ -137,11 +136,11 @@ async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
       status = snapshot;
       renderRuntimeStatus(root, status);
     }
-  } catch (error: unknown) {
+  } catch {
     if (!hasReceivedRuntimeEvent) {
       renderRuntimeStatus(root, {
         phase: "failed",
-        message: error instanceof Error ? error.message : String(error),
+        message: "暂时无法读取运行状态",
         errorCode: "status_unavailable",
       });
     }

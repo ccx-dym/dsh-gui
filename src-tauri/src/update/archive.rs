@@ -1,3 +1,4 @@
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
 use crate::paths::RuntimeLayout;
 use crate::runtime::install_state::InstalledRuntime;
 use crate::update::download::DownloadedArtifact;
@@ -182,10 +183,49 @@ impl RuntimeArchiveInstaller {
         &self,
         request: ArchiveInstallRequest,
     ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
-        let policy = self.policy;
-        tokio::task::spawn_blocking(move || install_blocking(request, policy))
+        self.install_inner(request, &DiagnosticContext::noop(TraceKind::Update))
             .await
-            .map_err(|_| ArchiveInstallError::Worker)?
+    }
+
+    /// 使用共享 trace 安装已验证运行时，不记录归档路径或内容。
+    ///
+    /// :param request: 已验证下载产物与目标 runtime 描述。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 封存完成的不可变 runtime 元数据。
+    /// :raises ArchiveInstallError: 验证、资源或文件系统边界失败时返回。
+    pub async fn install_with_context(
+        &self,
+        mut request: ArchiveInstallRequest,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
+        request.trace_id = diagnostics.trace_str().to_owned();
+        self.install_inner(request, diagnostics).await
+    }
+
+    async fn install_inner(
+        &self,
+        request: ArchiveInstallRequest,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
+        let started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::ArchiveInstall, 0, 0, None, None);
+        let policy = self.policy;
+        let result =
+            match tokio::task::spawn_blocking(move || install_blocking(request, policy)).await {
+                Ok(result) => result,
+                Err(_) => Err(ArchiveInstallError::Worker),
+            };
+        diagnostics.record(
+            DiagnosticStage::ArchiveInstall,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
     }
 }
 

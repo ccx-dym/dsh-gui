@@ -1,10 +1,11 @@
 use serde::Serialize;
-use std::fmt;
 use std::fs::OpenOptions as SyncOpenOptions;
 use std::io;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::fs;
 use tokio::sync::Mutex;
@@ -14,53 +15,64 @@ const LOG_PREFIX: &str = "diagnostics-";
 const LOG_SUFFIX: &str = ".jsonl";
 const MAX_LOG_SLOT_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 只允许安全关联标识进入诊断边界，避免正文、凭据、URL 与用户路径被误写。
+static TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// 由程序内部生成的关联标识；没有接收调用方字符串的公共构造入口。
+///
+/// ```compile_fail
+/// use dsh_desktop_lib::diagnostics::DiagnosticTraceId;
+/// let _ = DiagnosticTraceId::parse("sk-proj-user-controlled");
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct DiagnosticTraceId(String);
+struct DiagnosticTraceId(String);
 
-impl DiagnosticTraceId {
-    /// 校验并构造安全诊断标识。
-    ///
-    /// :param value: 预期为程序定义的 ASCII 标识符，而非外部错误正文。
-    /// :return: 通过字符集、长度与敏感词门禁的值。
-    /// :raises DiagnosticError: 值可能包含秘密、正文、URL 或路径时拒绝。
-    pub fn parse(value: &str) -> Result<Self, DiagnosticError> {
-        let lowered = value.to_ascii_lowercase();
-        let suspicious = [
-            "authorization",
-            "bearer",
-            "secret",
-            "token",
-            "api_key",
-            "apikey",
-            "password",
-        ];
-        let valid = !value.is_empty()
-            && value.len() <= 96
-            && value.is_ascii()
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-            && !suspicious.iter().any(|needle| lowered.contains(needle));
-        if !valid {
-            return Err(DiagnosticError::UnsafeMetadata);
+/// 关联标识的程序定义域；前缀不能由网络或用户输入控制。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceKind {
+    Activation,
+    Runtime,
+    Update,
+}
+
+impl TraceKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Activation => "activation",
+            Self::Runtime => "runtime",
+            Self::Update => "update",
         }
-        Ok(Self(value.to_owned()))
     }
 }
 
-impl TryFrom<&str> for DiagnosticTraceId {
-    type Error = DiagnosticError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
+/// 在同一更新或运行时操作的所有阶段间传递的类型化 trace。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationTrace {
+    id: DiagnosticTraceId,
 }
 
-impl fmt::Display for DiagnosticTraceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+impl OperationTrace {
+    /// 生成只由固定前缀、时间熵、进程 ID 与单调序号组成的新 trace。
+    ///
+    /// :param kind: 程序定义的操作类别。
+    /// :return: 不接受任意字符串输入的关联标识。
+    /// :raises: 系统时间异常时使用零时间熵，仍不会引入外部正文。
+    pub fn begin(kind: TraceKind) -> Self {
+        let time_entropy = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let sequence = TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Self {
+            id: DiagnosticTraceId(format!(
+                "{}-{:x}-{time_entropy:x}-{sequence:x}",
+                kind.prefix(),
+                std::process::id()
+            )),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.id.0
     }
 }
 
@@ -68,11 +80,24 @@ impl fmt::Display for DiagnosticTraceId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticStage {
+    ActivationCommit,
+    ActivationPrepare,
+    ActivationRecovery,
+    ActivationRollback,
+    ArchiveInstall,
     CloseToTray,
+    DownloadAttempt,
+    DownloadComplete,
+    ManifestVerify,
+    OfficialCheck,
+    CompatibilityCheck,
+    ProbeComplete,
+    ProbeStart,
     RuntimeFailed,
     RuntimeReady,
     RuntimeStart,
     RuntimeStopping,
+    SnapshotPrepare,
     SingleInstanceFocus,
     SingleInstanceShow,
     SingleInstanceWindow,
@@ -81,6 +106,7 @@ pub enum DiagnosticStage {
     TrayOpen,
     TrayRestart,
     UpdateProbe,
+    UpdateCheck,
 }
 
 /// 可记录的有限错误类别白名单，不携带底层 source 或动态上下文。
@@ -109,6 +135,7 @@ pub enum DiagnosticErrorKind {
     StartupAborted,
     StatePoisoned,
     TauriError,
+    UpdateFailure,
 }
 
 /// 固定字段的本地诊断事件；类型上不提供 headers、env、body 或任意文本字段。
@@ -136,7 +163,7 @@ impl DiagnosticEvent {
     /// :return: 只能由安全字段组成的诊断事件。
     /// :raises: 此构造器只接收已校验或有限枚举，不产生错误。
     pub fn new(
-        trace_id: DiagnosticTraceId,
+        trace: &OperationTrace,
         stage: DiagnosticStage,
         elapsed_ms: u64,
         retry: u32,
@@ -149,7 +176,7 @@ impl DiagnosticEvent {
             pid,
             retry,
             stage,
-            trace_id,
+            trace_id: trace.id.clone(),
         }
     }
 }
@@ -172,8 +199,6 @@ impl Default for DiagnosticPolicy {
 
 #[derive(Debug, Error)]
 pub enum DiagnosticError {
-    #[error("诊断元数据不符合安全标识规则")]
-    UnsafeMetadata,
     #[error("诊断日志策略无效")]
     InvalidPolicy,
     #[error("诊断日志事件超过单文件容量")]
@@ -190,7 +215,7 @@ struct LoggerState {
 }
 
 /// 写入固定数量日志槽位的异步本地诊断器。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DiagnosticLogger {
     directory: PathBuf,
     policy: DiagnosticPolicy,
@@ -238,6 +263,12 @@ impl DiagnosticLogger {
         fs::create_dir_all(&self.directory)
             .await
             .map_err(|_| DiagnosticError::Io)?;
+        let scan_directory = self.directory.clone();
+        let scan_policy = self.policy;
+        tokio::task::spawn_blocking(move || reclaim_oversized_slots(&scan_directory, scan_policy))
+            .await
+            .map_err(|_| DiagnosticError::Io)?
+            .map_err(|_| DiagnosticError::Io)?;
         let current = self.slot_path(state.slot);
         let current_size = match fs::metadata(&current).await {
             Ok(metadata) => metadata.len(),
@@ -261,6 +292,29 @@ impl DiagnosticLogger {
         self.directory
             .join(format!("{LOG_PREFIX}{slot}{LOG_SUFFIX}"))
     }
+}
+
+fn reclaim_oversized_slots(
+    directory: &std::path::Path,
+    policy: DiagnosticPolicy,
+) -> io::Result<()> {
+    let _directory_guard = open_directory_guard(directory)?;
+    for slot in 0..policy.slot_count {
+        let path = directory.join(format!("{LOG_PREFIX}{slot}{LOG_SUFFIX}"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let file = open_validated_slot(&path)?;
+                if file.metadata()?.len() > policy.max_file_bytes {
+                    // 超限旧槽位可能含截断 JSONL；验证完成后在原句柄内收敛，不删除。
+                    file.set_len(0)?;
+                    file.sync_data()?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn write_slot(
@@ -393,15 +447,88 @@ fn validate_windows_handle(file: &std::fs::File, expect_directory: bool) -> io::
 enum DiagnosticCommand {
     Event(DiagnosticEvent),
     Flush(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
 }
 
-/// 面向状态机的无失败诊断出口；满队列与磁盘错误只会丢弃诊断事件。
-#[derive(Clone, Debug)]
-pub struct DiagnosticSink {
+/// 更新与运行时状态机使用的无失败诊断边界。
+pub trait DiagnosticSink: Send + Sync + 'static {
+    /// 尽力记录一个完全类型化的事件。
+    ///
+    /// :param event: 不含任意文本字段的诊断事件。
+    /// :return: 无返回值；实现必须吸收队列、锁和 I/O 故障。
+    /// :raises: 此接口禁止传播错误。
+    fn record(&self, event: DiagnosticEvent);
+}
+
+/// 在完整更新操作中共享同一 trace 与无失败 sink 的上下文。
+#[derive(Clone)]
+pub struct DiagnosticContext {
+    trace: OperationTrace,
+    sink: Arc<dyn DiagnosticSink>,
+}
+
+impl DiagnosticContext {
+    /// 为一条生产操作链创建类型化诊断上下文。
+    ///
+    /// :param kind: 固定 trace 类别。
+    /// :param sink: 本地文件 sink 或 no-op 实现。
+    /// :return: 可跨 download/probe/activation 阶段克隆的上下文。
+    /// :raises: 此构造器不接受字符串且不产生错误。
+    pub fn begin(kind: TraceKind, sink: Arc<dyn DiagnosticSink>) -> Self {
+        Self {
+            trace: OperationTrace::begin(kind),
+            sink,
+        }
+    }
+
+    /// 创建未配置日志时的安全默认上下文。
+    ///
+    /// :param kind: 固定 trace 类别。
+    /// :return: 使用 no-op sink 的可共享上下文。
+    /// :raises: 此构造器不产生错误。
+    pub fn noop(kind: TraceKind) -> Self {
+        Self::begin(kind, Arc::new(NoopDiagnosticSink))
+    }
+
+    /// 记录一个固定阶段；调用方不能传入 message、path、URL 或错误 source。
+    pub fn record(
+        &self,
+        stage: DiagnosticStage,
+        elapsed_ms: u64,
+        retry: u32,
+        pid: Option<u32>,
+        error_kind: Option<DiagnosticErrorKind>,
+    ) {
+        self.sink.record(DiagnosticEvent::new(
+            &self.trace,
+            stage,
+            elapsed_ms,
+            retry,
+            pid,
+            error_kind,
+        ));
+    }
+
+    pub(crate) fn trace_str(&self) -> &str {
+        self.trace.as_str()
+    }
+}
+
+/// 未配置本地日志时使用的无副作用默认实现。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopDiagnosticSink;
+
+impl DiagnosticSink for NoopDiagnosticSink {
+    fn record(&self, _event: DiagnosticEvent) {}
+}
+
+/// 面向桌面应用的有界文件诊断出口；满队列与磁盘错误只会丢弃事件。
+#[derive(Clone)]
+pub struct FileDiagnosticSink {
     sender: mpsc::Sender<DiagnosticCommand>,
 }
 
-impl DiagnosticSink {
+impl FileDiagnosticSink {
     /// 创建有界队列并启动单一异步写入 worker。
     ///
     /// :param logger: 已配置固定槽位上限的本地 writer。
@@ -423,19 +550,14 @@ impl DiagnosticSink {
                     DiagnosticCommand::Flush(complete) => {
                         let _ = complete.send(());
                     }
+                    DiagnosticCommand::Shutdown(complete) => {
+                        let _ = complete.send(());
+                        break;
+                    }
                 }
             }
         });
         Ok(Self { sender })
-    }
-
-    /// 尽力排队一个类型化事件，队列满或 worker 已退出时立即丢弃。
-    ///
-    /// :param event: 不含任意文本字段的诊断事件。
-    /// :return: 无返回值；诊断失败绝不传播给业务状态机。
-    /// :raises: 此方法不产生错误且不阻塞。
-    pub fn record(&self, event: DiagnosticEvent) {
-        let _ = self.sender.try_send(DiagnosticCommand::Event(event));
     }
 
     /// 等待调用前已成功入队的事件完成处理，主要用于测试与受控退出。
@@ -452,5 +574,27 @@ impl DiagnosticSink {
         {
             let _ = completed.await;
         }
+    }
+
+    /// 有序停止 writer；关闭后所有 `record` 调用都由 channel 边界静默丢弃。
+    ///
+    /// :return: 先前已入队命令处理完且 worker 退出后返回。
+    /// :raises: channel 已关闭时直接返回，不传播错误。
+    pub async fn shutdown(&self) {
+        let (complete, completed) = oneshot::channel();
+        if self
+            .sender
+            .send(DiagnosticCommand::Shutdown(complete))
+            .await
+            .is_ok()
+        {
+            let _ = completed.await;
+        }
+    }
+}
+
+impl DiagnosticSink for FileDiagnosticSink {
+    fn record(&self, event: DiagnosticEvent) {
+        let _ = self.sender.try_send(DiagnosticCommand::Event(event));
     }
 }

@@ -21,6 +21,7 @@ use tokio::{
 use url::Url;
 
 use super::manifest::RuntimeArtifact;
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
 
 /// 下载器的资源与重试边界。
 #[derive(Clone, Debug)]
@@ -214,6 +215,7 @@ impl HttpsDownloader {
     async fn download_inner(
         &self,
         request: &DownloadRequest<'_>,
+        diagnostics: &DiagnosticContext,
     ) -> Result<DownloadedArtifact, DownloadError> {
         self.validate_url(request.artifact.url.as_str())?;
         validate_trace_id(request.trace_id)?;
@@ -251,7 +253,7 @@ impl HttpsDownloader {
         let result = tokio::select! {
             biased;
             _ = request.cancellation.cancelled() => Err(DownloadError::Cancelled),
-            result = self.retry_download(request, &part_path, &verified_path, deadline) => result,
+            result = self.retry_download(request, &part_path, &verified_path, deadline, diagnostics) => result,
         };
         result
     }
@@ -262,19 +264,47 @@ impl HttpsDownloader {
         part_path: &Path,
         verified_path: &Path,
         deadline: Instant,
+        diagnostics: &DiagnosticContext,
     ) -> Result<DownloadedArtifact, DownloadError> {
         let mut retry_index = 0_u32;
         loop {
             if Instant::now() >= deadline {
                 return Err(DownloadError::Timeout);
             }
+            diagnostics.record(DiagnosticStage::DownloadAttempt, 0, retry_index, None, None);
+            let attempt_started = std::time::Instant::now();
             match self
                 .download_attempt(request, part_path, verified_path, deadline)
                 .await
             {
-                Ok(downloaded) => return Ok(downloaded),
-                Err(AttemptFailure::Final(error)) => return Err(error),
+                Ok(downloaded) => {
+                    diagnostics.record(
+                        DiagnosticStage::DownloadComplete,
+                        attempt_started.elapsed().as_millis() as u64,
+                        retry_index,
+                        None,
+                        None,
+                    );
+                    return Ok(downloaded);
+                }
+                Err(AttemptFailure::Final(error)) => {
+                    diagnostics.record(
+                        DiagnosticStage::DownloadAttempt,
+                        attempt_started.elapsed().as_millis() as u64,
+                        retry_index,
+                        None,
+                        Some(DiagnosticErrorKind::UpdateFailure),
+                    );
+                    return Err(error);
+                }
                 Err(AttemptFailure::Retry { error, retry_after }) => {
+                    diagnostics.record(
+                        DiagnosticStage::DownloadAttempt,
+                        attempt_started.elapsed().as_millis() as u64,
+                        retry_index,
+                        None,
+                        Some(DiagnosticErrorKind::UpdateFailure),
+                    );
                     if retry_index >= self.policy.max_retries {
                         return Err(error);
                     }
@@ -452,7 +482,32 @@ impl ArtifactDownloader for HttpsDownloader {
         &'a self,
         request: DownloadRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<DownloadedArtifact, DownloadError>> + Send + 'a>> {
-        Box::pin(async move { self.download_inner(&request).await })
+        Box::pin(async move {
+            self.download_inner(&request, &DiagnosticContext::noop(TraceKind::Update))
+                .await
+        })
+    }
+}
+
+impl HttpsDownloader {
+    /// 使用共享更新上下文下载，使所有 attempt/retry 沿用同一 trace。
+    ///
+    /// :param request: 受信 artifact、更新根与取消句柄；其旧 trace 会被安全覆盖。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 大小和摘要均通过验证的暂存文件。
+    /// :raises DownloadError: 网络、取消、资源或完整性边界失败时返回。
+    pub async fn download_with_context(
+        &self,
+        request: DownloadRequest<'_>,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<DownloadedArtifact, DownloadError> {
+        let safe_request = DownloadRequest {
+            artifact: request.artifact,
+            updates_dir: request.updates_dir,
+            trace_id: diagnostics.trace_str(),
+            cancellation: request.cancellation,
+        };
+        self.download_inner(&safe_request, diagnostics).await
     }
 }
 

@@ -7,6 +7,7 @@ use thiserror::Error;
 use url::Url;
 
 use super::manifest::{ManifestVerifier, VerifiedManifest};
+use crate::diagnostics::DiagnosticContext;
 
 const OFFICIAL_PACKAGE_PATH: &str = "@deepseek-ai%2Fdsh";
 
@@ -190,6 +191,19 @@ pub trait CompatibilitySource: Send + Sync {
     fn latest_compatible<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>;
+
+    /// 使用共享更新上下文获取并验证清单；默认实现保持第三方 source 兼容。
+    ///
+    /// :param diagnostics: 同一次检查共享的类型化上下文。
+    /// :return: endpoint 不存在时为 None，验证成功时为受信清单。
+    /// :raises SourceError: 网络或验证失败时返回稳定错误。
+    fn latest_compatible_with_context<'a>(
+        &'a self,
+        _diagnostics: &'a DiagnosticContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
+    {
+        self.latest_compatible()
+    }
 }
 
 /// 固定查询官方 `@deepseek-ai/dsh` 的 npm source。
@@ -280,6 +294,45 @@ impl SignedCompatibilitySource {
             verifier,
         })
     }
+
+    async fn fetch_compatible(
+        &self,
+        diagnostics: Option<&DiagnosticContext>,
+    ) -> Result<Option<VerifiedManifest>, SourceError> {
+        let Some(manifest) = fetch_bytes(
+            self.transport.as_ref(),
+            &self.manifest_url,
+            &self.policy,
+            true,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let signature = fetch_bytes(
+            self.transport.as_ref(),
+            &self.signature_url,
+            &self.policy,
+            false,
+        )
+        .await?
+        .ok_or(SourceError::InvalidResponse)?;
+        if signature.len() > 128 {
+            return Err(SourceError::InvalidResponse);
+        }
+        let signature = std::str::from_utf8(&signature)
+            .map_err(|_| SourceError::InvalidResponse)?
+            .trim();
+        let verified = match diagnostics {
+            Some(context) => self
+                .verifier
+                .verify_with_context(&manifest, signature, context),
+            None => self.verifier.verify(&manifest, signature),
+        };
+        verified
+            .map(Some)
+            .map_err(|_| SourceError::CompatibilityVerification)
+    }
 }
 
 impl CompatibilitySource for SignedCompatibilitySource {
@@ -287,36 +340,15 @@ impl CompatibilitySource for SignedCompatibilitySource {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
     {
-        Box::pin(async move {
-            let Some(manifest) = fetch_bytes(
-                self.transport.as_ref(),
-                &self.manifest_url,
-                &self.policy,
-                true,
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
-            let signature = fetch_bytes(
-                self.transport.as_ref(),
-                &self.signature_url,
-                &self.policy,
-                false,
-            )
-            .await?
-            .ok_or(SourceError::InvalidResponse)?;
-            if signature.len() > 128 {
-                return Err(SourceError::InvalidResponse);
-            }
-            let signature = std::str::from_utf8(&signature)
-                .map_err(|_| SourceError::InvalidResponse)?
-                .trim();
-            self.verifier
-                .verify(&manifest, signature)
-                .map(Some)
-                .map_err(|_| SourceError::CompatibilityVerification)
-        })
+        Box::pin(async move { self.fetch_compatible(None).await })
+    }
+
+    fn latest_compatible_with_context<'a>(
+        &'a self,
+        diagnostics: &'a DiagnosticContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.fetch_compatible(Some(diagnostics)).await })
     }
 }
 

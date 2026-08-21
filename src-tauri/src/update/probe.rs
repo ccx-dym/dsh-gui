@@ -1,4 +1,5 @@
 use crate::app_controller::{ProbeExecutionPermit, ProbeLease};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 use crate::paths::RuntimeLayout;
 use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
 use crate::runtime::health::{HealthProbe, ReadyProbe};
@@ -576,6 +577,38 @@ impl RuntimeProbe {
             error_kind,
             trace_id,
         })
+    }
+
+    /// 使用类型化更新上下文执行探活，状态 marker 与诊断事件共享同一 trace。
+    ///
+    /// :param workspace: 已通过 activator 创建的隔离 candidate。
+    /// :param cancellation: 可中断预检与 readiness 的取消句柄。
+    /// :param diagnostics: 调用链共享的类型化诊断上下文。
+    /// :return: 不含运行时输出正文的探活报告。
+    /// :raises ProbeError: workspace、资源或 worker 边界失败时返回。
+    pub async fn probe_with_context(
+        &self,
+        workspace: ProbeWorkspace,
+        cancellation: ProbeCancellation,
+        diagnostics: &DiagnosticContext,
+    ) -> Result<ProbeReport, ProbeError> {
+        let started = Instant::now();
+        diagnostics.record(DiagnosticStage::ProbeStart, 0, 0, None, None);
+        let result = self
+            .probe(workspace, diagnostics.trace_str().to_owned(), cancellation)
+            .await;
+        let (retry, failed) = match &result {
+            Ok(report) => (report.retry_count, report.error_kind.is_some()),
+            Err(_) => (0, true),
+        };
+        diagnostics.record(
+            DiagnosticStage::ProbeComplete,
+            started.elapsed().as_millis() as u64,
+            retry,
+            None,
+            failed.then_some(DiagnosticErrorKind::UpdateFailure),
+        );
+        result
     }
 }
 
@@ -1766,7 +1799,10 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
-    use windows::Win32::Storage::FileSystem::{FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
 
     #[test]
     fn file_guard_denies_in_place_writes_while_identity_is_trusted() {
@@ -1791,6 +1827,11 @@ mod tests {
             WRITE_DAC.0,
             WRITE_OWNER.0,
             FILE_DELETE_CHILD.0,
+            DELETE.0,
+            FILE_WRITE_DATA.0,
+            FILE_APPEND_DATA.0,
+            FILE_WRITE_EA.0,
+            FILE_WRITE_ATTRIBUTES.0,
         ] {
             assert!(mask_grants_sensitive_write(mask));
         }

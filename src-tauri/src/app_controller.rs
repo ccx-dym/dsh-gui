@@ -1,5 +1,6 @@
 use crate::diagnostics::{
-    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, DiagnosticTraceId,
+    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, FileDiagnosticSink,
+    OperationTrace, TraceKind,
 };
 use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
 use crate::paths::AppPaths;
@@ -50,6 +51,7 @@ trait RuntimeUi: Send + Sync + 'static {
 
 struct TauriRuntimeUi {
     app: AppHandle,
+    trace: OperationTrace,
 }
 
 #[cfg(debug_assertions)]
@@ -78,6 +80,7 @@ impl RuntimeLifecycle for MockRuntimeLifecycle {
         let spec = RuntimeLaunchSpec::mock(node, script, paths.dsh_home, port);
         let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
             app: self.app.clone(),
+            trace: OperationTrace::begin(TraceKind::Runtime),
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -117,6 +120,7 @@ impl OfficialRuntimeLifecycle {
         let spec = official_launch_spec(&self.layout, deployment, port)?;
         let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
             app: self.app.clone(),
+            trace: OperationTrace::begin(TraceKind::Runtime),
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -223,7 +227,7 @@ fn official_launch_spec(
 
 impl RuntimeUi for TauriRuntimeUi {
     fn emit_status(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
-        record_runtime_diagnostic(&self.app, event);
+        record_runtime_diagnostic(&self.app, &self.trace, event);
         self.app
             .emit("runtime-status", event)
             .map_err(|error| RuntimeError::Tauri(error.to_string()))
@@ -238,12 +242,12 @@ impl RuntimeUi for TauriRuntimeUi {
     }
 }
 
-fn record_runtime_diagnostic(app: &AppHandle, runtime_event: &RuntimeEvent) {
-    let Some(sink) = app.try_state::<DiagnosticSink>() else {
-        return;
-    };
-    let trace_value = format!("desktop-{}", std::process::id());
-    let Ok(trace_id) = DiagnosticTraceId::parse(&trace_value) else {
+fn record_runtime_diagnostic(
+    app: &AppHandle,
+    trace: &OperationTrace,
+    runtime_event: &RuntimeEvent,
+) {
+    let Some(sink) = app.try_state::<FileDiagnosticSink>() else {
         return;
     };
     let (stage, elapsed_ms, error_kind) = match runtime_event {
@@ -259,7 +263,7 @@ fn record_runtime_diagnostic(app: &AppHandle, runtime_event: &RuntimeEvent) {
         RuntimeEvent::Stopping { .. } => (DiagnosticStage::RuntimeStopping, 0, None),
     };
     sink.record(DiagnosticEvent::new(
-        trace_id,
+        trace,
         stage,
         elapsed_ms,
         0,
