@@ -69,6 +69,20 @@ describe("renderRuntimeStatus", () => {
     expect(liveStatus?.getAttribute("aria-atomic")).toBe("true");
     expect(root.querySelector("[data-loading-indicator]")).not.toBeNull();
   });
+
+  it("等待安装兼容运行时时不显示加载指示", async () => {
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const { renderRuntimeStatus } = await import("./main");
+    renderRuntimeStatus(root, {
+      phase: "idle",
+      message: "尚未安装兼容运行时",
+    });
+
+    expect(root.querySelector("[data-loading-indicator]")).toBeNull();
+    expect(root.querySelector("[data-status-message]")?.textContent).toBe(
+      "尚未安装兼容运行时",
+    );
+  });
 });
 
 describe("启动页", () => {
@@ -100,6 +114,59 @@ describe("启动页", () => {
       ).toBe("正在检查运行环境");
     });
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_runtime_status");
+  });
+
+  it("在请求状态快照前建立运行事件监听", async () => {
+    const callOrder: string[] = [];
+    tauriMocks.listen.mockImplementationOnce(async () => {
+      callOrder.push("listen");
+      return () => undefined;
+    });
+    tauriMocks.invoke.mockImplementationOnce(async () => {
+      callOrder.push("invoke");
+      return { phase: "starting", message: "正在启动 DSH…" };
+    });
+
+    await import("./main");
+    await vi.waitFor(() => expect(callOrder).toHaveLength(2));
+
+    expect(callOrder).toEqual(["listen", "invoke"]);
+  });
+
+  it("订阅期间的新事件不被较旧状态快照覆盖", async () => {
+    let statusListener:
+      | ((event: { payload: RuntimeEvent }) => void)
+      | undefined;
+    tauriMocks.listen.mockImplementationOnce(
+      async (
+        _eventName: string,
+        handler: (event: { payload: RuntimeEvent }) => void,
+      ) => {
+        statusListener = handler;
+        return () => undefined;
+      },
+    );
+    tauriMocks.invoke.mockImplementationOnce(async () => {
+      statusListener?.({
+        payload: {
+          type: "failed",
+          code: "health_timeout",
+          message: "健康检查超时",
+        },
+      });
+      return { phase: "starting", message: "较旧的启动快照" };
+    });
+
+    await import("./main");
+
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector("[data-status-message]")?.textContent,
+      ).toBe("健康检查超时");
+    });
+    expect(document.querySelector("[data-error-code]")?.textContent).toBe(
+      "health_timeout",
+    );
   });
 
   it("收到运行事件后归约并呈现新状态", async () => {

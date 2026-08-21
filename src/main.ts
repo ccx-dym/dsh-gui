@@ -2,6 +2,7 @@ import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  initialRuntimeStatus,
   reduceRuntimeEvent,
   type RuntimeEvent,
   type RuntimeStatus,
@@ -51,7 +52,6 @@ export function renderRuntimeStatus(
   statusRegion.setAttribute("aria-atomic", "true");
 
   if (
-    status.phase === "idle" ||
     status.phase === "starting" ||
     status.phase === "stopping"
   ) {
@@ -123,19 +123,28 @@ root.addEventListener("click", (event: MouseEvent) => {
 renderRuntimeStatus(root, { phase: "starting", message: "正在启动 DSH…" });
 
 async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
+  let status = initialRuntimeStatus;
+  let hasReceivedRuntimeEvent = false;
   try {
-    let status = await invoke<RuntimeStatus>("get_runtime_status");
-    renderRuntimeStatus(root, status);
+    // 先建立订阅以封闭启动竞态窗口；订阅期间的新事件优先于随后返回的旧快照。
     await listen<RuntimeEvent>("runtime-status", ({ payload }) => {
+      hasReceivedRuntimeEvent = true;
       status = reduceRuntimeEvent(status, payload);
       renderRuntimeStatus(root, status);
     });
+    const snapshot = await invoke<RuntimeStatus>("get_runtime_status");
+    if (!hasReceivedRuntimeEvent) {
+      status = snapshot;
+      renderRuntimeStatus(root, status);
+    }
   } catch (error: unknown) {
-    renderRuntimeStatus(root, {
-      phase: "failed",
-      message: error instanceof Error ? error.message : String(error),
-      errorCode: "status_unavailable",
-    });
+    if (!hasReceivedRuntimeEvent) {
+      renderRuntimeStatus(root, {
+        phase: "failed",
+        message: error instanceof Error ? error.message : String(error),
+        errorCode: "status_unavailable",
+      });
+    }
   }
 }
 
