@@ -899,10 +899,13 @@ where
     RestartFuture: std::future::Future<Output = Result<(), ()>>,
 {
     let disposition = inspect_orphan_candidate_with(paths, pending, validate_inventory)?;
-    if let OrphanCandidateDisposition::RestartPrior(prior) = &disposition {
-        restart_prior(prior.clone())
-            .await
-            .map_err(|_| "activation_recovery_required")?;
+    if let OrphanCandidateDisposition::RestartPrior(prior) = &disposition
+        && restart_prior(prior.clone()).await.is_err()
+    {
+        // 旧版无法可靠恢复时，该 attempt 必须先成为终态；即使 durable 写入本身
+        // 失败也只返回同一个稳定恢复码，绝不把动态错误或“成功”暴露给上层。
+        let _ = write_activation_receipt(paths, pending, &UpdateUiPhase::RecoveryRequired);
+        return Err("activation_recovery_required");
     }
     write_activation_receipt(paths, pending, &UpdateUiPhase::Failed)
         .map_err(|_| "activation_recovery_required")?;
@@ -1852,6 +1855,51 @@ mod tests {
             serde_json::from_slice(&std::fs::read(activation_receipt(&paths, &pending)).unwrap())
                 .unwrap();
         assert!(matches!(receipt.outcome, UpdateUiPhase::Failed));
+    }
+
+    #[tokio::test]
+    async fn failed_orphan_prior_restart_is_terminal_and_never_retried_on_next_load() {
+        let (paths, pending, _) = orphan_candidate_fixture("restart-failed", true);
+        let restarts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&restarts);
+        assert_eq!(
+            recover_orphan_candidate_with(
+                &paths,
+                &pending,
+                |_, _| Ok(()),
+                move |_| async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(())
+                },
+            )
+            .await,
+            Err("activation_recovery_required")
+        );
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        let receipt: super::ActivationReceipt =
+            serde_json::from_slice(&std::fs::read(activation_receipt(&paths, &pending)).unwrap())
+                .unwrap();
+        assert!(matches!(receipt.outcome, UpdateUiPhase::RecoveryRequired));
+
+        // 第二次 cold load 必须在 receipt 门禁处停止，不再把 attempt 交给 restart。
+        if let Ok(Some(next)) = load_single_confirmed_pending(&paths) {
+            let observed = Arc::clone(&restarts);
+            let _ = recover_orphan_candidate_with(
+                &paths,
+                &next,
+                |_, _| Ok(()),
+                move |_| async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+        }
+        assert_eq!(
+            load_single_confirmed_pending(&paths),
+            Err("activation_recovery_required")
+        );
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
