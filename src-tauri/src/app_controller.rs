@@ -146,6 +146,12 @@ impl RuntimeLifecycle for OfficialRuntimeLifecycle {
     }
 
     fn start_and_wait_ready(&self, deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+        let authoritative = InstallStateStore::new(self.layout.clone())
+            .load()
+            .map_err(|_| RuntimeError::DeploymentChanged)?;
+        if &authoritative != deployment {
+            return Err(RuntimeError::DeploymentChanged);
+        }
         let port = self.start_exact(deployment)?;
         // supervisor 自己拥有 60 秒 readiness 截止；外层只作为清理兜底，避免两个
         // 相同截止互相竞态并留下 Starting 子进程。
@@ -651,6 +657,34 @@ impl AppController {
     pub fn start_active_runtime(&self) -> Result<(), RuntimeError> {
         let _guard = self.acquire_operation()?;
         self.runtime.start()
+    }
+
+    /// 仅在权威 pointer 仍精确等于指定 prior deployment 时恢复并等待就绪。
+    ///
+    /// :param expected: precommit 失败前读取的完整 runtime/data/workspace 配对。
+    /// :return: pointer 未变化且旧 runtime 已真实就绪时返回。
+    /// :raises RuntimeError: 生命周期门禁、pointer 复核或启动就绪失败时返回。
+    #[cfg(not(debug_assertions))]
+    pub(crate) async fn start_exact_active_runtime(
+        &self,
+        expected: &ActiveDeployment,
+    ) -> Result<(), RuntimeError> {
+        let _guard = self.acquire_operation()?;
+        let runtime = Arc::clone(&self.runtime);
+        let status = Arc::clone(&self.status);
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.start_and_wait_ready(&expected)?;
+            let mut status = status.write().map_err(|_| RuntimeError::StatePoisoned)?;
+            *status = RuntimeStatus {
+                phase: crate::domain::AppPhase::Ready,
+                message: "DSH 已就绪".to_owned(),
+                ..RuntimeStatus::default()
+            };
+            Ok(())
+        })
+        .await
+        .map_err(|_| RuntimeError::Tauri("activation lifecycle worker failed".to_owned()))?
     }
 
     /// 失败后重新构造端口与模拟启动参数并提交后台启动。

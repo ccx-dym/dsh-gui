@@ -1289,14 +1289,28 @@ impl DirectoryGuard {
 
 #[cfg(windows)]
 pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
+    ensure_private_windows_dacl_with_policy(path, false)
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_strict_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
+    ensure_private_windows_dacl_with_policy(path, true)
+}
+
+#[cfg(windows)]
+fn ensure_private_windows_dacl_with_policy(
+    path: &Path,
+    require_exclusive_access: bool,
+) -> Result<(), std::io::Error> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetTokenInformation,
-        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, GetTokenInformation, IsWellKnownSid,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY,
         TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerSid, WinLocalSystemSid,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -1336,6 +1350,18 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
             std::io::ErrorKind::PermissionDenied,
             "null DACL",
         ));
+    }
+    if require_exclusive_access {
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
+            .map_err(|error| std::io::Error::other(format!("HRESULT {:#010X}", error.code().0)))?;
+        if control & SE_DACL_PROTECTED.0 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "DACL inheritance is not protected",
+            ));
+        }
     }
     let mut raw_token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) }
@@ -1395,7 +1421,7 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
             continue;
         }
         let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
-        if !mask_grants_sensitive_write(ace.Mask) {
+        if !require_exclusive_access && !mask_grants_sensitive_write(ace.Mask) {
             continue;
         }
         let sid = PSID((&raw const ace.SidStart).cast_mut().cast::<c_void>());
@@ -1406,7 +1432,8 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
                 || EqualSid(sid, owner).is_ok()
                 || IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
                 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
-                || IsWellKnownSid(sid, WinCreatorOwnerSid).as_bool()
+                || (!require_exclusive_access
+                    && IsWellKnownSid(sid, WinCreatorOwnerSid).as_bool())
         };
         if !trusted {
             return Err(std::io::Error::new(
@@ -1416,6 +1443,145 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
         }
     }
     Ok(())
+}
+
+/// 将产品私有目录收敛为仅当前用户、SYSTEM 与 Administrators 可访问的受保护 DACL。
+///
+/// :param path: 已创建且不允许继承宽泛写权限的产品私有目录。
+/// :return: DACL 已设置并由生产校验器复核通过时返回。
+/// :raises std::io::Error: token、SID、ACL 写入或复核失败时返回，不包含输入路径。
+#[cfg(windows)]
+pub fn secure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{ERROR_SUCCESS, GENERIC_ALL, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW,
+        TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PWSTR;
+
+    let mut raw_token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) }
+        .map_err(|error| std::io::Error::other(format!("HRESULT {:#010X}", error.code().0)))?;
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token.0) };
+    let mut token_bytes = 0_u32;
+    let _ = unsafe { GetTokenInformation(raw_token, TokenUser, None, 0, &mut token_bytes) };
+    if token_bytes < std::mem::size_of::<TOKEN_USER>() as u32 {
+        return Err(std::io::Error::other("token user size"));
+    }
+    let mut token_buffer =
+        vec![0_usize; (token_bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+    unsafe {
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenUser,
+            Some(token_buffer.as_mut_ptr().cast()),
+            token_bytes,
+            &mut token_bytes,
+        )
+    }
+    .map_err(|error| std::io::Error::other(format!("HRESULT {:#010X}", error.code().0)))?;
+    let current_user = unsafe { (*(token_buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+
+    fn well_known(
+        kind: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+    ) -> Result<Vec<u8>, std::io::Error> {
+        use windows::Win32::Security::{CreateWellKnownSid, PSID};
+        let mut size = 0_u32;
+        let _ = unsafe { CreateWellKnownSid(kind, None, None, &mut size) };
+        if size == 0 {
+            return Err(std::io::Error::other("well known SID size"));
+        }
+        let mut bytes = vec![0_u8; size as usize];
+        unsafe { CreateWellKnownSid(kind, None, Some(PSID(bytes.as_mut_ptr().cast())), &mut size) }
+            .map_err(|error| std::io::Error::other(format!("HRESULT {:#010X}", error.code().0)))?;
+        Ok(bytes)
+    }
+    let mut system_sid = well_known(WinLocalSystemSid)?;
+    let mut admin_sid = well_known(WinBuiltinAdministratorsSid)?;
+    let system = PSID(system_sid.as_mut_ptr().cast());
+    let administrators = PSID(admin_sid.as_mut_ptr().cast());
+    let trustee = |sid: PSID, trustee_type| TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: Default::default(),
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: trustee_type,
+        ptstrName: PWSTR(sid.0.cast()),
+    };
+    let entries = [
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: trustee(current_user, TRUSTEE_IS_USER),
+        },
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: trustee(system, TRUSTEE_IS_USER),
+        },
+        EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL.0,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: trustee(administrators, TRUSTEE_IS_GROUP),
+        },
+    ];
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe { SetEntriesInAclW(Some(&entries), None, &mut dacl) };
+    if status != ERROR_SUCCESS || dacl.is_null() {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    struct LocalAcl(*mut ACL);
+    impl Drop for LocalAcl {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.cast())));
+            }
+        }
+    }
+    let _dacl = LocalAcl(dacl);
+    let mut wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PWSTR(wide.as_mut_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    ensure_strict_private_windows_dacl(path)
+}
+
+#[cfg(not(windows))]
+pub fn secure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "workspace boundary",
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -1796,7 +1962,10 @@ fn failed(
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{FileGuard, mask_grants_sensitive_write};
+    use super::{
+        FileGuard, ensure_private_windows_dacl, ensure_strict_private_windows_dacl,
+        mask_grants_sensitive_write, secure_private_windows_dacl,
+    };
     use std::fs::{self, OpenOptions};
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
@@ -1837,5 +2006,108 @@ mod tests {
             assert!(mask_grants_sensitive_write(mask));
         }
         assert!(!mask_grants_sensitive_write(1));
+    }
+
+    #[test]
+    fn workspace_dacl_rejects_everyone_write_and_hardens_to_current_user() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("dsh-workspace-acl-{unique}"));
+        fs::create_dir_all(&workspace).expect("workspace fixture");
+        use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
+        grant_everyone_access(&workspace, GENERIC_WRITE.0);
+        assert!(
+            ensure_private_windows_dacl(&workspace).is_err(),
+            "Everyone 写入权限必须被生产校验拒绝"
+        );
+
+        secure_private_windows_dacl(&workspace).expect("产品私有目录应能收敛 DACL");
+        ensure_strict_private_windows_dacl(&workspace).expect("收敛后仅可信主体可访问");
+
+        grant_everyone_access(&workspace, GENERIC_READ.0);
+        ensure_private_windows_dacl(&workspace).expect("普通 candidate 策略允许非可信只读 ACE");
+        assert!(
+            ensure_strict_private_windows_dacl(&workspace).is_err(),
+            "workspace 策略必须拒绝 Everyone 只读 ACE"
+        );
+        secure_private_windows_dacl(&workspace).expect("应重新移除宽泛只读 ACE");
+        ensure_strict_private_windows_dacl(&workspace).expect("DACL 必须受保护且主体集合精确");
+    }
+
+    fn grant_everyone_access(path: &std::path::Path, access_mask: u32) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{
+            EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+            SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+            TRUSTEE_W,
+        };
+        use windows::Win32::Security::{
+            ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+            PSECURITY_DESCRIPTOR, PSID, WinWorldSid,
+        };
+        use windows::core::{PCWSTR, PWSTR};
+
+        let mut wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut original_dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut original_dacl),
+                None,
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut sid_size = 0_u32;
+        let _ = unsafe { CreateWellKnownSid(WinWorldSid, None, None, &mut sid_size) };
+        let mut sid = vec![0_u8; sid_size as usize];
+        let everyone = PSID(sid.as_mut_ptr().cast());
+        unsafe { CreateWellKnownSid(WinWorldSid, None, Some(everyone), &mut sid_size) }
+            .expect("Everyone SID");
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access_mask,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: Default::default(),
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: PWSTR(everyone.0.cast()),
+            },
+        };
+        let mut broad_dacl: *mut ACL = std::ptr::null_mut();
+        let status =
+            unsafe { SetEntriesInAclW(Some(&[entry]), Some(original_dacl), &mut broad_dacl) };
+        assert_eq!(status, ERROR_SUCCESS);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                PWSTR(wide.as_mut_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(broad_dacl),
+                None,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(broad_dacl.cast())));
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+        }
     }
 }

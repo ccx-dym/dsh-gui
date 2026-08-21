@@ -11,6 +11,10 @@ use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::sync::Mutex;
 use url::Url;
 
+#[cfg(any(not(debug_assertions), test))]
+use crate::update::activation::ActivationError;
+#[cfg(not(debug_assertions))]
+use crate::update::activation::{ActivationCheckpoint, PrecommitStage};
 use crate::{
     diagnostics::{DiagnosticContext, FileDiagnosticSink, TraceKind},
     paths::{AppPaths, RuntimeLayout},
@@ -39,13 +43,58 @@ use crate::{
 #[cfg(not(debug_assertions))]
 use crate::update::{
     activation::{
-        ActivationCheckpoint, ActivationCheckpointSink, ActivationError, ActivationOutcome,
-        ActivationRequest, RuntimeActivator, RuntimeProbeAdapter, SnapshotPolicy,
+        ActivationCheckpointSink, ActivationOutcome, ActivationRequest, RuntimeActivator,
+        RuntimeProbeAdapter, SnapshotPolicy,
     },
     probe::{ProbePolicy, RuntimeProbe},
 };
 
 const UPDATE_EVENT: &str = "update-state";
+
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColdRecoveryPlan {
+    RestartPrior,
+    RetryFresh,
+    RecoveryRequired,
+}
+
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColdRecoveryResult {
+    Retryable,
+    RecoveryRequired,
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn plan_cold_recovery(
+    error: &ActivationError,
+    prior_exists: bool,
+    pointer_is_exact_prior: bool,
+) -> ColdRecoveryPlan {
+    let pointer_unchanged_failure = matches!(error, ActivationError::Precommit { .. });
+    if !pointer_unchanged_failure || !pointer_is_exact_prior {
+        ColdRecoveryPlan::RecoveryRequired
+    } else if prior_exists {
+        ColdRecoveryPlan::RestartPrior
+    } else {
+        ColdRecoveryPlan::RetryFresh
+    }
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn finish_cold_recovery(
+    plan: ColdRecoveryPlan,
+    prior_restart_succeeded: bool,
+) -> ColdRecoveryResult {
+    match plan {
+        ColdRecoveryPlan::RestartPrior if prior_restart_succeeded => ColdRecoveryResult::Retryable,
+        ColdRecoveryPlan::RetryFresh => ColdRecoveryResult::Retryable,
+        ColdRecoveryPlan::RestartPrior | ColdRecoveryPlan::RecoveryRequired => {
+            ColdRecoveryResult::RecoveryRequired
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -943,6 +992,8 @@ async fn cold_bootstrap_inner(
 
     let workspace = update_controller.paths.dsh_home.join("projects/default");
     std::fs::create_dir_all(&workspace).map_err(|_| "activation_recovery_required")?;
+    crate::update::probe::secure_private_windows_dacl(&workspace)
+        .map_err(|_| "activation_recovery_required")?;
     activator
         .save_trusted_workspace(&workspace)
         .map_err(|_| "activation_recovery_required")?;
@@ -969,6 +1020,12 @@ async fn cold_bootstrap_inner(
     update_controller
         .publish_cold_phase(app, UpdateUiPhase::Probing, None)
         .await;
+    let store = InstallStateStore::new(layout.clone());
+    let prior = match store.load() {
+        Ok(active) => Some(active),
+        Err(InstallStateError::NotInstalled) => None,
+        Err(_) => return Err("activation_recovery_required"),
+    };
     let session = app_controller
         .begin_activation()
         .map_err(|_| "activation_recovery_required")?;
@@ -981,6 +1038,57 @@ async fn cold_bootstrap_inner(
             diagnostics,
         )
         .await;
+    if let Err(error) = &outcome {
+        let pointer_is_exact_prior = match (&prior, store.load()) {
+            (Some(expected), Ok(actual)) => &actual == expected,
+            (None, Err(InstallStateError::NotInstalled)) => true,
+            _ => false,
+        };
+        let plan = plan_cold_recovery(error, prior.is_some(), pointer_is_exact_prior);
+        let journal_prepared = matches!(
+            error,
+            ActivationError::Precommit {
+                stage: PrecommitStage::JournalPrepared,
+                ..
+            }
+        );
+        let restarted = if journal_prepared && !matches!(plan, ColdRecoveryPlan::RecoveryRequired) {
+            match app_controller.begin_activation() {
+                Ok(recovery_session) => matches!(
+                    activator
+                        .recover_with_context(recovery_session, diagnostics)
+                        .await,
+                    Ok(ActivationOutcome::RolledBack { .. })
+                        | Ok(ActivationOutcome::FreshInstallFailed { .. })
+                ),
+                Err(_) => false,
+            }
+        } else {
+            match plan {
+                ColdRecoveryPlan::RestartPrior => app_controller
+                    .start_exact_active_runtime(prior.as_ref().expect("plan requires prior"))
+                    .await
+                    .is_ok(),
+                ColdRecoveryPlan::RetryFresh => true,
+                ColdRecoveryPlan::RecoveryRequired => false,
+            }
+        };
+        if matches!(
+            finish_cold_recovery(plan, restarted),
+            ColdRecoveryResult::Retryable
+        ) {
+            write_activation_receipt(&update_controller.paths, &pending, &UpdateUiPhase::Failed)
+                .map_err(|_| "activation_recovery_required")?;
+            update_controller
+                .publish_cold_phase(
+                    app,
+                    UpdateUiPhase::RecoveryRequired,
+                    Some("activation_retry_available"),
+                )
+                .await;
+            return Ok(());
+        }
+    }
     let phase = match outcome {
         Ok(ActivationOutcome::Activated) => UpdateUiPhase::UpToDate,
         Ok(ActivationOutcome::RolledBack { .. }) => UpdateUiPhase::RollingBack,
@@ -1301,10 +1409,15 @@ fn write_new_or_matching(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingActivation, UpdateUiController, UpdateUiPhase, activation_receipt,
-        confirmation_path, load_single_confirmed_pending, pending_path, write_activation_receipt,
+        ColdRecoveryPlan, ColdRecoveryResult, PendingActivation, UpdateUiController, UpdateUiPhase,
+        activation_receipt, confirmation_path, finish_cold_recovery, load_single_confirmed_pending,
+        pending_path, plan_cold_recovery, write_activation_receipt,
     };
     use crate::paths::AppPaths;
+    use crate::update::activation::{
+        ActivationCheckpoint, ActivationError, ActivationFailure, ActivationFailureStage,
+    };
+    use crate::update::probe::ProbeError;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
@@ -1466,5 +1579,77 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn precommit_activation_failures_are_retryable_only_with_an_exact_pointer() {
+        for source in [
+            ActivationError::Interrupted {
+                checkpoint: ActivationCheckpoint::CandidatePrepared,
+            },
+            ActivationError::SnapshotLimit,
+            ActivationError::UnsafeSnapshot,
+            ActivationError::ProbeRejected,
+            ActivationError::Probe(ProbeError::Cancelled),
+            ActivationError::WorkerFailed,
+            ActivationError::Io(std::io::Error::other("injected precommit I/O")),
+        ] {
+            let error = ActivationError::Precommit {
+                stage: crate::update::activation::PrecommitStage::Candidate,
+                source: Box::new(source),
+            };
+            assert_eq!(
+                plan_cold_recovery(&error, true, true),
+                ColdRecoveryPlan::RestartPrior
+            );
+            assert_eq!(
+                plan_cold_recovery(&error, false, true),
+                ColdRecoveryPlan::RetryFresh
+            );
+            assert_eq!(
+                plan_cold_recovery(&error, true, false),
+                ColdRecoveryPlan::RecoveryRequired
+            );
+        }
+        assert_eq!(
+            plan_cold_recovery(
+                &ActivationError::Interrupted {
+                    checkpoint: ActivationCheckpoint::PointerCommitted,
+                },
+                true,
+                true,
+            ),
+            ColdRecoveryPlan::RecoveryRequired
+        );
+        assert_eq!(
+            plan_cold_recovery(
+                &ActivationError::RecoveryRequired {
+                    failure: ActivationFailure {
+                        stage: ActivationFailureStage::RecoveryResume,
+                        error_code: "runtime_start_failed".to_owned(),
+                    },
+                    recovery_code: "pointer_mismatch".to_owned(),
+                },
+                true,
+                true,
+            ),
+            ColdRecoveryPlan::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn prior_restart_failure_escalates_to_recovery_required() {
+        assert_eq!(
+            finish_cold_recovery(ColdRecoveryPlan::RestartPrior, true),
+            ColdRecoveryResult::Retryable
+        );
+        assert_eq!(
+            finish_cold_recovery(ColdRecoveryPlan::RestartPrior, false),
+            ColdRecoveryResult::RecoveryRequired
+        );
+        assert_eq!(
+            finish_cold_recovery(ColdRecoveryPlan::RetryFresh, false),
+            ColdRecoveryResult::Retryable
+        );
     }
 }

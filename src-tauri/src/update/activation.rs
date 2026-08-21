@@ -200,8 +200,20 @@ impl ActivationFailure {
 }
 
 /// 激活、回滚或崩溃恢复失败。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrecommitStage {
+    Candidate,
+    JournalPrepared,
+}
+
 #[derive(Debug, Error)]
 pub enum ActivationError {
+    #[error("activation pointer 提交前失败")]
+    Precommit {
+        stage: PrecommitStage,
+        #[source]
+        source: Box<ActivationError>,
+    },
     #[error("激活 I/O 失败: {0}")]
     Io(#[source] std::io::Error),
     #[error("激活后台文件任务异常退出")]
@@ -234,6 +246,20 @@ pub enum ActivationError {
 impl ActivationError {
     pub(crate) fn io(source: std::io::Error) -> Self {
         Self::Io(source)
+    }
+
+    fn precommit(source: Self) -> Self {
+        Self::Precommit {
+            stage: PrecommitStage::Candidate,
+            source: Box::new(source),
+        }
+    }
+
+    fn journal_precommit(source: Self) -> Self {
+        Self::Precommit {
+            stage: PrecommitStage::JournalPrepared,
+            source: Box::new(source),
+        }
     }
 }
 
@@ -349,6 +375,10 @@ impl DeploymentStore for InstallStateStore {
 
 trait SnapshotAclInspector: Send + Sync {
     fn ensure_private(&self, path: &Path) -> Result<(), ActivationError>;
+
+    fn ensure_workspace_private(&self, path: &Path) -> Result<(), ActivationError> {
+        self.ensure_private(path)
+    }
 }
 
 struct SystemSnapshotAclInspector;
@@ -356,6 +386,10 @@ struct SystemSnapshotAclInspector;
 impl SnapshotAclInspector for SystemSnapshotAclInspector {
     fn ensure_private(&self, path: &Path) -> Result<(), ActivationError> {
         validate_private_acl(path)
+    }
+
+    fn ensure_workspace_private(&self, path: &Path) -> Result<(), ActivationError> {
+        validate_private_workspace_acl(path)
     }
 }
 
@@ -423,6 +457,7 @@ impl RuntimeActivator {
     /// :raises ActivationError: 目录不可信或设置文件写入失败时返回。
     pub fn save_trusted_workspace(&self, path: &Path) -> Result<(), ActivationError> {
         let path = validate_project_workspace(path)?;
+        self.acl.ensure_workspace_private(&path)?;
         let document = ActivationSettings {
             schema: SETTINGS_SCHEMA,
             project_workspace: path.to_string_lossy().into_owned(),
@@ -468,14 +503,21 @@ impl RuntimeActivator {
                 .as_deref()
                 .ok_or(InstallStateError::MissingDescriptor {
                     field: "project_workspace",
-                })?
+                })
+                .map_err(|error| ActivationError::precommit(error.into()))?
                 .to_path_buf(),
-            None => self.load_trusted_workspace()?,
+            None => self
+                .load_trusted_workspace()
+                .map_err(ActivationError::precommit)?,
         };
-        validate_project_workspace(&workspace)?;
+        validate_project_workspace(&workspace)
+            .map_err(|error| ActivationError::precommit(error.into()))?;
         self.prepare_candidate(prior.as_ref(), &request.candidate)
-            .await?;
-        checkpoints.reached(ActivationCheckpoint::CandidatePrepared)?;
+            .await
+            .map_err(ActivationError::precommit)?;
+        checkpoints
+            .reached(ActivationCheckpoint::CandidatePrepared)
+            .map_err(ActivationError::precommit)?;
 
         probe
             .probe(
@@ -486,15 +528,17 @@ impl RuntimeActivator {
                 session.probe_lease(),
                 diagnostics,
             )
-            .await?;
+            .await
+            .map_err(ActivationError::precommit)?;
         let passed = read_passed_generation_state(
             &self.layout,
             &request.candidate,
             &request.runtime,
             diagnostics.trace_str(),
-        )?;
+        )
+        .map_err(|error| ActivationError::precommit(error.into()))?;
         if passed.runtime() != &request.runtime || passed.candidate() != &request.candidate {
-            return Err(ActivationError::InvalidJournal);
+            return Err(ActivationError::precommit(ActivationError::InvalidJournal));
         }
         let target = ActiveDeployment::with_project_workspace(
             request.runtime,
@@ -508,13 +552,17 @@ impl RuntimeActivator {
             prior: prior
                 .as_ref()
                 .map(JournalDeployment::from_active)
-                .transpose()?,
-            target: JournalDeployment::from_active(&target)?,
+                .transpose()
+                .map_err(ActivationError::precommit)?,
+            target: JournalDeployment::from_active(&target).map_err(ActivationError::precommit)?,
             state: JournalState::Prepared,
             failure: None,
         };
-        self.write_journal(&journal)?;
-        checkpoints.reached(ActivationCheckpoint::JournalPrepared)?;
+        self.write_journal(&journal)
+            .map_err(ActivationError::precommit)?;
+        checkpoints
+            .reached(ActivationCheckpoint::JournalPrepared)
+            .map_err(ActivationError::journal_precommit)?;
         self.store.save(&target)?;
         checkpoints.reached(ActivationCheckpoint::PointerCommitted)?;
         journal.state = JournalState::Committed;
@@ -793,7 +841,9 @@ impl RuntimeActivator {
         if document.schema != SETTINGS_SCHEMA {
             return Err(ActivationError::InvalidJournal);
         }
-        validate_project_workspace(Path::new(&document.project_workspace)).map_err(Into::into)
+        let workspace = validate_project_workspace(Path::new(&document.project_workspace))?;
+        self.acl.ensure_workspace_private(&workspace)?;
+        Ok(workspace)
     }
 
     async fn prepare_candidate(
@@ -1114,9 +1164,19 @@ fn validate_private_acl(path: &Path) -> Result<(), ActivationError> {
         .map_err(|_| ActivationError::UnsafeSnapshot)
 }
 
+#[cfg(windows)]
+fn validate_private_workspace_acl(path: &Path) -> Result<(), ActivationError> {
+    crate::update::probe::ensure_strict_private_windows_dacl(path).map_err(ActivationError::io)
+}
+
 #[cfg(not(windows))]
 fn validate_private_acl(_path: &Path) -> Result<(), ActivationError> {
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn validate_private_workspace_acl(path: &Path) -> Result<(), ActivationError> {
+    validate_private_acl(path)
 }
 
 #[cfg(windows)]
@@ -1289,6 +1349,21 @@ mod tests {
     }
 
     struct PassedProbe;
+    struct RejectedProbe;
+
+    impl ActivationProbe for RejectedProbe {
+        fn probe<'a>(
+            &'a self,
+            _layout: &'a RuntimeLayout,
+            _runtime: &'a InstalledRuntime,
+            _candidate: &'a DataGeneration,
+            _project_workspace: &'a Path,
+            _lease: ProbeLease,
+            _diagnostics: &'a DiagnosticContext,
+        ) -> BoxFuture<'a, Result<(), super::ActivationError>> {
+            async { Err(super::ActivationError::ProbeRejected) }.boxed()
+        }
+    }
 
     impl ActivationProbe for PassedProbe {
         fn probe<'a>(
@@ -1326,6 +1401,7 @@ mod tests {
     struct PermissiveAcl;
 
     struct SlowAcl;
+    struct RejectWorkspaceAcl;
 
     struct ConfirmedIdleProvider;
 
@@ -1389,6 +1465,16 @@ mod tests {
         }
     }
 
+    impl super::SnapshotAclInspector for RejectWorkspaceAcl {
+        fn ensure_private(&self, _path: &Path) -> Result<(), super::ActivationError> {
+            Ok(())
+        }
+
+        fn ensure_workspace_private(&self, _path: &Path) -> Result<(), super::ActivationError> {
+            Err(super::ActivationError::UnsafeSnapshot)
+        }
+    }
+
     impl ActivationCheckpointSink for NoCrash {
         fn reached(&self, _checkpoint: ActivationCheckpoint) -> Result<(), super::ActivationError> {
             Ok(())
@@ -1449,6 +1535,52 @@ mod tests {
             .expect("active pointer");
         assert_eq!(active.runtime, fixture.new_runtime);
         assert_eq!(active.data, fixture.candidate);
+    }
+
+    #[test]
+    fn trusted_workspace_settings_reject_non_private_workspace_before_persisting() {
+        let fixture = Fixture::new("workspace-private", false);
+        let activator = RuntimeActivator::new(fixture.layout.clone(), SnapshotPolicy::default())
+            .expect("activator")
+            .with_acl_inspector(Arc::new(RejectWorkspaceAcl));
+        assert!(matches!(
+            activator.save_trusted_workspace(&fixture.workspace),
+            Err(super::ActivationError::UnsafeSnapshot)
+        ));
+
+        let writer = RuntimeActivator::new(fixture.layout.clone(), SnapshotPolicy::default())
+            .expect("writer")
+            .with_acl_inspector(Arc::new(PermissiveAcl));
+        writer
+            .save_trusted_workspace(&fixture.workspace)
+            .expect("fixture setting");
+        let reader = RuntimeActivator::new(fixture.layout, SnapshotPolicy::default())
+            .expect("reader")
+            .with_acl_inspector(Arc::new(RejectWorkspaceAcl));
+        assert!(matches!(
+            reader.load_trusted_workspace(),
+            Err(super::ActivationError::UnsafeSnapshot)
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_rejection_is_explicit_precommit_and_preserves_prior_pointer() {
+        let fixture = Fixture::new("probe-precommit", true);
+        let runtime = Arc::new(RecordingRuntime::default());
+        let session = controller(runtime).begin_activation().expect("session");
+        assert!(matches!(
+            activator(&fixture)
+                .activate(session, fixture.request(), &RejectedProbe, &NoCrash)
+                .await,
+            Err(super::ActivationError::Precommit { source, .. })
+                if matches!(*source, super::ActivationError::ProbeRejected)
+        ));
+        assert_eq!(
+            InstallStateStore::new(fixture.layout)
+                .load()
+                .expect("prior pointer"),
+            fixture.old
+        );
     }
 
     #[tokio::test]
@@ -1728,7 +1860,8 @@ mod tests {
                     &CrashAt(ActivationCheckpoint::JournalPrepared),
                 )
                 .await,
-            Err(super::ActivationError::Interrupted { .. })
+            Err(super::ActivationError::Precommit { source, .. })
+                if matches!(*source, super::ActivationError::Interrupted { .. })
         ));
         assert_eq!(
             InstallStateStore::new(fixture.layout.clone())
@@ -1766,7 +1899,8 @@ mod tests {
                     &CrashAt(ActivationCheckpoint::JournalPrepared),
                 )
                 .await,
-            Err(super::ActivationError::Interrupted { .. })
+            Err(super::ActivationError::Precommit { source, .. })
+                if matches!(*source, super::ActivationError::Interrupted { .. })
         ));
         let node_dir = fixture
             .layout
@@ -1849,7 +1983,8 @@ mod tests {
             activator
                 .activate(session, fixture.request(), &PassedProbe, &NoCrash)
                 .await,
-            Err(super::ActivationError::SnapshotLimit)
+            Err(super::ActivationError::Precommit { source, .. })
+                if matches!(*source, super::ActivationError::SnapshotLimit)
         ));
         assert_eq!(
             InstallStateStore::new(fixture.layout.clone())
