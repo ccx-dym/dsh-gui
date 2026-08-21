@@ -88,26 +88,33 @@ impl RuntimeLaunchSpec {
         dsh_home: PathBuf,
         port: u16,
     ) -> Result<Self, RuntimeError> {
+        if port == 0 {
+            return Err(RuntimeError::InvalidLoopbackPort { port });
+        }
         validate_directory("runtime_root", &runtime_root)?;
         validate_file("node", &node)?;
         validate_file("cli", &cli)?;
         validate_directory("cwd", &cwd)?;
-        if !dsh_home.is_absolute() {
-            return Err(invalid_path("dsh_home", "路径必须为绝对路径"));
-        }
+        validate_directory("dsh_home", &dsh_home)?;
 
         let canonical_root = runtime_root
             .canonicalize()
             .map_err(|_| invalid_path("runtime_root", "目录无法规范化"))?;
+        let canonical_node = node
+            .canonicalize()
+            .map_err(|_| invalid_path("node", "文件无法规范化"))?;
         let canonical_cli = cli
             .canonicalize()
             .map_err(|_| invalid_path("cli", "文件无法规范化"))?;
+        if !canonical_node.starts_with(&canonical_root) {
+            return Err(invalid_path("node", "Node 必须位于所选 runtime 内"));
+        }
         if !canonical_cli.starts_with(&canonical_root) {
             return Err(invalid_path("cli", "CLI 必须位于所选 runtime 内"));
         }
 
         let args = vec![
-            cli.to_string_lossy().into_owned(),
+            canonical_cli.to_string_lossy().into_owned(),
             "web".to_owned(),
             "--host".to_owned(),
             Ipv4Addr::LOCALHOST.to_string(),
@@ -124,7 +131,7 @@ impl RuntimeLaunchSpec {
         ]);
 
         Ok(Self {
-            program: node,
+            program: canonical_node,
             args,
             env,
             cwd,
@@ -265,11 +272,16 @@ mod tests {
         )
         .expect("有效的官方 runtime 布局应生成启动参数");
 
-        assert_eq!(spec.program, layout.node);
+        assert_eq!(spec.program, layout.node.canonicalize().unwrap());
         assert_eq!(
             spec.args,
             vec![
-                layout.cli.to_string_lossy().into_owned(),
+                layout
+                    .cli
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
                 "web".to_owned(),
                 "--host".to_owned(),
                 "127.0.0.1".to_owned(),
@@ -359,6 +371,77 @@ mod tests {
             result,
             Err(RuntimeError::InvalidLaunchPath { field: "cli", .. })
         ));
+    }
+
+    #[test]
+    fn official_spec_rejects_node_outside_selected_runtime() {
+        let layout = TestLayout::create("outside-node");
+        let outside_node = std::env::temp_dir()
+            .join("dsh-desktop-command-tests")
+            .join("runtime之外")
+            .join("node.exe");
+        fs::create_dir_all(outside_node.parent().unwrap()).expect("应创建 runtime 外目录");
+        fs::write(&outside_node, []).expect("应创建 runtime 外 Node");
+
+        assert!(matches!(
+            RuntimeLaunchSpec::official(
+                layout.root.clone(),
+                outside_node,
+                layout.cli.clone(),
+                layout.cwd.clone(),
+                layout.dsh_home.clone(),
+                43127,
+            ),
+            Err(RuntimeError::InvalidLaunchPath { field: "node", .. })
+        ));
+    }
+
+    #[test]
+    fn official_spec_requires_an_existing_absolute_dsh_home_directory() {
+        let layout = TestLayout::create("invalid-home");
+        let home_file = layout.root.join("home-file");
+        fs::write(&home_file, []).expect("应创建数据目录反例文件");
+        for invalid in [
+            PathBuf::from("relative-home"),
+            layout.root.join("missing-home"),
+            home_file,
+        ] {
+            assert!(matches!(
+                RuntimeLaunchSpec::official(
+                    layout.root.clone(),
+                    layout.node.clone(),
+                    layout.cli.clone(),
+                    layout.cwd.clone(),
+                    invalid,
+                    43127,
+                ),
+                Err(RuntimeError::InvalidLaunchPath {
+                    field: "dsh_home",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn official_spec_rejects_zero_loopback_port_with_a_stable_error() {
+        let layout = TestLayout::create("zero-port");
+
+        let error = RuntimeLaunchSpec::official(
+            layout.root,
+            layout.node,
+            layout.cli,
+            layout.cwd,
+            layout.dsh_home,
+            0,
+        )
+        .expect_err("端口 0 不能作为已预留的固定启动端口");
+
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidLoopbackPort { port: 0 }
+        ));
+        assert_eq!(error.code(), "invalid_loopback_port");
     }
 
     #[test]

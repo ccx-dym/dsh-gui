@@ -48,6 +48,8 @@ pub enum RuntimeError {
         field: &'static str,
         reason: &'static str,
     },
+    #[error("无效的动态回环端口: {port}")]
+    InvalidLoopbackPort { port: u16 },
 }
 
 impl RuntimeError {
@@ -70,6 +72,7 @@ impl RuntimeError {
             Self::ProcessExitedEarly => "process_exited_early",
             Self::OutputReadinessTimeout { .. } => "output_readiness_timeout",
             Self::InvalidLaunchPath { .. } => "invalid_launch_path",
+            Self::InvalidLoopbackPort { .. } => "invalid_loopback_port",
         }
     }
 }
@@ -89,10 +92,8 @@ pub trait RuntimeProcess: Send {
     fn wait_for_readiness(
         &mut self,
         port: u16,
-        _timeout: Duration,
-    ) -> Result<ReadinessSignal, RuntimeError> {
-        Ok(ReadinessSignal::Web { port })
-    }
+        timeout: Duration,
+    ) -> Result<ReadinessSignal, RuntimeError>;
 }
 
 /// 创建受生命周期约束的运行时进程。
@@ -489,6 +490,14 @@ mod tests {
             *self.state.stop_calls.lock().expect("停止计数锁不应中毒") += 1;
             Ok(StopOutcome::Terminated)
         }
+
+        fn wait_for_readiness(
+            &mut self,
+            port: u16,
+            _timeout: Duration,
+        ) -> Result<ReadinessSignal, RuntimeError> {
+            Ok(ReadinessSignal::Web { port })
+        }
     }
 
     struct FakeLauncher {
@@ -590,6 +599,14 @@ mod tests {
                 values = changed.wait(values).expect("停止闸锁不应中毒");
             }
             Ok(StopOutcome::Terminated)
+        }
+
+        fn wait_for_readiness(
+            &mut self,
+            port: u16,
+            _timeout: Duration,
+        ) -> Result<ReadinessSignal, RuntimeError> {
+            Ok(ReadinessSignal::Web { port })
         }
     }
 
