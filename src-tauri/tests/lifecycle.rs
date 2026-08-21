@@ -46,6 +46,7 @@ fn immediately_exiting_spec() -> RuntimeLaunchSpec {
         program: node,
         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
         env: BTreeMap::new(),
+        loopback_port: None,
     }
 }
 
@@ -143,7 +144,9 @@ fn dropping_managed_child_reclaims_the_process() {
 #[test]
 fn stop_reports_exited_when_node_finished_during_grace_period() {
     let _serial = process_test_lock();
-    let mut child = ManagedChild::spawn(&immediately_exiting_spec()).expect("Node 应启动");
+    let spec = immediately_exiting_spec();
+    assert_eq!(spec.loopback_port, None, "非网络进程不应触发 HTTP 探活");
+    let mut child = ManagedChild::spawn(&spec).expect("Node 应启动");
     let pid = child.id();
 
     assert_eq!(

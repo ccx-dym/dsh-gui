@@ -8,6 +8,7 @@ pub struct RuntimeLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub loopback_port: Option<u16>,
 }
 
 impl RuntimeLaunchSpec {
@@ -42,6 +43,7 @@ impl RuntimeLaunchSpec {
             program: node,
             args,
             env,
+            loopback_port: Some(port),
         }
     }
 }
@@ -92,6 +94,7 @@ mod tests {
         );
         assert_eq!(spec.env.get("NO_COLOR").unwrap(), "1");
         assert_eq!(spec.env.len(), 2);
+        assert_eq!(spec.loopback_port, Some(43127));
     }
 
     #[test]
