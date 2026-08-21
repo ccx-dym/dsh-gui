@@ -7,10 +7,13 @@ use std::{
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::sync::Mutex;
 use url::Url;
 
+#[cfg(any(not(debug_assertions), test))]
+use crate::runtime::install_state::{ActiveDeployment, DataGeneration};
 #[cfg(any(not(debug_assertions), test))]
 use crate::update::activation::ActivationError;
 #[cfg(not(debug_assertions))]
@@ -179,6 +182,7 @@ struct ActivationConfirmation {
     version: String,
     manifest_digest: String,
     generation: String,
+    prior_pointer: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -816,6 +820,82 @@ impl ActivationCheckpointSink for ProductionCheckpoints {
     }
 }
 
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Debug, Eq, PartialEq)]
+enum OrphanCandidateDisposition {
+    RestartPrior(ActiveDeployment),
+    RetryFresh,
+}
+
+/// 对 CandidatePrepared 与 JournalPrepared 之间的磁盘残留做只读、失败关闭分类。
+///
+/// validator 在生产环境同时复核签名 runtime inventory 与 candidate snapshot inventory；
+/// 测试可注入确定性校验器以直接覆盖真实 pending/confirmation/pointer 文件矩阵。
+#[cfg(any(not(debug_assertions), test))]
+fn inspect_orphan_candidate_with(
+    paths: &AppPaths,
+    pending: &PendingActivation,
+    validate_inventory: impl FnOnce(&InstalledRuntime, &DataGeneration) -> Result<(), ()>,
+) -> Result<OrphanCandidateDisposition, &'static str> {
+    let expected_pending =
+        serde_json::to_vec(pending).map_err(|_| "activation_recovery_required")?;
+    if std::fs::read(pending_path(paths, pending)).map_err(|_| "activation_recovery_required")?
+        != expected_pending
+        || activation_receipt(paths, pending).exists()
+    {
+        return Err("activation_recovery_required");
+    }
+    let confirmation: ActivationConfirmation = serde_json::from_slice(
+        &std::fs::read(confirmation_path(paths, pending))
+            .map_err(|_| "activation_recovery_required")?,
+    )
+    .map_err(|_| "activation_recovery_required")?;
+    if confirmation.schema != 2
+        || confirmation.status != "confirmed"
+        || confirmation.version != pending.version
+        || confirmation.manifest_digest != pending.manifest_digest
+        || confirmation.generation != pending.generation
+        || confirmation.prior_pointer != current_pointer_identity(paths)?
+    {
+        return Err("activation_recovery_required");
+    }
+
+    // 任意 journal 都必须交还 Task9 恢复矩阵；这里仅识别 journal 尚未落盘的窄窗口。
+    let journal_root = paths.settings.join("activation-journal");
+    match std::fs::read_dir(&journal_root) {
+        Ok(mut entries) => {
+            if entries
+                .next()
+                .transpose()
+                .map_err(|_| "activation_recovery_required")?
+                .is_some()
+            {
+                return Err("activation_recovery_required");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("activation_recovery_required"),
+    }
+
+    let runtime = InstalledRuntime::with_node_version(
+        &pending.version,
+        pending.manifest_digest.clone(),
+        &pending.node_version,
+    )
+    .map_err(|_| "activation_recovery_required")?;
+    let candidate =
+        DataGeneration::new(&pending.generation).map_err(|_| "activation_recovery_required")?;
+    validate_inventory(&runtime, &candidate).map_err(|_| "activation_recovery_required")?;
+
+    match InstallStateStore::new(RuntimeLayout::from_paths(paths)).load() {
+        Ok(active) if active.runtime != runtime || active.data.id != pending.generation => {
+            Ok(OrphanCandidateDisposition::RestartPrior(active))
+        }
+        Err(InstallStateError::NotInstalled) => Ok(OrphanCandidateDisposition::RetryFresh),
+        Ok(_) | Err(_) => Err("activation_recovery_required"),
+    }
+}
+
 /// 在 supervisor 启动前恢复旧事务或激活已确认的暂存版本。
 ///
 /// 在线命令只创建 append-only pending/confirmation；本函数是唯一切换入口。
@@ -972,22 +1052,38 @@ async fn cold_bootstrap_inner(
     let candidate = crate::runtime::install_state::DataGeneration::new(&pending.generation)
         .map_err(|_| "activation_recovery_required")?;
     if layout.generation_dir(&candidate).exists() {
-        // 没有 terminal receipt 却已有 candidate，表示在 journal 前崩溃或外部篡改；
-        // 保留现场并停止自动重试，避免每次启动形成激活循环。
-        write_activation_receipt(
+        let disposition = inspect_orphan_candidate_with(
             &update_controller.paths,
             &pending,
-            &UpdateUiPhase::RecoveryRequired,
-        )
-        .map_err(|_| "activation_recovery_required")?;
+            |runtime, candidate| {
+                verify_installed_runtime_inventory(
+                    &layout.runtime_dir(runtime),
+                    ArchiveInstallPolicy::default(),
+                    || true,
+                )
+                .map_err(|_| ())?;
+                activator
+                    .validate_prepared_candidate(candidate)
+                    .map_err(|_| ())
+            },
+        )?;
+        if let OrphanCandidateDisposition::RestartPrior(prior) = disposition {
+            app_controller
+                .start_exact_active_runtime(&prior)
+                .await
+                .map_err(|_| "activation_recovery_required")?;
+        }
+        // candidate 只作为崩溃证据保留；显式重试会生成全新的 generation id。
+        write_activation_receipt(&update_controller.paths, &pending, &UpdateUiPhase::Failed)
+            .map_err(|_| "activation_recovery_required")?;
         update_controller
             .publish_cold_phase(
                 app,
-                UpdateUiPhase::RecoveryRequired,
-                Some("candidate_without_terminal_journal"),
+                UpdateUiPhase::Failed,
+                Some("activation_retry_available"),
             )
             .await;
-        return Err("activation_recovery_required");
+        return Ok(());
     }
 
     let workspace = update_controller.paths.dsh_home.join("projects/default");
@@ -1142,11 +1238,12 @@ fn load_single_confirmed_pending(
                 &std::fs::read(&confirmation).map_err(|_| "activation_recovery_required")?,
             )
             .map_err(|_| "activation_recovery_required")?;
-            if document.schema != 1
+            if document.schema != 2
                 || document.status != "confirmed"
                 || document.version != pending.version
                 || document.manifest_digest != pending.manifest_digest
                 || document.generation != pending.generation
+                || !valid_pointer_identity(&document.prior_pointer)
             {
                 return Err("activation_recovery_required");
             }
@@ -1276,14 +1373,38 @@ fn persist_confirmation_record(
     pending: &PendingActivation,
 ) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&ActivationConfirmation {
-        schema: 1,
+        schema: 2,
         status: "confirmed".to_owned(),
         version: pending.version.clone(),
         manifest_digest: pending.manifest_digest.clone(),
         generation: pending.generation.clone(),
+        prior_pointer: current_pointer_identity(paths).map_err(std::io::Error::other)?,
     })
     .map_err(std::io::Error::other)?;
     write_new_or_matching(&confirmation_path(paths, pending), &bytes)
+}
+
+fn current_pointer_identity(paths: &AppPaths) -> Result<String, &'static str> {
+    let layout = RuntimeLayout::from_paths(paths);
+    match InstallStateStore::new(layout.clone()).load() {
+        Ok(_) => {
+            let bytes = std::fs::read(layout.deployment_file())
+                .map_err(|_| "activation_recovery_required")?;
+            Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+        }
+        Err(InstallStateError::NotInstalled) => Ok("uninstalled".to_owned()),
+        Err(_) => Err("activation_recovery_required"),
+    }
+}
+
+fn valid_pointer_identity(value: &str) -> bool {
+    value == "uninstalled"
+        || value.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
 }
 
 fn create_explicit_retry_attempt(paths: &AppPaths) -> Result<PendingActivation, &'static str> {
@@ -1318,11 +1439,12 @@ fn create_explicit_retry_attempt(paths: &AppPaths) -> Result<PendingActivation, 
             &std::fs::read(confirmation_path).map_err(|_| "activation_recovery_required")?,
         )
         .map_err(|_| "activation_recovery_required")?;
-        if confirmation.schema != 1
+        if confirmation.schema != 2
             || confirmation.status != "confirmed"
             || confirmation.version != pending.version
             || confirmation.manifest_digest != pending.manifest_digest
             || confirmation.generation != pending.generation
+            || !valid_pointer_identity(&confirmation.prior_pointer)
         {
             return Err("activation_recovery_required");
         }
@@ -1409,11 +1531,15 @@ fn write_new_or_matching(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        ColdRecoveryPlan, ColdRecoveryResult, PendingActivation, UpdateUiController, UpdateUiPhase,
-        activation_receipt, confirmation_path, finish_cold_recovery, load_single_confirmed_pending,
+        ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
+        UpdateUiController, UpdateUiPhase, activation_receipt, confirmation_path,
+        finish_cold_recovery, inspect_orphan_candidate_with, load_single_confirmed_pending,
         pending_path, plan_cold_recovery, write_activation_receipt,
     };
-    use crate::paths::AppPaths;
+    use crate::paths::{AppPaths, RuntimeLayout};
+    use crate::runtime::install_state::{
+        ActiveDeployment, DataGeneration, InstallStateStore, InstalledRuntime,
+    };
     use crate::update::activation::{
         ActivationCheckpoint, ActivationError, ActivationFailure, ActivationFailureStage,
     };
@@ -1487,7 +1613,7 @@ mod tests {
         std::fs::write(
             confirmation_path(&paths, &pending),
             format!(
-                r#"{{"schema":1,"status":"confirmed","version":"0.1.2","manifest_digest":"{}","generation":"{}"}}"#,
+                r#"{{"schema":2,"status":"confirmed","version":"0.1.2","manifest_digest":"{}","generation":"{}","prior_pointer":"uninstalled"}}"#,
                 "a".repeat(64), pending.generation
             ),
         )
@@ -1574,11 +1700,138 @@ mod tests {
         std::fs::write(
             confirmation_path(paths, pending),
             format!(
-                r#"{{"schema":1,"status":"confirmed","version":"{}","manifest_digest":"{}","generation":"{}"}}"#,
-                pending.version, pending.manifest_digest, pending.generation
+                r#"{{"schema":2,"status":"confirmed","version":"{}","manifest_digest":"{}","generation":"{}","prior_pointer":"{}"}}"#,
+                pending.version,
+                pending.manifest_digest,
+                pending.generation,
+                super::current_pointer_identity(paths).unwrap()
             ),
         )
         .unwrap();
+    }
+
+    fn orphan_candidate_fixture(
+        label: &str,
+        with_prior: bool,
+    ) -> (AppPaths, PendingActivation, Option<ActiveDeployment>) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("dsh-orphan-{label}-{nonce}"));
+        let paths = AppPaths::from_roots(&root.join("roaming"), &root.join("local"));
+        paths.ensure_exists().unwrap();
+        let pending = PendingActivation {
+            schema: 1,
+            status: "downloaded".to_owned(),
+            version: "0.2.0".to_owned(),
+            node_version: "24.15.0".to_owned(),
+            manifest_digest: "d".repeat(64),
+            generation: format!("generation-dddddddddddddddddddddddd-{nonce}"),
+        };
+        std::fs::write(
+            pending_path(&paths, &pending),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        let layout = RuntimeLayout::from_paths(&paths);
+        std::fs::create_dir_all(
+            layout.generation_dir(&DataGeneration::new(&pending.generation).unwrap()),
+        )
+        .unwrap();
+        let prior = with_prior.then(|| {
+            let runtime =
+                InstalledRuntime::with_node_version("0.1.0", "e".repeat(64), "24.15.0").unwrap();
+            let data = DataGeneration::new("generation-prior").unwrap();
+            std::fs::create_dir_all(layout.runtime_dir(&runtime)).unwrap();
+            std::fs::create_dir_all(layout.generation_dir(&data)).unwrap();
+            let workspace = paths.dsh_home.join("projects/prior");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let active = ActiveDeployment::with_project_workspace(
+                runtime,
+                data,
+                "epoch-prior".to_owned(),
+                workspace,
+            );
+            InstallStateStore::new(layout.clone())
+                .save(&active)
+                .unwrap();
+            InstallStateStore::new(layout.clone()).load().unwrap()
+        });
+        std::fs::write(
+            confirmation_path(&paths, &pending),
+            serde_json::to_vec(&super::ActivationConfirmation {
+                schema: 2,
+                status: "confirmed".to_owned(),
+                version: pending.version.clone(),
+                manifest_digest: pending.manifest_digest.clone(),
+                generation: pending.generation.clone(),
+                prior_pointer: super::current_pointer_identity(&paths).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        (paths, pending, prior)
+    }
+
+    #[test]
+    fn orphan_candidate_without_journal_recovers_exact_active_prior() {
+        let (paths, pending, prior) = orphan_candidate_fixture("active", true);
+        let result =
+            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())).expect("valid residual");
+        assert_eq!(
+            result,
+            OrphanCandidateDisposition::RestartPrior(prior.unwrap())
+        );
+        assert!(!activation_receipt(&paths, &pending).exists());
+    }
+
+    #[test]
+    fn orphan_candidate_without_journal_keeps_fresh_install_uninstalled() {
+        let (paths, pending, _) = orphan_candidate_fixture("fresh", false);
+        assert_eq!(
+            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())).unwrap(),
+            OrphanCandidateDisposition::RetryFresh
+        );
+    }
+
+    #[test]
+    fn orphan_candidate_with_invalid_pointer_requires_recovery() {
+        let (paths, pending, _) = orphan_candidate_fixture("invalid", false);
+        std::fs::write(
+            RuntimeLayout::from_paths(&paths).deployment_file(),
+            b"truncated",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())),
+            Err("activation_recovery_required")
+        );
+    }
+
+    #[test]
+    fn orphan_candidate_with_valid_but_mismatched_pointer_requires_recovery() {
+        let (paths, pending, _) = orphan_candidate_fixture("mismatch", true);
+        let layout = RuntimeLayout::from_paths(&paths);
+        let runtime =
+            InstalledRuntime::with_node_version("0.1.1", "f".repeat(64), "24.15.0").unwrap();
+        let data = DataGeneration::new("generation-other").unwrap();
+        std::fs::create_dir_all(layout.runtime_dir(&runtime)).unwrap();
+        std::fs::create_dir_all(layout.generation_dir(&data)).unwrap();
+        let workspace = paths.dsh_home.join("projects/other");
+        std::fs::create_dir_all(&workspace).unwrap();
+        InstallStateStore::new(layout)
+            .save(&ActiveDeployment::with_project_workspace(
+                runtime,
+                data,
+                "epoch-other".to_owned(),
+                workspace,
+            ))
+            .unwrap();
+        assert_eq!(
+            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())),
+            Err("activation_recovery_required")
+        );
     }
 
     #[test]

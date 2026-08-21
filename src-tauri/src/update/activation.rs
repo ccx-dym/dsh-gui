@@ -450,6 +450,36 @@ impl RuntimeActivator {
         self
     }
 
+    /// 校验 journal 写入前遗留 candidate 的目录身份、ACL 与有界文件清单。
+    ///
+    /// 该校验只用于判断残留是否确实来自已完成的 snapshot；candidate 仍会被封存，
+    /// 后续显式重试必须创建新的 generation，绝不会复用此目录。
+    ///
+    /// :param candidate: 已由 pending 文档验证过的 generation 标识。
+    /// :return: 目录边界、ACL 与 snapshot 清单均可信时返回。
+    /// :raises ActivationError: 路径替换、重解析点、硬链接或额度异常时返回。
+    #[cfg(not(debug_assertions))]
+    pub(crate) fn validate_prepared_candidate(
+        &self,
+        candidate: &DataGeneration,
+    ) -> Result<(), ActivationError> {
+        validate_plain_dir(self.layout.generation_root())?;
+        let canonical_root = self
+            .layout
+            .generation_root()
+            .canonicalize()
+            .map_err(ActivationError::io)?;
+        let target = self.layout.generation_dir(candidate);
+        validate_plain_dir(&target)?;
+        self.acl.ensure_private(&target)?;
+        let canonical_target = target.canonicalize().map_err(ActivationError::io)?;
+        if canonical_target.parent() != Some(canonical_root.as_path()) {
+            return Err(ActivationError::UnsafeSnapshot);
+        }
+        measure_generation(&target, self.policy)?;
+        Ok(())
+    }
+
     /// 保存首次安装向导已确认的可信本地项目目录。
     ///
     /// :param path: 用户选择且当前存在的绝对普通目录。

@@ -1969,6 +1969,7 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Security::{WinCreatorOwnerSid, WinWorldSid};
     use windows::Win32::Storage::FileSystem::{
         DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
         FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
@@ -2018,7 +2019,7 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace fixture");
         use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
 
-        grant_everyone_access(&workspace, GENERIC_WRITE.0);
+        grant_well_known_access(&workspace, WinWorldSid, GENERIC_WRITE.0);
         assert!(
             ensure_private_windows_dacl(&workspace).is_err(),
             "Everyone 写入权限必须被生产校验拒绝"
@@ -2027,17 +2028,25 @@ mod tests {
         secure_private_windows_dacl(&workspace).expect("产品私有目录应能收敛 DACL");
         ensure_strict_private_windows_dacl(&workspace).expect("收敛后仅可信主体可访问");
 
-        grant_everyone_access(&workspace, GENERIC_READ.0);
-        ensure_private_windows_dacl(&workspace).expect("普通 candidate 策略允许非可信只读 ACE");
-        assert!(
-            ensure_strict_private_windows_dacl(&workspace).is_err(),
-            "workspace 策略必须拒绝 Everyone 只读 ACE"
-        );
-        secure_private_windows_dacl(&workspace).expect("应重新移除宽泛只读 ACE");
-        ensure_strict_private_windows_dacl(&workspace).expect("DACL 必须受保护且主体集合精确");
+        for (sid_type, label) in [
+            (WinWorldSid, "Everyone"),
+            (WinCreatorOwnerSid, "CreatorOwner"),
+        ] {
+            grant_well_known_access(&workspace, sid_type, GENERIC_READ.0);
+            assert!(
+                ensure_strict_private_windows_dacl(&workspace).is_err(),
+                "workspace 策略必须拒绝 {label} ACE"
+            );
+            secure_private_windows_dacl(&workspace).expect("应重新移除宽泛 ACE");
+            ensure_strict_private_windows_dacl(&workspace).expect("DACL 必须受保护且主体集合精确");
+        }
     }
 
-    fn grant_everyone_access(path: &std::path::Path, access_mask: u32) {
+    fn grant_well_known_access(
+        path: &std::path::Path,
+        sid_type: windows::Win32::Security::WELL_KNOWN_SID_TYPE,
+        access_mask: u32,
+    ) {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
         use windows::Win32::Security::Authorization::{
@@ -2047,7 +2056,7 @@ mod tests {
         };
         use windows::Win32::Security::{
             ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-            PSECURITY_DESCRIPTOR, PSID, WinWorldSid,
+            PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
         };
         use windows::core::{PCWSTR, PWSTR};
 
@@ -2072,15 +2081,19 @@ mod tests {
         };
         assert_eq!(status, ERROR_SUCCESS);
         let mut sid_size = 0_u32;
-        let _ = unsafe { CreateWellKnownSid(WinWorldSid, None, None, &mut sid_size) };
+        let _ = unsafe { CreateWellKnownSid(sid_type, None, None, &mut sid_size) };
         let mut sid = vec![0_u8; sid_size as usize];
         let everyone = PSID(sid.as_mut_ptr().cast());
-        unsafe { CreateWellKnownSid(WinWorldSid, None, Some(everyone), &mut sid_size) }
-            .expect("Everyone SID");
+        unsafe { CreateWellKnownSid(sid_type, None, Some(everyone), &mut sid_size) }
+            .expect("well-known SID");
         let entry = EXPLICIT_ACCESS_W {
             grfAccessPermissions: access_mask,
             grfAccessMode: GRANT_ACCESS,
-            grfInheritance: NO_INHERITANCE,
+            grfInheritance: if sid_type == WinCreatorOwnerSid {
+                SUB_CONTAINERS_AND_OBJECTS_INHERIT
+            } else {
+                NO_INHERITANCE
+            },
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation: Default::default(),
