@@ -3,6 +3,7 @@ pub mod domain;
 pub mod paths;
 pub mod runtime;
 pub mod tray;
+pub mod update;
 
 use app_controller::{AppController, get_runtime_status, retry_runtime};
 use tauri::Manager;
