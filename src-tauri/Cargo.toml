@@ -23,6 +23,7 @@ tauri-plugin-single-instance = "=2.4.3"
 thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", default-features = false, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 url = "=2.5.8"
+zip = { version = "=8.4.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "=0.62.2", features = [
