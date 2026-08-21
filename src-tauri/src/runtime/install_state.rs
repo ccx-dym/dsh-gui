@@ -13,6 +13,7 @@ const DEPLOYMENT_SCHEMA: u32 = 1;
 pub struct InstalledRuntime {
     pub version: Version,
     pub manifest_digest: String,
+    pub node_version: Version,
 }
 
 impl InstalledRuntime {
@@ -20,9 +21,14 @@ impl InstalledRuntime {
     ///
     /// :param version: 不带 `v` 前缀的完整 semver 字符串。
     /// :param manifest_digest: 已验证兼容清单的 SHA-256 摘要。
-    /// :return: 类型化的已安装运行时标识。
-    /// :raises InstallStateError: 版本不是严格 semver 时返回 `InvalidVersion`。
-    pub fn new(version: &str, manifest_digest: String) -> Result<Self, InstallStateError> {
+    /// :param node_version: 离线启动所需的严格 Node semver。
+    /// :return: 类型化且可离线恢复的已安装运行时标识。
+    /// :raises InstallStateError: 版本或摘要无效时返回对应错误。
+    pub fn new(
+        version: &str,
+        manifest_digest: String,
+        node_version: &str,
+    ) -> Result<Self, InstallStateError> {
         let parsed =
             Version::parse(version).map_err(|source| InstallStateError::InvalidVersion {
                 version: version.to_owned(),
@@ -35,10 +41,32 @@ impl InstalledRuntime {
         if !digest_is_canonical {
             return Err(InstallStateError::InvalidManifestDigest);
         }
+        let node_version = Version::parse(node_version).map_err(|source| {
+            InstallStateError::InvalidNodeVersion {
+                version: node_version.to_owned(),
+                source,
+            }
+        })?;
         Ok(Self {
             version: parsed,
             manifest_digest,
+            node_version,
         })
+    }
+
+    /// 创建包含离线启动所需 Node 版本的完整运行时 descriptor。
+    ///
+    /// :param version: DSH 严格 semver。
+    /// :param manifest_digest: 已验证兼容清单摘要。
+    /// :param node_version: 签名清单固定的 Node 严格 semver。
+    /// :return: 可持久化并在崩溃恢复时独立启动的 descriptor。
+    /// :raises InstallStateError: 任一版本或摘要无效时返回。
+    pub fn with_node_version(
+        version: &str,
+        manifest_digest: String,
+        node_version: &str,
+    ) -> Result<Self, InstallStateError> {
+        Self::new(version, manifest_digest, node_version)
     }
 }
 
@@ -106,6 +134,7 @@ pub struct ActiveDeployment {
     pub runtime: InstalledRuntime,
     pub data: DataGeneration,
     pub activated_at: String,
+    pub project_workspace: Option<PathBuf>,
 }
 
 impl ActiveDeployment {
@@ -121,6 +150,29 @@ impl ActiveDeployment {
             runtime,
             data,
             activated_at,
+            project_workspace: None,
+        }
+    }
+
+    /// 创建包含可信本地项目目录的完整激活配对。
+    ///
+    /// :param runtime: 含 Node 版本的完整运行时 descriptor。
+    /// :param data: 与运行时成对切换的数据 generation。
+    /// :param activated_at: UTC 激活时间。
+    /// :param project_workspace: 首次设置后规范化的本地项目目录。
+    /// :return: 可供 `InstallStateStore` 校验并持久化的完整配对。
+    /// :raises: 此值构造器不执行 I/O；存储时会重验目录。
+    pub fn with_project_workspace(
+        runtime: InstalledRuntime,
+        data: DataGeneration,
+        activated_at: String,
+        project_workspace: PathBuf,
+    ) -> Self {
+        Self {
+            runtime,
+            data,
+            activated_at,
+            project_workspace: Some(project_workspace),
         }
     }
 }
@@ -137,12 +189,23 @@ pub enum InstallStateError {
     },
     #[error("兼容清单摘要不是规范的小写 SHA-256 hex")]
     InvalidManifestDigest,
+    #[error("无效的 Node 版本 {version}: {source}")]
+    InvalidNodeVersion {
+        version: String,
+        source: semver::Error,
+    },
+    #[error("deployment 缺少离线启动 descriptor 字段 {field}")]
+    MissingDescriptor { field: &'static str },
+    #[error("项目工作目录不是可信的本地普通目录")]
+    InvalidProjectWorkspace,
     #[error("无效的数据 generation 标识: {id}")]
     InvalidGeneration { id: String },
     #[error("deployment.json 不是完整有效的 JSON: {source}")]
     InvalidJson { source: serde_json::Error },
     #[error("不支持的 deployment schema: {schema}")]
     UnknownSchema { schema: u32 },
+    #[error("不支持的 deployment 状态")]
+    UnknownStatus,
     #[error("deployment 字段 {field} 逃逸固定根目录")]
     PathEscape { field: &'static str },
     #[error("待激活的 {target} 目录不存在")]
@@ -160,24 +223,37 @@ pub enum InstallStateError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DeploymentDocument {
     schema: u32,
     runtime: RuntimeDocument,
     data: DataDocument,
     activated_at: String,
+    project_workspace: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeDocument {
     version: String,
     relative_dir: String,
     manifest_digest: String,
+    node_version: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DataDocument {
     id: String,
     relative_dir: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UninstalledDocument {
+    schema: u32,
+    status: String,
+    changed_at: String,
 }
 
 /// 在漫游设置目录维护单一原子 deployment 指针。
@@ -209,7 +285,29 @@ impl InstallStateStore {
             }
             Err(source) => return Err(io_error("read", path, source)),
         };
-        let document: DeploymentDocument = serde_json::from_slice(&bytes)
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|source| InstallStateError::InvalidJson { source })?;
+        if raw.get("status").is_some() {
+            let document: UninstalledDocument = serde_json::from_value(raw)
+                .map_err(|source| InstallStateError::InvalidJson { source })?;
+            if document.schema != DEPLOYMENT_SCHEMA {
+                return Err(InstallStateError::UnknownSchema {
+                    schema: document.schema,
+                });
+            }
+            if document.status == "uninstalled" {
+                return Err(InstallStateError::NotInstalled);
+            }
+            return Err(InstallStateError::UnknownStatus);
+        }
+        if let Some(schema) = raw.get("schema").and_then(serde_json::Value::as_u64)
+            && schema != u64::from(DEPLOYMENT_SCHEMA)
+        {
+            return Err(InstallStateError::UnknownSchema {
+                schema: u32::try_from(schema).unwrap_or(u32::MAX),
+            });
+        }
+        let document: DeploymentDocument = serde_json::from_value(raw)
             .map_err(|source| InstallStateError::InvalidJson { source })?;
         if document.schema != DEPLOYMENT_SCHEMA {
             return Err(InstallStateError::UnknownSchema {
@@ -217,9 +315,13 @@ impl InstallStateStore {
             });
         }
 
-        let runtime =
-            InstalledRuntime::new(&document.runtime.version, document.runtime.manifest_digest)?;
+        let runtime = InstalledRuntime::with_node_version(
+            &document.runtime.version,
+            document.runtime.manifest_digest,
+            &document.runtime.node_version,
+        )?;
         let data = DataGeneration::new(&document.data.id)?;
+        let project_workspace = validate_project_workspace(Path::new(&document.project_workspace))?;
         validate_relative_dir(
             "runtime",
             &document.runtime.relative_dir,
@@ -230,7 +332,12 @@ impl InstallStateStore {
             &document.data.relative_dir,
             Path::new("generations").join(&data.id),
         )?;
-        Ok(ActiveDeployment::new(runtime, data, document.activated_at))
+        Ok(ActiveDeployment::with_project_workspace(
+            runtime,
+            data,
+            document.activated_at,
+            project_workspace,
+        ))
     }
 
     /// 将 runtime 与 data 配对写入同一个原子激活指针。
@@ -244,6 +351,13 @@ impl InstallStateStore {
     /// :raises InstallStateError: 目标目录缺失/不是目录，或创建设置目录、序列化、写入、
     ///   flush、rename 失败时返回。
     pub fn save(&self, deployment: &ActiveDeployment) -> Result<(), InstallStateError> {
+        let node_version = &deployment.runtime.node_version;
+        let project_workspace = deployment.project_workspace.as_deref().ok_or(
+            InstallStateError::MissingDescriptor {
+                field: "project_workspace",
+            },
+        )?;
+        let project_workspace = validate_project_workspace(project_workspace)?;
         let runtime_dir = self.layout.runtime_dir(&deployment.runtime);
         let generation_dir = self.layout.generation_dir(&deployment.data);
         validate_deployment_directory("runtime", &runtime_dir)?;
@@ -261,12 +375,14 @@ impl InstallStateStore {
                 version: deployment.runtime.version.to_string(),
                 relative_dir: format!("dsh/{}", deployment.runtime.version),
                 manifest_digest: deployment.runtime.manifest_digest.clone(),
+                node_version: node_version.to_string(),
             },
             data: DataDocument {
                 id: deployment.data.id.clone(),
                 relative_dir: format!("generations/{}", deployment.data.id),
             },
             activated_at: deployment.activated_at.clone(),
+            project_workspace: project_workspace.to_string_lossy().into_owned(),
         };
         let bytes = serde_json::to_vec(&document)
             .map_err(|source| InstallStateError::Serialize { source })?;
@@ -285,6 +401,71 @@ impl InstallStateStore {
             .map_err(|source| io_error("rename", destination, source))?;
         Ok(())
     }
+
+    /// 原子写入明确的“已安装但未激活”权威状态，不删除 deployment pointer。
+    ///
+    /// :param changed_at: 进入未激活状态的 UTC 时间。
+    /// :return: 文件 flush 并原子替换完成时返回。
+    /// :raises InstallStateError: 设置目录创建、序列化或写入失败时返回。
+    pub fn mark_uninstalled(&self, changed_at: &str) -> Result<(), InstallStateError> {
+        let destination = self.layout.deployment_file();
+        let parent = destination.parent().ok_or(InstallStateError::PathEscape {
+            field: "deployment",
+        })?;
+        fs::create_dir_all(parent).map_err(|source| io_error("create_dir_all", parent, source))?;
+        let bytes = serde_json::to_vec(&UninstalledDocument {
+            schema: DEPLOYMENT_SCHEMA,
+            status: "uninstalled".to_owned(),
+            changed_at: changed_at.to_owned(),
+        })
+        .map_err(|source| InstallStateError::Serialize { source })?;
+        write_atomic(
+            parent,
+            destination,
+            "deployment-uninstalled.json.tmp",
+            &bytes,
+        )
+    }
+}
+
+pub(crate) fn validate_project_workspace(path: &Path) -> Result<PathBuf, InstallStateError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| InstallStateError::InvalidProjectWorkspace)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || !path.is_absolute() {
+        return Err(InstallStateError::InvalidProjectWorkspace);
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| InstallStateError::InvalidProjectWorkspace)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(InstallStateError::InvalidProjectWorkspace);
+        }
+    }
+    Ok(canonical)
+}
+
+fn write_atomic(
+    parent: &Path,
+    destination: &Path,
+    temporary_name: &str,
+    bytes: &[u8],
+) -> Result<(), InstallStateError> {
+    let temporary = parent.join(temporary_name);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| io_error("open", &temporary, source))?;
+    file.write_all(bytes)
+        .map_err(|source| io_error("write", &temporary, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("flush", &temporary, source))?;
+    drop(file);
+    fs::rename(&temporary, destination).map_err(|source| io_error("rename", destination, source))
 }
 
 fn validate_deployment_directory(
@@ -348,10 +529,15 @@ mod tests {
     }
 
     fn deployment(version: &str, generation: &str) -> ActiveDeployment {
-        ActiveDeployment::new(
-            InstalledRuntime::new(version, "a".repeat(64)).expect("测试版本应有效"),
+        ActiveDeployment::with_project_workspace(
+            InstalledRuntime::with_node_version(version, "a".repeat(64), "24.15.0")
+                .expect("测试版本应有效"),
             DataGeneration::new(generation).expect("测试 generation 应有效"),
             "2026-08-21T09:30:00Z".to_owned(),
+            std::env::current_dir()
+                .expect("测试 cwd")
+                .canonicalize()
+                .expect("测试 cwd canonical"),
         )
     }
 
@@ -363,10 +549,40 @@ mod tests {
     }
 
     #[test]
+    fn explicit_uninstalled_state_survives_offline_restart_without_deleting_pointer() {
+        let paths = test_paths("uninstalled");
+        let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
+
+        store
+            .mark_uninstalled("2026-08-22T00:00:00Z")
+            .expect("应能原子写入未激活状态");
+
+        assert!(paths.settings.join("deployment.json").is_file());
+        assert!(matches!(store.load(), Err(InstallStateError::NotInstalled)));
+    }
+
+    #[test]
+    fn uninstalled_pointer_rejects_unknown_schema_and_fields() {
+        let paths = test_paths("uninstalled-strict");
+        let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
+        fs::create_dir_all(&paths.settings).expect("settings");
+        for json in [
+            r#"{"schema":2,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z"}"#,
+            r#"{"schema":1,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z","extra":true}"#,
+        ] {
+            fs::write(paths.settings.join("deployment.json"), json).expect("pointer");
+            assert!(!matches!(
+                store.load(),
+                Err(InstallStateError::NotInstalled)
+            ));
+        }
+    }
+
+    #[test]
     fn installed_runtime_rejects_non_strict_semver() {
         for invalid in ["1", "1.2", "v1.2.3", "1.2.3/escape", " 1.2.3"] {
             assert!(matches!(
-                InstalledRuntime::new(invalid, "a".repeat(64)),
+                InstalledRuntime::new(invalid, "a".repeat(64), "24.15.0"),
                 Err(InstallStateError::InvalidVersion { .. })
             ));
         }
@@ -380,7 +596,7 @@ mod tests {
             "g".repeat(64),
             "A".repeat(64),
         ] {
-            let error = InstalledRuntime::new("1.2.3", invalid.clone())
+            let error = InstalledRuntime::new("1.2.3", invalid.clone(), "24.15.0")
                 .expect_err("非规范 SHA-256 摘要必须被拒绝");
             assert!(matches!(error, InstallStateError::InvalidManifestDigest));
             assert!(!error.to_string().contains(&invalid));
@@ -438,8 +654,16 @@ mod tests {
             ("runtime", "../outside", "generations/generation-001"),
             ("data", "dsh/1.2.3", "../outside"),
         ] {
+            let workspace = serde_json::to_string(
+                &std::env::current_dir()
+                    .expect("测试 cwd")
+                    .canonicalize()
+                    .expect("测试 cwd canonical")
+                    .to_string_lossy(),
+            )
+            .expect("workspace json");
             let json = format!(
-                r#"{{"schema":1,"runtime":{{"version":"1.2.3","relative_dir":"{runtime_dir}","manifest_digest":"{}"}},"data":{{"id":"generation-001","relative_dir":"{data_dir}"}},"activated_at":"2026-08-21T09:30:00Z"}}"#,
+                r#"{{"schema":1,"runtime":{{"version":"1.2.3","relative_dir":"{runtime_dir}","manifest_digest":"{}","node_version":"24.15.0"}},"data":{{"id":"generation-001","relative_dir":"{data_dir}"}},"activated_at":"2026-08-21T09:30:00Z","project_workspace":{workspace}}}"#,
                 "a".repeat(64)
             );
             fs::write(paths.settings.join("deployment.json"), json).expect("应能写入逃逸夹具");

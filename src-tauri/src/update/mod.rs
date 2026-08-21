@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod archive;
 pub mod coordinator;
 pub mod download;

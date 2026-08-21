@@ -94,6 +94,8 @@ pub enum ArchiveInstallError {
     ArtifactSizeMismatch,
     #[error("运行时压缩包摘要与下载验证结果不一致")]
     ArtifactDigestMismatch,
+    #[error("运行时 descriptor 与解压请求的 Node 版本不一致")]
+    RuntimeDescriptorMismatch,
     #[error("运行时压缩包包含不安全路径")]
     UnsafeEntry,
     #[error("运行时压缩包包含不支持的条目类型")]
@@ -407,6 +409,9 @@ fn install_blocking(
     request: ArchiveInstallRequest,
     policy: ArchiveInstallPolicy,
 ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
+    if request.runtime.node_version != request.node_version {
+        return Err(ArchiveInstallError::RuntimeDescriptorMismatch);
+    }
     validate_trace_id(&request.trace_id)?;
     validate_source_path(&request.archive_path)?;
     let mut archive_file = open_verified_archive(&request.archive_path)?;
@@ -1218,7 +1223,8 @@ mod tests {
     }
 
     fn runtime() -> InstalledRuntime {
-        InstalledRuntime::new(DSH_VERSION, "a".repeat(64)).expect("runtime")
+        InstalledRuntime::with_node_version(DSH_VERSION, "a".repeat(64), NODE_VERSION)
+            .expect("runtime")
     }
 
     fn layout(root: &Path) -> RuntimeLayout {
@@ -1367,6 +1373,27 @@ mod tests {
             .expect("policy")
             .install(request(&root, archive_path, "trace_01"))
             .await
+    }
+
+    #[tokio::test]
+    async fn rejects_node_version_that_is_not_bound_to_runtime_descriptor() {
+        let root = test_root("node-descriptor-mismatch");
+        fs::create_dir_all(&root).expect("root");
+        let archive_path = root.join("artifact.verified");
+        fs::write(&archive_path, archive_bytes(&valid_payload())).expect("archive");
+        let mut install_request = request(&root, archive_path, "trace_01");
+        install_request.node_version = Version::parse("23.0.0").expect("node version");
+
+        let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
+            .expect("policy")
+            .install(install_request)
+            .await
+            .expect_err("runtime descriptor and archive validation must use the same Node");
+
+        assert!(matches!(
+            error,
+            ArchiveInstallError::RuntimeDescriptorMismatch
+        ));
     }
 
     #[tokio::test]

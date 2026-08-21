@@ -1,45 +1,44 @@
-use crate::domain::RuntimeStatus;
-#[cfg(any(debug_assertions, test))]
-use crate::domain::{AppPhase, RuntimeEvent};
-#[cfg(debug_assertions)]
+use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
 use crate::paths::AppPaths;
-use crate::runtime::RuntimeError;
-#[cfg(any(debug_assertions, test))]
-use crate::runtime::RuntimeEventSink;
-#[cfg(debug_assertions)]
-use crate::runtime::RuntimeSupervisor;
-#[cfg(debug_assertions)]
+#[cfg(any(not(debug_assertions), test))]
+use crate::paths::RuntimeLayout;
 use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
+use crate::runtime::install_state::{ActiveDeployment, InstallStateStore};
+use crate::runtime::{RuntimeError, RuntimeEventSink, RuntimeSupervisor};
+use crate::update::activation::{
+    RuntimeBusyProvider, RuntimeBusyState, UnknownRuntimeBusyProvider,
+};
 #[cfg(debug_assertions)]
 use std::env;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-#[cfg(debug_assertions)]
 use std::time::Duration;
-#[cfg(debug_assertions)]
+#[cfg(not(debug_assertions))]
+use std::time::Instant;
 use tauri::Emitter;
 use tauri::{AppHandle, Manager};
 
 #[cfg(debug_assertions)]
 const MOCK_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(debug_assertions)]
 const RUNTIME_STOP_GRACE: Duration = Duration::from_secs(2);
 
-trait RuntimeLifecycle: Send + Sync + 'static {
+#[cfg(not(debug_assertions))]
+const OFFICIAL_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) trait RuntimeLifecycle: Send + Sync + 'static {
     fn start(&self) -> Result<(), RuntimeError>;
     fn stop(&self) -> Result<(), RuntimeError>;
+    fn start_and_wait_ready(&self, deployment: &ActiveDeployment) -> Result<(), RuntimeError>;
 }
 
-#[cfg(any(debug_assertions, test))]
 trait RuntimeUi: Send + Sync + 'static {
     fn emit_status(&self, event: &RuntimeEvent) -> Result<(), RuntimeError>;
     fn navigate_main(&self, url: &tauri::Url) -> Result<(), RuntimeError>;
 }
 
-#[cfg(debug_assertions)]
 struct TauriRuntimeUi {
     app: AppHandle,
 }
@@ -82,23 +81,109 @@ impl RuntimeLifecycle for MockRuntimeLifecycle {
     fn stop(&self) -> Result<(), RuntimeError> {
         self.supervisor.stop(RUNTIME_STOP_GRACE)
     }
+
+    fn start_and_wait_ready(&self, _deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+        // 开发 mock 的异步启动不满足激活事务的同步“真实就绪”契约，必须失败关闭。
+        Err(RuntimeError::MockRuntimeDisabled)
+    }
 }
 
 #[cfg(not(debug_assertions))]
-struct UnavailableRuntime;
+struct OfficialRuntimeLifecycle {
+    supervisor: Arc<RuntimeSupervisor>,
+    status: Arc<RwLock<RuntimeStatus>>,
+    app: AppHandle,
+    local_url: tauri::Url,
+    layout: RuntimeLayout,
+}
 
 #[cfg(not(debug_assertions))]
-impl RuntimeLifecycle for UnavailableRuntime {
+impl OfficialRuntimeLifecycle {
+    fn start_exact(&self, deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+        let port = reserve_loopback_port()?;
+        let spec = official_launch_spec(&self.layout, deployment, port)?;
+        let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
+            app: self.app.clone(),
+        });
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
+            Arc::clone(&self.status),
+            ui,
+            self.local_url.clone(),
+        ));
+        self.supervisor.start(spec, OFFICIAL_READY_TIMEOUT, sink)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+impl RuntimeLifecycle for OfficialRuntimeLifecycle {
     fn start(&self) -> Result<(), RuntimeError> {
-        Err(RuntimeError::MockRuntimeDisabled)
+        let deployment = InstallStateStore::new(self.layout.clone())
+            .load()
+            .map_err(|_| RuntimeError::DeploymentChanged)?;
+        self.start_exact(&deployment)
     }
 
     fn stop(&self) -> Result<(), RuntimeError> {
-        Ok(())
+        self.supervisor.stop(RUNTIME_STOP_GRACE)
+    }
+
+    fn start_and_wait_ready(&self, deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+        self.start_exact(deployment)?;
+        let deadline = Instant::now() + OFFICIAL_READY_TIMEOUT;
+        loop {
+            match self
+                .status
+                .read()
+                .map_err(|_| RuntimeError::StatePoisoned)?
+                .phase
+            {
+                AppPhase::Ready => return Ok(()),
+                AppPhase::Failed => {
+                    return Err(RuntimeError::Tauri(
+                        "official runtime failed before readiness".to_owned(),
+                    ));
+                }
+                AppPhase::Idle | AppPhase::Starting | AppPhase::Stopping => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::HealthTimeout {
+                    port: 0,
+                    timeout_ms: OFFICIAL_READY_TIMEOUT.as_millis() as u64,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(not(debug_assertions), test))]
+fn official_launch_spec(
+    layout: &RuntimeLayout,
+    deployment: &ActiveDeployment,
+    port: u16,
+) -> Result<RuntimeLaunchSpec, RuntimeError> {
+    let node_version = &deployment.runtime.node_version;
+    let project_workspace =
+        deployment
+            .project_workspace
+            .as_ref()
+            .ok_or(RuntimeError::InvalidLaunchPath {
+                field: "project_workspace",
+                reason: "missing descriptor",
+            })?;
+    let runtime_dir = layout.runtime_dir(&deployment.runtime);
+    RuntimeLaunchSpec::official(
+        runtime_dir.clone(),
+        runtime_dir
+            .join(format!("node-v{node_version}-win-x64"))
+            .join("node.exe"),
+        runtime_dir.join("app/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+        project_workspace.clone(),
+        layout.generation_dir(&deployment.data),
+        port,
+    )
+}
+
 impl RuntimeUi for TauriRuntimeUi {
     fn emit_status(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
         self.app
@@ -115,14 +200,12 @@ impl RuntimeUi for TauriRuntimeUi {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 struct ControllerEventSink {
     status: Arc<RwLock<RuntimeStatus>>,
     ui: Arc<dyn RuntimeUi>,
     local_url: tauri::Url,
 }
 
-#[cfg(any(debug_assertions, test))]
 impl ControllerEventSink {
     fn new(
         status: Arc<RwLock<RuntimeStatus>>,
@@ -137,7 +220,6 @@ impl ControllerEventSink {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 impl RuntimeEventSink for ControllerEventSink {
     fn emit(&self, event: RuntimeEvent) -> Result<(), RuntimeError> {
         let next_status = status_from_event(&event);
@@ -164,7 +246,6 @@ impl RuntimeEventSink for ControllerEventSink {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 fn status_from_event(event: &RuntimeEvent) -> RuntimeStatus {
     match event {
         RuntimeEvent::Starting { message } => RuntimeStatus {
@@ -193,7 +274,6 @@ fn status_from_event(event: &RuntimeEvent) -> RuntimeStatus {
     }
 }
 
-#[cfg(any(debug_assertions, test))]
 fn strict_loopback_url(value: &str) -> Result<tauri::Url, RuntimeError> {
     let url =
         tauri::Url::parse(value).map_err(|error| RuntimeError::InvalidUrl(error.to_string()))?;
@@ -233,6 +313,70 @@ pub struct AppController {
     status: Arc<RwLock<RuntimeStatus>>,
     exit_requested: AtomicBool,
     operation_gate: Arc<AtomicBool>,
+    busy_provider: Arc<dyn RuntimeBusyProvider>,
+}
+
+/// 一次激活事务持有的不可伪造生命周期会话。
+pub struct ActivationSession {
+    runtime: Arc<dyn RuntimeLifecycle>,
+    status: Arc<RwLock<RuntimeStatus>>,
+    lease: ProbeLease,
+}
+
+impl ActivationSession {
+    /// 返回供隔离探活绑定的 lease；会话仍持有原 lease 直到事务终态。
+    ///
+    /// :return: 共享同一 operation guard 的 probe lease。
+    /// :raises: 克隆值对象不产生错误。
+    pub fn probe_lease(&self) -> ProbeLease {
+        self.lease.clone()
+    }
+
+    /// 从权威 pointer 重读并比对精确配对后，同步等待真实 runtime 就绪。
+    ///
+    /// :param store: 权威 deployment pointer 存储。
+    /// :param expected: journal 正在提交的 runtime/data 配对。
+    /// :return: pointer 未变化且 runtime 已真实就绪时返回。
+    /// :raises RuntimeError: pointer 不匹配、读取失败或 runtime 首启失败时返回。
+    pub fn start_and_wait_ready(
+        &self,
+        store: &InstallStateStore,
+        expected: &ActiveDeployment,
+    ) -> Result<(), RuntimeError> {
+        let actual = store.load().map_err(|_| RuntimeError::DeploymentChanged)?;
+        if actual != *expected {
+            return Err(RuntimeError::DeploymentChanged);
+        }
+        self.runtime.start_and_wait_ready(expected)?;
+        let mut status = self
+            .status
+            .write()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        *status = RuntimeStatus {
+            phase: crate::domain::AppPhase::Ready,
+            message: "DSH 已就绪".to_owned(),
+            ..RuntimeStatus::default()
+        };
+        Ok(())
+    }
+
+    /// 在首启失败或回滚前停止会话内 runtime，不重新获取 operation gate。
+    ///
+    /// :return: runtime 已停止且控制器状态回到 Idle 时返回。
+    /// :raises RuntimeError: 停止或状态锁失败时返回。
+    pub fn stop(&self) -> Result<(), RuntimeError> {
+        self.runtime.stop()?;
+        let mut status = self
+            .status
+            .write()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        *status = RuntimeStatus {
+            phase: crate::domain::AppPhase::Idle,
+            message: "DSH 已停止".to_owned(),
+            ..RuntimeStatus::default()
+        };
+        Ok(())
+    }
 }
 
 /// 独占一次已停止 runtime 的更新/探活窗口。
@@ -331,14 +475,25 @@ impl AppController {
         });
         #[cfg(not(debug_assertions))]
         let runtime: Arc<dyn RuntimeLifecycle> = {
-            let _ = (app, local_url);
-            Arc::new(UnavailableRuntime)
+            let paths =
+                AppPaths::resolve(&app).map_err(|error| RuntimeError::Tauri(error.to_string()))?;
+            paths
+                .ensure_exists()
+                .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
+            Arc::new(OfficialRuntimeLifecycle {
+                supervisor: Arc::new(RuntimeSupervisor::new()),
+                status: Arc::clone(&status),
+                app,
+                local_url,
+                layout: RuntimeLayout::from_paths(&paths),
+            })
         };
         Ok(Self {
             runtime,
             status,
             exit_requested: AtomicBool::new(false),
             operation_gate: Arc::new(AtomicBool::new(false)),
+            busy_provider: Arc::new(UnknownRuntimeBusyProvider),
         })
     }
 
@@ -349,6 +504,21 @@ impl AppController {
             status: Arc::new(RwLock::new(initial_runtime_status(true))),
             exit_requested: AtomicBool::new(false),
             operation_gate: Arc::new(AtomicBool::new(false)),
+            busy_provider: Arc::new(UnknownRuntimeBusyProvider),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_busy(
+        runtime: Arc<dyn RuntimeLifecycle>,
+        busy_provider: Arc<dyn RuntimeBusyProvider>,
+    ) -> Self {
+        Self {
+            runtime,
+            status: Arc::new(RwLock::new(initial_runtime_status(true))),
+            exit_requested: AtomicBool::new(false),
+            operation_gate: Arc::new(AtomicBool::new(false)),
+            busy_provider,
         }
     }
 
@@ -454,6 +624,41 @@ impl AppController {
         }
     }
 
+    /// 原子确认 Agent 空闲并将 Ready runtime 受控停止后创建独占激活会话。
+    ///
+    /// lifecycle 与 Agent busy 分开判断：Starting/Stopping 以及 ActiveTask/UnknownBusy
+    /// 均失败关闭；Ready 只在 ConfirmedIdle 时执行一次 stop。lease 生命周期覆盖后续
+    /// candidate、probe、指针提交、首启与回滚，防止其他生命周期操作插入事务。
+    ///
+    /// :return: 已确认 runtime 停止且独占操作门禁的会话。
+    /// :raises RuntimeError: Agent 非空闲、生命周期处于转换态、停止失败或已有操作时返回。
+    pub fn begin_activation(&self) -> Result<ActivationSession, RuntimeError> {
+        let guard = self.acquire_operation()?;
+        match self.status().phase {
+            crate::domain::AppPhase::Ready => {
+                if self.busy_provider.quiesce() != RuntimeBusyState::ConfirmedIdle {
+                    return Err(RuntimeError::ActivationBusy);
+                }
+                self.stop_under_gate()?;
+            }
+            crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => {}
+            crate::domain::AppPhase::Starting | crate::domain::AppPhase::Stopping => {
+                return Err(RuntimeError::ProbeRequiresStoppedRuntime);
+            }
+        }
+        let lease = ProbeLease {
+            inner: Arc::new(ProbeLeaseInner {
+                _guard: guard,
+                probe_active: AtomicBool::new(false),
+            }),
+        };
+        Ok(ActivationSession {
+            runtime: Arc::clone(&self.runtime),
+            status: Arc::clone(&self.status),
+            lease,
+        })
+    }
+
     fn acquire_operation(&self) -> Result<OperationGuard, RuntimeError> {
         self.operation_gate
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -490,7 +695,9 @@ mod tests {
         AppController, ControllerEventSink, RuntimeLifecycle, RuntimeUi, initial_runtime_status,
     };
     use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
+    use crate::runtime::install_state::{ActiveDeployment, DataGeneration, InstalledRuntime};
     use crate::runtime::{RuntimeError, RuntimeEventSink};
+    use crate::update::activation::{RuntimeBusyProvider, RuntimeBusyState};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
 
@@ -498,6 +705,127 @@ mod tests {
     struct RecordingRuntime {
         calls: Mutex<Vec<&'static str>>,
         fail_stop: bool,
+    }
+
+    struct FixedBusyProvider(RuntimeBusyState);
+
+    impl RuntimeBusyProvider for FixedBusyProvider {
+        fn quiesce(&self) -> RuntimeBusyState {
+            self.0
+        }
+    }
+
+    #[test]
+    fn activation_gate_stops_ready_runtime_only_when_agent_is_confirmed_idle() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test_with_busy(
+            runtime.clone(),
+            Arc::new(FixedBusyProvider(RuntimeBusyState::ConfirmedIdle)),
+        );
+        controller.status.write().expect("状态锁不应中毒").phase = AppPhase::Ready;
+
+        let session = controller
+            .begin_activation()
+            .expect("Ready 且确认空闲应受控停止并签发 lease");
+
+        assert_eq!(
+            runtime.calls.lock().expect("调用记录锁不应中毒").as_slice(),
+            ["stop"]
+        );
+        assert!(matches!(controller.status().phase, AppPhase::Idle));
+        assert!(matches!(
+            controller.start_mock_runtime(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        drop(session);
+        controller
+            .start_mock_runtime()
+            .expect("lease 释放后应恢复生命周期操作");
+    }
+
+    #[test]
+    fn activation_gate_rejects_busy_unknown_and_transitioning_runtime_without_stopping() {
+        for busy in [RuntimeBusyState::ActiveTask, RuntimeBusyState::UnknownBusy] {
+            let runtime = Arc::new(RecordingRuntime::default());
+            let controller = AppController::for_test_with_busy(
+                runtime.clone(),
+                Arc::new(FixedBusyProvider(busy)),
+            );
+            controller.status.write().expect("状态锁不应中毒").phase = AppPhase::Ready;
+
+            assert!(controller.begin_activation().is_err());
+            assert!(runtime.calls.lock().expect("调用记录锁不应中毒").is_empty());
+        }
+
+        for phase in [AppPhase::Starting, AppPhase::Stopping] {
+            let runtime = Arc::new(RecordingRuntime::default());
+            let controller = AppController::for_test_with_busy(
+                runtime.clone(),
+                Arc::new(FixedBusyProvider(RuntimeBusyState::ConfirmedIdle)),
+            );
+            controller.status.write().expect("状态锁不应中毒").phase = phase;
+
+            assert!(controller.begin_activation().is_err());
+            assert!(runtime.calls.lock().expect("调用记录锁不应中毒").is_empty());
+        }
+    }
+
+    #[test]
+    fn official_activation_spec_uses_only_persisted_runtime_descriptor_fields() {
+        let root = std::env::temp_dir().join("dsh-official-spec-descriptor");
+        let paths = crate::paths::AppPaths::from_roots(&root.join("roaming"), &root.join("local"));
+        let layout = crate::paths::RuntimeLayout::from_paths(&paths);
+        let runtime = InstalledRuntime::with_node_version("0.1.2", "a".repeat(64), "24.15.0")
+            .expect("runtime");
+        let data = DataGeneration::new("generation-001").expect("generation");
+        let workspace = root.join("workspace");
+        let deployment = ActiveDeployment::with_project_workspace(
+            runtime.clone(),
+            data.clone(),
+            "2026-08-22T00:00:00Z".to_owned(),
+            workspace.clone(),
+        );
+        std::fs::create_dir_all(layout.runtime_dir(&runtime).join("node-v24.15.0-win-x64"))
+            .expect("node dir");
+        std::fs::create_dir_all(
+            layout
+                .runtime_dir(&runtime)
+                .join("app/node_modules/@deepseek-ai/dsh/lib"),
+        )
+        .expect("cli dir");
+        std::fs::create_dir_all(layout.generation_dir(&data)).expect("generation dir");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            layout
+                .runtime_dir(&runtime)
+                .join("node-v24.15.0-win-x64/node.exe"),
+            b"node",
+        )
+        .expect("node");
+        std::fs::write(
+            layout
+                .runtime_dir(&runtime)
+                .join("app/node_modules/@deepseek-ai/dsh/lib/bin.js"),
+            b"cli",
+        )
+        .expect("cli");
+
+        let spec = super::official_launch_spec(&layout, &deployment, 43127).expect("spec");
+
+        assert_eq!(
+            spec.program,
+            layout
+                .runtime_dir(&runtime)
+                .join("node-v24.15.0-win-x64/node.exe")
+                .canonicalize()
+                .expect("canonical node")
+        );
+        assert_eq!(spec.cwd, workspace);
+        let expected_home = layout.generation_dir(&data).to_string_lossy().into_owned();
+        assert_eq!(
+            spec.env.get("DSH_HOME").map(String::as_str),
+            Some(expected_home.as_str())
+        );
     }
 
     impl RuntimeLifecycle for RecordingRuntime {
@@ -513,6 +841,14 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn start_and_wait_ready(&self, _deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+            self.calls
+                .lock()
+                .expect("调用记录锁不应中毒")
+                .push("start_exact");
+            Ok(())
         }
     }
 
@@ -698,6 +1034,12 @@ mod tests {
                 assert!(self.gate.load(Ordering::Acquire));
                 Ok(())
             }
+            fn start_and_wait_ready(
+                &self,
+                _deployment: &ActiveDeployment,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
         }
         let gate = Arc::new(AtomicBool::new(false));
         let controller = AppController {
@@ -707,6 +1049,7 @@ mod tests {
             status: Arc::new(RwLock::new(initial_runtime_status(true))),
             exit_requested: AtomicBool::new(false),
             operation_gate: Arc::clone(&gate),
+            busy_provider: Arc::new(FixedBusyProvider(RuntimeBusyState::UnknownBusy)),
         };
 
         controller.request_exit().expect("exit");

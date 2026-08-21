@@ -226,6 +226,9 @@ impl ProbeWorkspace {
         project_workspace: PathBuf,
         lease: &ProbeLease,
     ) -> Result<Self, ProbeError> {
+        if runtime.node_version != node_version {
+            return Err(ProbeError::RuntimeDescriptorMismatch);
+        }
         let permit = lease
             .claim_probe()
             .map_err(|_| ProbeError::ProbeAlreadyActive)?;
@@ -301,6 +304,8 @@ pub enum ProbeError {
     InvalidTraceId,
     #[error("当前激活指针无法可信读取")]
     InvalidActiveDeployment,
+    #[error("runtime descriptor 与 probe 的 Node 版本不一致")]
+    RuntimeDescriptorMismatch,
     #[error("candidate generation 不能复用 active generation")]
     CandidateIsActive,
     #[error("探活工作区缺少必要目录")]
@@ -1249,7 +1254,7 @@ impl DirectoryGuard {
 }
 
 #[cfg(windows)]
-fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};

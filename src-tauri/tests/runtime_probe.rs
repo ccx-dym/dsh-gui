@@ -194,7 +194,8 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("dsh-runtime-probe-{label}-{unique}"));
         let paths = AppPaths::from_roots(&root.join("roaming"), &root.join("local"));
         let layout = RuntimeLayout::from_paths(&paths);
-        let runtime = InstalledRuntime::new("0.1.1-rc.1", "a".repeat(64)).expect("runtime");
+        let runtime = InstalledRuntime::with_node_version("0.1.1-rc.1", "a".repeat(64), "24.15.0")
+            .expect("runtime");
         let candidate = DataGeneration::new("candidate-001").expect("candidate");
         let active = DataGeneration::new("active-001").expect("active");
         let runtime_dir = layout.runtime_dir(&runtime);
@@ -255,10 +256,11 @@ impl Fixture {
 
     fn workspace(&self) -> ProbeWorkspace {
         InstallStateStore::new(self.layout.clone())
-            .save(&ActiveDeployment::new(
+            .save(&ActiveDeployment::with_project_workspace(
                 self.runtime.clone(),
                 self.active.clone(),
                 "2026-08-22T00:00:00Z".to_owned(),
+                self.workspace.clone(),
             ))
             .expect("active deployment");
         ProbeWorkspace::new(
@@ -887,7 +889,8 @@ async fn passed_state_reader_rejects_runtime_or_trace_substitution() {
         read_passed_generation_state(&fixture.layout, &fixture.candidate, &fixture.runtime, trace,)
             .is_ok()
     );
-    let other = InstalledRuntime::new("0.1.2", "b".repeat(64)).expect("runtime");
+    let other =
+        InstalledRuntime::with_node_version("0.1.2", "b".repeat(64), "24.15.0").expect("runtime");
     assert!(
         read_passed_generation_state(&fixture.layout, &fixture.candidate, &other, trace).is_err()
     );
@@ -1017,13 +1020,42 @@ fn candidate_directory_reparse_point_is_rejected_at_workspace_boundary() {
 }
 
 #[test]
+fn probe_rejects_node_version_not_bound_to_persisted_runtime_descriptor() {
+    let fixture = Fixture::new("node-descriptor-mismatch");
+    InstallStateStore::new(fixture.layout.clone())
+        .save(&ActiveDeployment::with_project_workspace(
+            fixture.runtime.clone(),
+            fixture.active.clone(),
+            "2026-08-22T00:00:00Z".to_owned(),
+            fixture.workspace.clone(),
+        ))
+        .expect("active deployment");
+
+    let error = ProbeWorkspace::new(
+        fixture.layout,
+        fixture.runtime,
+        Version::parse("23.0.0").expect("node version"),
+        fixture.candidate,
+        fixture.workspace,
+        &ProbeLease::for_test(),
+    )
+    .expect_err("probe Node must match the persisted runtime descriptor");
+
+    assert!(matches!(
+        error,
+        dsh_desktop_lib::update::probe::ProbeError::RuntimeDescriptorMismatch
+    ));
+}
+
+#[test]
 fn active_candidate_is_loaded_from_trusted_deployment_and_rejected() {
     let fixture = Fixture::new("active-derived");
     InstallStateStore::new(fixture.layout.clone())
-        .save(&ActiveDeployment::new(
+        .save(&ActiveDeployment::with_project_workspace(
             fixture.runtime.clone(),
             fixture.candidate.clone(),
             "2026-08-22T00:00:00Z".to_owned(),
+            fixture.workspace.clone(),
         ))
         .expect("active deployment");
 

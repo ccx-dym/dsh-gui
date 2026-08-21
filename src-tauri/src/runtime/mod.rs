@@ -54,6 +54,10 @@ pub enum RuntimeError {
     ProbeRequiresStoppedRuntime,
     #[error("运行时更新或探活操作正在进行")]
     ProbeOperationInProgress,
+    #[error("当前 Agent 活动状态无法安全进入运行时激活")]
+    ActivationBusy,
+    #[error("激活指针已变化，拒绝启动不匹配的 runtime/data 配对")]
+    DeploymentChanged,
 }
 
 impl RuntimeError {
@@ -79,6 +83,8 @@ impl RuntimeError {
             Self::InvalidLoopbackPort { .. } => "invalid_loopback_port",
             Self::ProbeRequiresStoppedRuntime => "probe_requires_stopped_runtime",
             Self::ProbeOperationInProgress => "probe_operation_in_progress",
+            Self::ActivationBusy => "activation_busy",
+            Self::DeploymentChanged => "deployment_changed",
         }
     }
 }

@@ -87,6 +87,13 @@ impl RuntimeLayout {
     pub(crate) fn deployment_file(&self) -> &Path {
         &self.deployment_file
     }
+
+    /// 返回 deployment 与 activation journal 共用的漫游设置目录。
+    pub(crate) fn settings_dir(&self) -> Result<&Path, PathError> {
+        self.deployment_file
+            .parent()
+            .ok_or_else(|| PathError::Resolve("deployment 文件缺少设置目录".to_owned()))
+    }
 }
 
 impl AppPaths {
