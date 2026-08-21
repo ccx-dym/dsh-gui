@@ -144,6 +144,24 @@ fn strict_loopback_url(value: &str) -> Result<tauri::Url, RuntimeError> {
     }
 }
 
+fn initial_runtime_status(mock_runtime_enabled: bool) -> RuntimeStatus {
+    if mock_runtime_enabled {
+        RuntimeStatus {
+            phase: crate::domain::AppPhase::Idle,
+            message: "等待启动".to_owned(),
+            ..RuntimeStatus::default()
+        }
+    } else {
+        // 正式构建在阶段 2 接入兼容运行时前必须明确保持 Idle，避免把“没有
+        // 运行时”误报成仍在启动，也为后续本地启动页查询提供稳定提示。
+        RuntimeStatus {
+            phase: crate::domain::AppPhase::Idle,
+            message: "尚未安装兼容运行时".to_owned(),
+            ..RuntimeStatus::default()
+        }
+    }
+}
+
 /// 协调运行时状态、后台生命周期任务与单一 Tauri 主窗口。
 pub struct AppController {
     #[cfg(debug_assertions)]
@@ -172,7 +190,7 @@ impl AppController {
         Ok(Self {
             #[cfg(debug_assertions)]
             supervisor: Arc::new(RuntimeSupervisor::new()),
-            status: Arc::new(RwLock::new(RuntimeStatus::default())),
+            status: Arc::new(RwLock::new(initial_runtime_status(cfg!(debug_assertions)))),
             #[cfg(debug_assertions)]
             app,
             #[cfg(debug_assertions)]
@@ -256,10 +274,34 @@ pub fn retry_runtime(controller: tauri::State<'_, AppController>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{ControllerEventSink, RuntimeUi};
+    use super::{ControllerEventSink, RuntimeUi, initial_runtime_status};
     use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
     use crate::runtime::{RuntimeError, RuntimeEventSink};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[test]
+    fn initial_status_distinguishes_debug_mock_from_release_without_runtime() {
+        assert_eq!(
+            initial_runtime_status(true),
+            RuntimeStatus {
+                phase: AppPhase::Idle,
+                message: "等待启动".to_owned(),
+                url: None,
+                elapsed_ms: None,
+                error_code: None,
+            }
+        );
+        assert_eq!(
+            initial_runtime_status(false),
+            RuntimeStatus {
+                phase: AppPhase::Idle,
+                message: "尚未安装兼容运行时".to_owned(),
+                url: None,
+                elapsed_ms: None,
+                error_code: None,
+            }
+        );
+    }
 
     #[derive(Default)]
     struct FakeUi {
