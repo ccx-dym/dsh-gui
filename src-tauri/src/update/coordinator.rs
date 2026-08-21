@@ -3,14 +3,17 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt, task::JoinHandle};
+use tokio::{fs, io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
 
 use super::{
     manifest::VerifiedManifest,
@@ -19,6 +22,8 @@ use super::{
 use crate::domain::UpdateNotice;
 
 const UPDATE_STATE_SCHEMA: u32 = 1;
+static UPDATE_CHECK_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 启动与周期检查策略；默认启动后短暂延迟，并每 12 小时检查一次。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +170,17 @@ impl UpdateStateStore {
         fs::create_dir_all(parent)
             .await
             .map_err(|_| UpdateStateError::FileSystem)?;
-        let temporary = parent.join("update-state.json.tmp");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| UpdateStateError::Clock)?
+            .as_nanos();
+        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        // 临时名只由数值组成且固定在 state 文件父目录；崩溃残留会保留诊断价值，
+        // 后续保存使用新 nonce，不需要删除或覆盖残留文件。
+        let temporary = parent.join(format!(
+            "update-state.json.tmp-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -202,6 +217,13 @@ pub struct UpdateCheckResult {
     pub next_check_epoch_secs: u64,
 }
 
+/// 启动延迟检查的结果；未到期与实际网络检查明确分离。
+#[derive(Clone, Debug)]
+pub enum ScheduledCheckResult {
+    Skipped { next_check_epoch_secs: u64 },
+    Checked(Box<UpdateCheckResult>),
+}
+
 /// 将官方发现、签名兼容源和通知状态组合在一起的异步协调器。
 pub struct UpdateCoordinator {
     official: Arc<dyn OfficialVersionSource>,
@@ -210,6 +232,7 @@ pub struct UpdateCoordinator {
     time: Arc<dyn UpdateTimeSource>,
     schedule: UpdateSchedule,
     channel: String,
+    check_lock: Arc<Mutex<()>>,
 }
 
 impl UpdateCoordinator {
@@ -231,7 +254,10 @@ impl UpdateCoordinator {
         schedule: UpdateSchedule,
         channel: String,
     ) -> Result<Self, UpdateStateError> {
-        if schedule.interval.is_zero()
+        if schedule.interval.as_secs() == 0
+            || schedule.interval.subsec_nanos() != 0
+            || schedule.interval > Duration::from_secs(30 * 24 * 60 * 60)
+            || schedule.startup_delay > Duration::from_secs(60 * 60)
             || channel.is_empty()
             || !channel
                 .bytes()
@@ -246,6 +272,11 @@ impl UpdateCoordinator {
             time,
             schedule,
             channel,
+            // 当前桌面进程只有一个状态文件命名空间；所有协调器实例共享这把锁，
+            // 防止 startup/tray/manual 入口分别构造对象时丢失通知键。
+            check_lock: UPDATE_CHECK_LOCK
+                .get_or_init(|| Arc::new(Mutex::new(())))
+                .clone(),
         })
     }
 
@@ -258,7 +289,16 @@ impl UpdateCoordinator {
         &self,
         current: Option<&Version>,
     ) -> Result<UpdateCheckResult, UpdateStateError> {
-        let mut state = self.state_store.load().await?;
+        let _guard = self.check_lock.lock().await;
+        let state = self.state_store.load().await?;
+        self.check_with_state(current, state).await
+    }
+
+    async fn check_with_state(
+        &self,
+        current: Option<&Version>,
+        mut state: PersistedUpdateState,
+    ) -> Result<UpdateCheckResult, UpdateStateError> {
         let (notice, manifest) = match self.official.latest().await {
             Err(error) => (failed_notice(current, None, &error), None),
             Ok(official) => match self.compatibility.latest_compatible().await {
@@ -306,11 +346,33 @@ impl UpdateCoordinator {
     pub fn spawn_startup_check(
         coordinator: Arc<Self>,
         current: Option<Version>,
-    ) -> JoinHandle<Result<UpdateCheckResult, UpdateStateError>> {
+    ) -> JoinHandle<Result<ScheduledCheckResult, UpdateStateError>> {
         tokio::spawn(async move {
             tokio::time::sleep(coordinator.schedule.startup_delay).await;
-            coordinator.check(current.as_ref()).await
+            coordinator.check_if_due(current.as_ref()).await
         })
+    }
+
+    /// 仅在持久化截止时间到期时执行检查；到期判断与状态提交共用同一进程锁。
+    ///
+    /// :param current: 当前安装版本快照。
+    /// :return: 未到期时返回 `Skipped`，到期时返回实际检查结果。
+    /// :raises UpdateStateError: 状态、时钟或检查后的状态提交失败时返回。
+    pub async fn check_if_due(
+        &self,
+        current: Option<&Version>,
+    ) -> Result<ScheduledCheckResult, UpdateStateError> {
+        let _guard = self.check_lock.lock().await;
+        let state = self.state_store.load().await?;
+        if self.time.now_epoch_secs()? < state.next_check_epoch_secs {
+            return Ok(ScheduledCheckResult::Skipped {
+                next_check_epoch_secs: state.next_check_epoch_secs,
+            });
+        }
+        self.check_with_state(current, state)
+            .await
+            .map(Box::new)
+            .map(ScheduledCheckResult::Checked)
     }
 
     /// 返回到期状态，供托盘周期计时器决定是否发起检查。
@@ -453,8 +515,8 @@ mod tests {
     use semver::Version;
 
     use super::{
-        PersistedUpdateState, UpdateCoordinator, UpdateSchedule, UpdateStateError,
-        UpdateStateStore, UpdateTimeSource, decide_notice, notification_key,
+        PersistedUpdateState, ScheduledCheckResult, UpdateCoordinator, UpdateSchedule,
+        UpdateStateError, UpdateStateStore, UpdateTimeSource, decide_notice, notification_key,
     };
     use crate::domain::UpdateNotice;
     use crate::update::{
@@ -612,6 +674,36 @@ mod tests {
         assert_eq!(schedule.interval, Duration::from_secs(12 * 60 * 60));
     }
 
+    #[test]
+    fn schedule_rejects_subsecond_interval_and_extreme_startup_delay() {
+        for schedule in [
+            UpdateSchedule {
+                startup_delay: Duration::ZERO,
+                interval: Duration::from_nanos(1),
+            },
+            UpdateSchedule {
+                startup_delay: Duration::ZERO,
+                interval: Duration::from_millis(1_500),
+            },
+            UpdateSchedule {
+                startup_delay: Duration::from_secs(60 * 60 + 1),
+                interval: Duration::from_secs(60),
+            },
+        ] {
+            assert!(matches!(
+                UpdateCoordinator::new(
+                    official("0.2.0"),
+                    no_compatibility(),
+                    UpdateStateStore::new(&unique_settings("invalid-schedule")),
+                    Arc::new(FixedTime(0)),
+                    schedule,
+                    "stable".to_owned(),
+                ),
+                Err(UpdateStateError::InvalidSchedule)
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn check_failure_is_not_reported_as_up_to_date() {
         let coordinator = UpdateCoordinator::new(
@@ -664,17 +756,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn existing_temporary_state_is_a_stable_failure() {
+    async fn residual_temporary_state_does_not_block_future_saves() {
         let settings = unique_settings("temporary");
         tokio::fs::create_dir_all(&settings).await.unwrap();
         tokio::fs::write(settings.join("update-state.json.tmp"), b"diagnostic")
             .await
             .unwrap();
         let store = UpdateStateStore::new(&settings);
-        assert!(matches!(
-            store.save(&PersistedUpdateState::default()).await,
-            Err(UpdateStateError::TemporaryFileExists)
-        ));
+        store
+            .save(&PersistedUpdateState::default())
+            .await
+            .expect("残留诊断文件不能永久阻塞更新状态");
     }
 
     #[tokio::test]
@@ -719,5 +811,77 @@ mod tests {
                 .to_string(),
             "0.1.2"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_coordinators_share_the_process_lock_and_notify_once() {
+        let settings = unique_settings("concurrent");
+        let first = Arc::new(
+            UpdateCoordinator::new(
+                official("0.2.0"),
+                no_compatibility(),
+                UpdateStateStore::new(&settings),
+                Arc::new(FixedTime(1_000)),
+                UpdateSchedule::default(),
+                "stable".to_owned(),
+            )
+            .unwrap(),
+        );
+        let second = Arc::new(
+            UpdateCoordinator::new(
+                official("0.2.0"),
+                no_compatibility(),
+                UpdateStateStore::new(&settings),
+                Arc::new(FixedTime(1_000)),
+                UpdateSchedule::default(),
+                "stable".to_owned(),
+            )
+            .unwrap(),
+        );
+        let (left, right) = tokio::join!(first.check(None), second.check(None));
+        let left = left.expect("并发检查一应完成");
+        let right = right.expect("并发检查二应完成");
+        assert_ne!(left.should_notify, right.should_notify);
+        let state = UpdateStateStore::new(&settings).load().await.unwrap();
+        assert_eq!(state.notification_keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_check_skips_network_work_before_persisted_deadline() {
+        let settings = unique_settings("startup-deadline");
+        let store = UpdateStateStore::new(&settings);
+        store
+            .save(&PersistedUpdateState {
+                schema: 1,
+                next_check_epoch_secs: 500,
+                notification_keys: BTreeSet::new(),
+            })
+            .await
+            .unwrap();
+        let coordinator = Arc::new(
+            UpdateCoordinator::new(
+                official("0.2.0"),
+                no_compatibility(),
+                store.clone(),
+                Arc::new(FixedTime(100)),
+                UpdateSchedule {
+                    startup_delay: Duration::ZERO,
+                    interval: Duration::from_secs(12 * 60 * 60),
+                },
+                "stable".to_owned(),
+            )
+            .unwrap(),
+        );
+        let result = UpdateCoordinator::spawn_startup_check(coordinator, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            ScheduledCheckResult::Skipped {
+                next_check_epoch_secs: 500
+            }
+        ));
+        assert_eq!(store.load().await.unwrap().next_check_epoch_secs, 500);
     }
 }

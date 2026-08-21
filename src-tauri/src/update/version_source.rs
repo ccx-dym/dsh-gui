@@ -417,23 +417,50 @@ fn validate_integrity(value: &str) -> Result<(), SourceError> {
     let payload = value
         .strip_prefix("sha512-")
         .ok_or(SourceError::InvalidIntegrity)?;
-    if payload.is_empty() || !payload.len().is_multiple_of(4) {
-        return Err(SourceError::InvalidIntegrity);
+    decode_canonical_sha512(payload)
+        .map(|_| ())
+        .ok_or(SourceError::InvalidIntegrity)
+}
+
+fn decode_canonical_sha512(payload: &str) -> Option<[u8; 64]> {
+    // SHA-512 固定 64 bytes，规范 base64 必须恰好 88 字符，并以 `==` 收尾。
+    if payload.len() != 88 || !payload.ends_with("==") || payload[..86].contains('=') {
+        return None;
     }
-    let padding = payload
-        .bytes()
-        .rev()
-        .take_while(|byte| *byte == b'=')
-        .count();
-    if padding > 2
-        || payload[..payload.len() - padding]
-            .bytes()
-            .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')))
-        || payload[..payload.len() - padding].contains('=')
-    {
-        return Err(SourceError::InvalidIntegrity);
+    let mut decoded = [0_u8; 64];
+    let bytes = payload.as_bytes();
+    let mut output = 0_usize;
+    for chunk_index in 0..22 {
+        let offset = chunk_index * 4;
+        let first = base64_value(bytes[offset])?;
+        let second = base64_value(bytes[offset + 1])?;
+        decoded[output] = (first << 2) | (second >> 4);
+        output += 1;
+        if chunk_index == 21 {
+            // 单字节尾块的未使用低 4 bit 必须为零，否则存在多种非规范编码。
+            if second & 0x0f != 0 || bytes[offset + 2] != b'=' || bytes[offset + 3] != b'=' {
+                return None;
+            }
+            break;
+        }
+        let third = base64_value(bytes[offset + 2])?;
+        let fourth = base64_value(bytes[offset + 3])?;
+        decoded[output] = (second << 4) | (third >> 2);
+        decoded[output + 1] = (third << 6) | fourth;
+        output += 2;
     }
-    Ok(())
+    (output == decoded.len()).then_some(decoded)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 fn validate_https_url(url: &Url) -> Result<(), SourceError> {
@@ -475,8 +502,8 @@ mod tests {
 
     use super::{
         CompatibilitySource, ManifestVerifier, SignedCompatibilitySource, SourceError,
-        SourceHttpResponse, SourceHttpTransport, SourcePolicy, TransportError, fetch_bytes,
-        parse_npm_document,
+        SourceHttpResponse, SourceHttpTransport, SourcePolicy, TransportError,
+        decode_canonical_sha512, fetch_bytes, parse_npm_document,
     };
 
     struct ScriptedTransport {
@@ -527,11 +554,14 @@ mod tests {
     fn parses_latest_exact_version_and_integrity() {
         let body = br#"{
           "dist-tags":{"latest":"0.2.0"},
-          "versions":{"0.2.0":{"version":"0.2.0","dist":{"integrity":"sha512-YWJjZA=="}}}
+          "versions":{"0.2.0":{"version":"0.2.0","dist":{"integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}
         }"#;
         let release = parse_npm_document(body).expect("合法 npm 元数据应可解析");
         assert_eq!(release.version.to_string(), "0.2.0");
-        assert_eq!(release.integrity, "sha512-YWJjZA==");
+        assert_eq!(
+            release.integrity,
+            "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        );
     }
 
     #[test]
@@ -540,7 +570,7 @@ mod tests {
           "name":"@deepseek-ai/dsh",
           "dist-tags":{"latest":"0.2.0","next":"0.3.0-beta.1"},
           "versions":{"0.2.0":{"name":"@deepseek-ai/dsh","version":"0.2.0",
-            "dist":{"tarball":"https://registry.example.invalid/pkg.tgz","integrity":"sha512-YWJjZA=="}}}
+            "dist":{"tarball":"https://registry.example.invalid/pkg.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}
         }"#;
         let release = parse_npm_document(body).expect("无关 npm 元数据不应破坏所需字段解析");
         assert_eq!(release.version.to_string(), "0.2.0");
@@ -563,9 +593,27 @@ mod tests {
             Err(SourceError::InvalidIntegrity)
         ));
 
+        let short_digest = br#"{
+          "dist-tags":{"latest":"0.2.0"},
+          "versions":{"0.2.0":{"version":"0.2.0","dist":{"integrity":"sha512-YWJjZA=="}}}
+        }"#;
+        assert!(matches!(
+            parse_npm_document(short_digest),
+            Err(SourceError::InvalidIntegrity)
+        ));
+
+        let noncanonical_tail = br#"{
+          "dist-tags":{"latest":"0.2.0"},
+          "versions":{"0.2.0":{"version":"0.2.0","dist":{"integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=="}}}
+        }"#;
+        assert!(matches!(
+            parse_npm_document(noncanonical_tail),
+            Err(SourceError::InvalidIntegrity)
+        ));
+
         let mismatched = br#"{
           "dist-tags":{"latest":"0.2.0"},
-          "versions":{"0.2.0":{"version":"0.2.1","dist":{"integrity":"sha512-YWJjZA=="}}}
+          "versions":{"0.2.0":{"version":"0.2.1","dist":{"integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}
         }"#;
         assert!(matches!(
             parse_npm_document(mismatched),
@@ -584,6 +632,15 @@ mod tests {
                 Err(SourceError::InvalidVersion)
             ));
         }
+    }
+
+    #[test]
+    fn canonical_sri_decoder_returns_all_sixty_four_digest_bytes() {
+        let payload = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+        assert_eq!(
+            decode_canonical_sha512(payload).expect("规范 SHA-512 base64"),
+            std::array::from_fn(|index| index as u8)
+        );
     }
 
     #[tokio::test]
