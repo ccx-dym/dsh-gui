@@ -1,5 +1,6 @@
 pub mod domain;
 pub mod paths;
+pub mod runtime;
 
 /// 启动 DSH Desktop 的单一 Tauri 窗口。
 ///
