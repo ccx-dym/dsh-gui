@@ -107,6 +107,8 @@ fn main() {
         if !args.iter().any(|value| value == "--no-open") { std::process::exit(11); }
         let port: u16 = args[args.iter().position(|value| value == "--port").unwrap() + 1].parse().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let suppress_readiness = env::current_exe().unwrap().parent().unwrap().join("suppress-readiness").exists();
+        if !suppress_readiness { println!("dsh web: http://127.0.0.1:{port}"); }
         for attempt in 0..2 {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
@@ -148,6 +150,14 @@ foreach ($requiredEntry in @('inventory.json', 'THIRD_PARTY_NOTICES.json', 'app/
 if ($zipEntries -match 'smoke-home|private|npm-cache') {
     throw 'runtime ZIP 不得包含 smoke home、密钥或 npm cache'
 }
+
+# HTTP 200 只是传输层探活；官方 CLI 未发布精确 readiness 行时，runtime 不得进入发布产物。
+Set-Content -LiteralPath (Join-Path $fakeRoot 'suppress-readiness') -Value '' -NoNewline
+$silentArchive = Join-Path $testRoot 'silent-input\node-v24.15.0-win-x64.zip'
+New-Item -ItemType Directory -Path (Split-Path -Parent $silentArchive) | Out-Null
+[System.IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $testRoot 'fake-node-archive'), $silentArchive)
+$silentDigest = (Get-FileHash -LiteralPath $silentArchive -Algorithm SHA256).Hash
+Assert-FailsWith -TargetScript $isolatedScript -Arguments @('-DshVersion', '0.1.1-rc.1', '-NodeArchive', $silentArchive, '-NodeSha256', $silentDigest, '-OutputDirectory', (Join-Path $testRoot 'silent-runtime-out')) -Pattern 'readiness|就绪'
 
 $lockRoot = Join-Path $repositoryRoot 'runtime\locks\dsh-0.1.1-rc.1\package-lock.json'
 if (Test-Path -LiteralPath $lockRoot) {

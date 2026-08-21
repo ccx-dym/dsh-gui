@@ -160,6 +160,7 @@ foreach ($argument in @($dshBin, 'web', '--host', '127.0.0.1', '--port', $smokeP
 $smokeProcess = [System.Diagnostics.Process]::Start($startInfo)
 $stdoutDrain = $smokeProcess.StandardOutput.ReadToEndAsync()
 $stderrDrain = $smokeProcess.StandardError.ReadToEndAsync()
+$smokeStdout = ''
 try {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(20)
     $ready = $false
@@ -192,8 +193,13 @@ finally {
         $smokeProcess.Kill($true)
     }
     $smokeProcess.WaitForExit()
-    $stdoutDrain.GetAwaiter().GetResult() | Out-Null
+    $smokeStdout = $stdoutDrain.GetAwaiter().GetResult()
     $stderrDrain.GetAwaiter().GetResult() | Out-Null
+}
+$expectedReadiness = "dsh web: http://127.0.0.1:$smokePort"
+if (-not (($smokeStdout -split '\r?\n') -ccontains $expectedReadiness)) {
+    # 捕获输出可能携带用户配置或环境信息，发布错误只暴露固定原因。
+    throw 'DSH Web readiness 就绪信号缺失。'
 }
 
 # lock path 是 npm package root 的权威边界；递归找 package.json 会误收包内 fixture/资源清单。
