@@ -1,30 +1,247 @@
 :root {
-  color: #17324d;
-  font-family: "Segoe UI", system-ui, sans-serif;
-  background: #f4fbff;
+  color: #153e5d;
+  font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", sans-serif;
+  background: #e8f8ff;
   font-synthesis: none;
+  text-rendering: optimizeLegibility;
 }
 
+* {
+  box-sizing: border-box;
+}
+
+html,
 body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
+  overflow: hidden;
 }
 
 .boot {
+  --sky-top: #ffffff;
+  --sky-mid: #dff5ff;
+  --sea: #6dcaff;
+  --sea-deep: #3caef3;
   display: grid;
+  position: relative;
+  isolation: isolate;
   min-height: 100vh;
   place-content: center;
   justify-items: center;
-  background: linear-gradient(160deg, #ffffff 0%, #e9f8ff 100%);
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 76% 18%, rgb(255 255 255 / 92%) 0 7%, transparent 22%),
+    linear-gradient(172deg, var(--sky-top) 0%, var(--sky-mid) 57%, #bcecff 100%);
+}
+
+.boot__atmosphere {
+  position: absolute;
+  z-index: -2;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 25% 24%, rgb(255 255 255 / 78%) 0 11%, transparent 28%),
+    linear-gradient(115deg, transparent 12%, rgb(255 255 255 / 35%) 48%, transparent 72%);
+  opacity: 0.85;
+}
+
+.boot__horizon {
+  position: absolute;
+  z-index: -1;
+  right: -12vw;
+  bottom: -21vh;
+  left: -12vw;
+  height: 52vh;
+  overflow: hidden;
+  border-radius: 50% 50% 0 0 / 16% 16% 0 0;
+  background: linear-gradient(180deg, rgb(118 207 255 / 78%), var(--sea-deep));
+  box-shadow: inset 0 1px rgb(255 255 255 / 72%);
+}
+
+.boot__wave {
+  position: absolute;
+  top: -14px;
+  left: -8%;
+  width: 116%;
+  height: 28px;
+  border-radius: 50%;
+  border-top: 2px solid rgb(255 255 255 / 68%);
+  animation: wave-drift 7s ease-in-out infinite alternate;
+}
+
+.boot__wave--2 {
+  top: 18px;
+  left: -14%;
+  opacity: 0.55;
+  animation-delay: -2.2s;
+  animation-duration: 9s;
+}
+
+.boot__wave--3 {
+  top: 53px;
+  opacity: 0.35;
+  animation-delay: -4.5s;
+  animation-duration: 11s;
+}
+
+.boot__content {
+  display: grid;
+  position: relative;
+  width: min(82vw, 440px);
+  padding: 34px 26px 40px;
+  justify-items: center;
+  text-align: center;
+}
+
+.boot__whale {
+  width: clamp(88px, 18vw, 118px);
+  height: auto;
+  filter: drop-shadow(0 15px 18px rgb(29 143 208 / 17%));
+  animation: whale-rise 4.8s ease-in-out infinite;
 }
 
 .boot h1 {
-  margin: 20px 0 8px;
-  font-size: 28px;
+  margin: 22px 0 0;
+  color: #14527c;
+  font-family: "Segoe UI Variable Display", "Microsoft YaHei UI", sans-serif;
+  font-size: clamp(26px, 5vw, 34px);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
 }
 
-.boot p {
+.boot__status {
+  display: flex;
+  min-height: 52px;
+  margin-top: 15px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.boot__message {
+  max-width: 36ch;
   margin: 0;
-  color: #55738e;
+  color: #47708e;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.boot__spinner {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border: 2px solid rgb(49 163 230 / 22%);
+  border-top-color: #2ba9ee;
+  border-radius: 50%;
+  animation: spinner-turn 0.8s linear infinite;
+}
+
+.boot__failure {
+  display: grid;
+  margin-top: 3px;
+  justify-items: center;
+  gap: 18px;
+}
+
+.boot__error-code {
+  padding: 5px 10px;
+  border: 1px solid rgb(40 144 203 / 15%);
+  border-radius: 999px;
+  color: #5b7b91;
+  background: rgb(255 255 255 / 52%);
+  font: 11px/1.2 "Cascadia Mono", Consolas, monospace;
+  letter-spacing: 0.025em;
+}
+
+.boot__retry {
+  min-width: 120px;
+  min-height: 40px;
+  padding: 9px 20px;
+  border: 1px solid rgb(255 255 255 / 75%);
+  border-radius: 999px;
+  color: #ffffff;
+  background: linear-gradient(180deg, #45baf5, #249fe6);
+  box-shadow:
+    0 10px 24px rgb(23 140 208 / 20%),
+    inset 0 1px rgb(255 255 255 / 32%);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 620;
+  cursor: pointer;
+  transition: transform 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+}
+
+.boot__retry:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow:
+    0 13px 27px rgb(23 140 208 / 25%),
+    inset 0 1px rgb(255 255 255 / 38%);
+}
+
+.boot__retry:focus-visible {
+  outline: 3px solid rgb(24 144 213 / 28%);
+  outline-offset: 4px;
+}
+
+.boot__retry:disabled {
+  cursor: wait;
+  opacity: 0.62;
+}
+
+.boot--failed .boot__whale {
+  animation-play-state: paused;
+}
+
+@keyframes spinner-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes whale-rise {
+  0%,
+  100% {
+    transform: translateY(2px) rotate(-0.6deg);
+  }
+
+  50% {
+    transform: translateY(-7px) rotate(0.7deg);
+  }
+}
+
+@keyframes wave-drift {
+  from {
+    transform: translateX(-1.8%) scaleY(0.9);
+  }
+
+  to {
+    transform: translateX(1.8%) scaleY(1.08);
+  }
+}
+
+@media (max-height: 520px) {
+  .boot__content {
+    padding-block: 18px 24px;
+  }
+
+  .boot__whale {
+    width: 74px;
+  }
+
+  .boot h1 {
+    margin-top: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot__whale,
+  .boot__spinner,
+  .boot__wave {
+    animation: none;
+  }
+
+  .boot__retry {
+    transition: none;
+  }
 }

@@ -1,4 +1,94 @@
 import "./styles.css";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import {
+  reduceRuntimeEvent,
+  type RuntimeEvent,
+  type RuntimeStatus,
+} from "./app-state";
+
+export function renderRuntimeStatus(
+  root: HTMLElement,
+  status: RuntimeStatus,
+): void {
+  root.replaceChildren();
+
+  const main = document.createElement("main");
+  main.className = `boot boot--${status.phase}`;
+
+  const atmosphere = document.createElement("div");
+  atmosphere.className = "boot__atmosphere";
+  atmosphere.setAttribute("aria-hidden", "true");
+
+  const horizon = document.createElement("div");
+  horizon.className = "boot__horizon";
+  horizon.setAttribute("aria-hidden", "true");
+  for (let waveIndex = 0; waveIndex < 3; waveIndex += 1) {
+    const wave = document.createElement("span");
+    wave.className = `boot__wave boot__wave--${waveIndex + 1}`;
+    horizon.append(wave);
+  }
+
+  const content = document.createElement("section");
+  content.className = "boot__content";
+  content.setAttribute("aria-labelledby", "boot-title");
+
+  const icon = document.createElement("img");
+  icon.src = "/icon-128.png";
+  icon.alt = "";
+  icon.width = 96;
+  icon.height = 96;
+  icon.className = "boot__whale";
+
+  const title = document.createElement("h1");
+  title.id = "boot-title";
+  title.textContent = "DSH Desktop";
+
+  const statusRegion = document.createElement("div");
+  statusRegion.className = "boot__status";
+  statusRegion.setAttribute("role", "status");
+  statusRegion.setAttribute("aria-live", "polite");
+  statusRegion.setAttribute("aria-atomic", "true");
+
+  if (
+    status.phase === "idle" ||
+    status.phase === "starting" ||
+    status.phase === "stopping"
+  ) {
+    const loadingIndicator = document.createElement("span");
+    loadingIndicator.className = "boot__spinner";
+    loadingIndicator.dataset.loadingIndicator = "";
+    loadingIndicator.setAttribute("aria-hidden", "true");
+    statusRegion.append(loadingIndicator);
+  }
+
+  const message = document.createElement("p");
+  message.className = "boot__message";
+  message.dataset.statusMessage = "";
+  message.textContent = status.message;
+
+  statusRegion.append(message);
+  content.append(icon, title, statusRegion);
+
+  if (status.phase === "failed") {
+    const actions = document.createElement("div");
+    actions.className = "boot__failure";
+    const errorCode = document.createElement("code");
+    errorCode.className = "boot__error-code";
+    errorCode.dataset.errorCode = "";
+    errorCode.textContent = status.errorCode ?? "unknown_error";
+    const retry = document.createElement("button");
+    retry.className = "boot__retry";
+    retry.type = "button";
+    retry.dataset.action = "retry";
+    retry.textContent = "重新启动";
+    actions.append(errorCode, retry);
+    content.append(actions);
+  }
+
+  main.append(atmosphere, horizon, content);
+  root.append(main);
+}
 
 const root = document.querySelector<HTMLElement>("#app");
 
@@ -6,10 +96,47 @@ if (root === null) {
   throw new Error("缺少 #app 根节点");
 }
 
-root.innerHTML = `
-  <main class="boot" aria-live="polite">
-    <img src="/icon-128.png" alt="" width="96" height="96" />
-    <h1>DSH Desktop</h1>
-    <p>正在启动 DSH…</p>
-  </main>
-`;
+// 事件只绑定在稳定的根节点上；状态重绘会替换按钮，但不会累积监听器。
+root.addEventListener("click", (event: MouseEvent) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const retry = event.target.closest<HTMLButtonElement>(
+    "button[data-action='retry']",
+  );
+  if (retry === null || !root.contains(retry)) {
+    return;
+  }
+  retry.disabled = true;
+  retry.setAttribute("aria-busy", "true");
+  retry.textContent = "正在重试…";
+  void invoke<void>("retry_runtime").catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    renderRuntimeStatus(root, {
+      phase: "failed",
+      message: `重试失败：${detail}`,
+      errorCode: "retry_failed",
+    });
+  });
+});
+
+renderRuntimeStatus(root, { phase: "starting", message: "正在启动 DSH…" });
+
+async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
+  try {
+    let status = await invoke<RuntimeStatus>("get_runtime_status");
+    renderRuntimeStatus(root, status);
+    await listen<RuntimeEvent>("runtime-status", ({ payload }) => {
+      status = reduceRuntimeEvent(status, payload);
+      renderRuntimeStatus(root, status);
+    });
+  } catch (error: unknown) {
+    renderRuntimeStatus(root, {
+      phase: "failed",
+      message: error instanceof Error ? error.message : String(error),
+      errorCode: "status_unavailable",
+    });
+  }
+}
+
+void initializeRuntimeStatus(root);
