@@ -1,0 +1,25 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/node": "24.13.3",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  }
+}

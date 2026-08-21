@@ -1,0 +1,30 @@
+:root {
+  color: #17324d;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: #f4fbff;
+  font-synthesis: none;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+.boot {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  justify-items: center;
+  background: linear-gradient(160deg, #ffffff 0%, #e9f8ff 100%);
+}
+
+.boot h1 {
+  margin: 20px 0 8px;
+  font-size: 28px;
+}
+
+.boot p {
+  margin: 0;
+  color: #55738e;
+}

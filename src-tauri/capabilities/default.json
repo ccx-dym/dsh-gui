@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-main",
+  "description": "本地启动页的最小窗口权限",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
