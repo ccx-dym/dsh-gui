@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::domain::RuntimeEvent;
-use command::RuntimeLaunchSpec;
+use command::{ReadinessPolicy, RuntimeLaunchSpec};
 use health::{HealthProbe, ReadyProbe};
 #[cfg(windows)]
 use process::{ManagedChild, StopOutcome};
@@ -41,6 +41,13 @@ pub enum RuntimeError {
     StatePoisoned,
     #[error("运行时进程在就绪前退出")]
     ProcessExitedEarly,
+    #[error("DSH 在 {timeout_ms} ms 内未打印端口 {port} 的可信就绪信号")]
+    OutputReadinessTimeout { port: u16, timeout_ms: u64 },
+    #[error("运行时启动路径无效（{field}: {reason}）")]
+    InvalidLaunchPath {
+        field: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl RuntimeError {
@@ -61,8 +68,17 @@ impl RuntimeError {
             Self::MissingLoopbackPort => "missing_loopback_port",
             Self::StatePoisoned => "state_poisoned",
             Self::ProcessExitedEarly => "process_exited_early",
+            Self::OutputReadinessTimeout { .. } => "output_readiness_timeout",
+            Self::InvalidLaunchPath { .. } => "invalid_launch_path",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// 从受管 stdout 中提取的可信控制信号。
+pub enum ReadinessSignal {
+    /// 官方 DSH stdout 声明的回环 Web 端口。
+    Web { port: u16 },
 }
 
 /// 抽象受管子进程，使状态机测试不依赖真实 Windows 进程。
@@ -70,6 +86,13 @@ pub trait RuntimeProcess: Send {
     fn id(&self) -> u32;
     fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError>;
     fn stop(&mut self, grace: Duration) -> Result<StopOutcome, RuntimeError>;
+    fn wait_for_readiness(
+        &mut self,
+        port: u16,
+        _timeout: Duration,
+    ) -> Result<ReadinessSignal, RuntimeError> {
+        Ok(ReadinessSignal::Web { port })
+    }
 }
 
 /// 创建受生命周期约束的运行时进程。
@@ -100,6 +123,14 @@ impl RuntimeProcess for ManagedChild {
 
     fn stop(&mut self, grace: Duration) -> Result<StopOutcome, RuntimeError> {
         self.stop(grace)
+    }
+
+    fn wait_for_readiness(
+        &mut self,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<ReadinessSignal, RuntimeError> {
+        self.wait_for_readiness(port, timeout)
     }
 }
 
@@ -295,7 +326,16 @@ fn run_start(
         Ok(None) => {}
     }
 
-    let url = match probe.wait_until_ready(port, timeout) {
+    if spec.readiness_policy == ReadinessPolicy::StdoutAndHttp {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if let Err(error) = child.wait_for_readiness(port, remaining) {
+            fail_start(&state, &sink, Some(child), error);
+            return;
+        }
+    }
+
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let url = match probe.wait_until_ready(port, remaining) {
         Ok(url) => url,
         Err(error) => {
             fail_start(&state, &sink, Some(child), error);
@@ -349,11 +389,11 @@ fn emit_failure(sink: &Arc<dyn RuntimeEventSink>, error: &RuntimeError) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcessLauncher, RuntimeError, RuntimeEventSink, RuntimeProcess, RuntimeSupervisor,
-        SupervisorState,
+        ProcessLauncher, ReadinessSignal, RuntimeError, RuntimeEventSink, RuntimeProcess,
+        RuntimeSupervisor, SupervisorState,
     };
     use crate::domain::RuntimeEvent;
-    use crate::runtime::command::RuntimeLaunchSpec;
+    use crate::runtime::command::{ReadinessPolicy, RuntimeLaunchSpec};
     use crate::runtime::health::ReadyProbe;
     use crate::runtime::process::StopOutcome;
     use std::path::PathBuf;
@@ -453,6 +493,51 @@ mod tests {
 
     struct FakeLauncher {
         state: FakeProcessState,
+    }
+
+    struct ReadinessFailProcess {
+        state: FakeProcessState,
+    }
+
+    impl RuntimeProcess for ReadinessFailProcess {
+        fn id(&self) -> u32 {
+            126
+        }
+
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError> {
+            Ok(None)
+        }
+
+        fn stop(&mut self, _grace: Duration) -> Result<StopOutcome, RuntimeError> {
+            *self.state.stop_calls.lock().expect("停止计数锁不应中毒") += 1;
+            Ok(StopOutcome::Terminated)
+        }
+
+        fn wait_for_readiness(
+            &mut self,
+            port: u16,
+            _timeout: Duration,
+        ) -> Result<ReadinessSignal, RuntimeError> {
+            Err(RuntimeError::OutputReadinessTimeout {
+                port,
+                timeout_ms: 1,
+            })
+        }
+    }
+
+    struct ReadinessFailLauncher {
+        state: FakeProcessState,
+    }
+
+    impl ProcessLauncher for ReadinessFailLauncher {
+        fn spawn(
+            &self,
+            _spec: &RuntimeLaunchSpec,
+        ) -> Result<Box<dyn RuntimeProcess>, RuntimeError> {
+            Ok(Box::new(ReadinessFailProcess {
+                state: self.state.clone(),
+            }))
+        }
     }
 
     #[derive(Clone, Default)]
@@ -646,6 +731,59 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn official_policy_requires_stdout_readiness_before_http_success() {
+        let process_state = FakeProcessState::default();
+        let sink = RecordingSink::default();
+        let supervisor = RuntimeSupervisor::for_test(
+            Arc::new(ReadinessFailLauncher {
+                state: process_state.clone(),
+            }),
+            Arc::new(FakeProbe {
+                result: Ok("http://127.0.0.1:43127".to_owned()),
+            }),
+        );
+        let mut spec = test_spec();
+        spec.readiness_policy = ReadinessPolicy::StdoutAndHttp;
+
+        supervisor
+            .start(spec, Duration::from_secs(1), Arc::new(sink.clone()))
+            .expect("后台启动应成功调度");
+
+        let events = sink.wait_for_count(2, Duration::from_secs(1));
+        assert!(matches!(events[0], RuntimeEvent::Starting { .. }));
+        assert!(matches!(
+            &events[1],
+            RuntimeEvent::Failed { code, .. } if code == "output_readiness_timeout"
+        ));
+        assert_eq!(
+            *process_state.stop_calls.lock().expect("停止计数锁不应中毒"),
+            1
+        );
+    }
+
+    #[test]
+    fn mock_policy_keeps_http_only_readiness() {
+        let sink = RecordingSink::default();
+        let supervisor = RuntimeSupervisor::for_test(
+            Arc::new(ReadinessFailLauncher {
+                state: FakeProcessState::default(),
+            }),
+            Arc::new(FakeProbe {
+                result: Ok("http://127.0.0.1:43127".to_owned()),
+            }),
+        );
+
+        supervisor
+            .start(test_spec(), Duration::from_secs(1), Arc::new(sink.clone()))
+            .expect("后台启动应成功调度");
+
+        assert!(matches!(
+            sink.wait_for_count(2, Duration::from_secs(1))[1],
+            RuntimeEvent::Ready { .. }
+        ));
     }
 
     #[test]

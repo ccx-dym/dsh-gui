@@ -1,7 +1,10 @@
 #![cfg(windows)]
 
-use dsh_desktop_lib::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
-use dsh_desktop_lib::runtime::process::{ManagedChild, StopOutcome};
+use dsh_desktop_lib::runtime::ReadinessSignal;
+use dsh_desktop_lib::runtime::command::{
+    ReadinessPolicy, RuntimeLaunchSpec, reserve_loopback_port,
+};
+use dsh_desktop_lib::runtime::process::{ManagedChild, RuntimeOutputErrorKind, StopOutcome};
 use std::collections::BTreeMap;
 use std::env;
 use std::net::{Ipv4Addr, TcpStream};
@@ -46,7 +49,23 @@ fn immediately_exiting_spec() -> RuntimeLaunchSpec {
         program: node,
         args: vec!["-e".to_owned(), "process.exit(0)".to_owned()],
         env: BTreeMap::new(),
+        cwd: env::current_dir().expect("应读取测试工作目录"),
         loopback_port: None,
+        readiness_policy: ReadinessPolicy::HttpOnly,
+    }
+}
+
+fn node_eval_spec(source: &str, port: u16) -> RuntimeLaunchSpec {
+    let node = env::var_os("DSH_DESKTOP_NODE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("node.exe"));
+    RuntimeLaunchSpec {
+        program: node,
+        args: vec!["-e".to_owned(), source.to_owned()],
+        env: BTreeMap::new(),
+        cwd: env::current_dir().expect("应读取测试工作目录"),
+        loopback_port: Some(port),
+        readiness_policy: ReadinessPolicy::StdoutAndHttp,
     }
 }
 
@@ -186,5 +205,97 @@ fn stop_terminates_a_live_mock_after_the_grace_period() {
     assert!(
         wait_until_process_stops(pid, Duration::from_secs(2)),
         "限时停止后应回收 mock DSH"
+    );
+}
+
+#[test]
+fn output_drain_accepts_only_the_exact_loopback_readiness_line_after_large_output() {
+    let _serial = process_test_lock();
+    let port = reserve_loopback_port().expect("应能申请动态回环端口");
+    let source = format!(
+        "process.stdout.write('x'.repeat(2*1024*1024)+'\\n');\
+         process.stderr.write('private'.repeat(256*1024)+'\\n');\
+         console.log('dsh web: http://127.0.0.1:{}');\
+         console.log('dsh web: http://127.0.0.1:{port}');\
+         setInterval(()=>{{}},1000);",
+        port.saturating_add(1)
+    );
+    let mut child = ManagedChild::spawn(&node_eval_spec(&source, port)).expect("Node 应启动");
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        child
+            .wait_for_readiness(port, Duration::from_secs(5))
+            .expect("大量输出必须被持续 drain，且不应阻塞精确就绪信号"),
+        ReadinessSignal::Web { port }
+    );
+    let stderr_deadline = Instant::now() + Duration::from_secs(1);
+    while child.output_error_kind().is_none() && Instant::now() < stderr_deadline {
+        thread::yield_now();
+    }
+    assert_eq!(
+        child.output_error_kind(),
+        Some(RuntimeOutputErrorKind::StderrObserved),
+        "stderr 只能暴露脱敏类别，不能返回 private 原文"
+    );
+    child.stop(Duration::ZERO).expect("应停止大输出进程");
+}
+
+#[test]
+fn output_drain_rejects_non_loopback_and_wrong_port_readiness_lines() {
+    let _serial = process_test_lock();
+    let port = reserve_loopback_port().expect("应能申请动态回环端口");
+    for forged in [
+        format!("dsh web: http://0.0.0.0:{port}"),
+        format!("dsh web: http://127.0.0.1:{}", port.saturating_add(1)),
+        format!("dsh web: http://127.0.0.1:0{port}"),
+    ] {
+        let source = format!("console.log({forged:?});");
+        let mut child = ManagedChild::spawn(&node_eval_spec(&source, port)).expect("Node 应启动");
+
+        assert!(
+            child
+                .wait_for_readiness(port, Duration::from_secs(1))
+                .is_err(),
+            "伪造输出不得满足官方 stdout readiness: {forged}"
+        );
+        child.stop(Duration::ZERO).expect("退出进程应可回收");
+    }
+}
+
+#[test]
+fn output_readiness_accepts_a_large_timeout_without_deadline_overflow() {
+    let _serial = process_test_lock();
+    let port = reserve_loopback_port().expect("应能申请动态回环端口");
+    let source =
+        format!("console.log('dsh web: http://127.0.0.1:{port}');setInterval(()=>{{}},1000);");
+    let mut child = ManagedChild::spawn(&node_eval_spec(&source, port)).expect("Node 应启动");
+
+    assert_eq!(
+        child
+            .wait_for_readiness(port, Duration::MAX)
+            .expect("合法的大超时不得让截止时间计算溢出"),
+        ReadinessSignal::Web { port }
+    );
+    child.stop(Duration::ZERO).expect("应停止就绪测试进程");
+}
+
+#[test]
+fn natural_main_exit_terminates_pipe_inheriting_descendants_before_join() {
+    let _serial = process_test_lock();
+    let port = reserve_loopback_port().expect("应能申请动态回环端口");
+    let source = "require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:['ignore','inherit','inherit']}).unref();";
+    let mut child = ManagedChild::spawn(&node_eval_spec(source, port)).expect("Node 应启动");
+    let started = Instant::now();
+
+    assert_eq!(
+        child
+            .stop(Duration::from_secs(2))
+            .expect("主进程自然退出时必须回收继承 pipe 的后代"),
+        StopOutcome::Exited
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "join 不得被后代持有的 pipe 卡住"
     );
 }
