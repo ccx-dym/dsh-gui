@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-desktop.invalid/schemas/runtime-manifest-v1.json",
+  "title": "DSH Desktop compatibility runtime manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "dsh_version", "node_version", "minimum_desktop_version", "platform", "arch", "artifact", "verified_at", "compatibility_summary"],
+  "properties": {
+    "schema": { "const": 1 },
+    "dsh_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z]+(?:\\.[0-9A-Za-z]+)*)?$" },
+    "node_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "minimum_desktop_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z]+(?:\\.[0-9A-Za-z]+)*)?$" },
+    "platform": { "const": "windows" },
+    "arch": { "const": "x86_64" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "size", "sha256"],
+      "properties": {
+        "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "size": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "verified_at": { "type": "string", "format": "date-time", "pattern": "Z$" },
+    "compatibility_summary": { "type": "string", "minLength": 1, "maxLength": 512 }
+  }
+}
