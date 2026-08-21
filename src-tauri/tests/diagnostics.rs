@@ -323,6 +323,48 @@ async fn complete_json_with_a_non_generated_secret_trace_is_not_preserved() {
 }
 
 #[tokio::test]
+async fn recovery_rejects_unknown_keys_types_and_enum_values_without_echoing_secrets() {
+    for (index, mutate) in [
+        ("stage", "private ASCII body"),
+        ("error_kind", "AKIAIOSFODNN7EXAMPLE"),
+        ("unknown", "Authorization: Bearer sk-proj-secret"),
+        ("elapsed_ms", r"C:\用户\私密.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = isolated_directory(&format!("invalid-schema-{index}"));
+        fs::create_dir_all(&directory).expect("应创建日志目录");
+        let slot = directory.join("diagnostics-0.jsonl");
+        let mut forged = serde_json::to_value(event(DiagnosticStage::OfficialCheck, None))
+            .expect("合法事件应可序列化");
+        forged[mutate.0] = serde_json::Value::String(mutate.1.to_owned());
+        let mut bytes = serde_json::to_vec(&forged).expect("伪造夹具应可序列化");
+        bytes.push(b'\n');
+        fs::write(&slot, bytes).expect("应预置不合法 JSONL");
+        let logger = DiagnosticLogger::new(
+            directory,
+            DiagnosticPolicy {
+                max_file_bytes: 1024,
+                slot_count: 2,
+            },
+        )
+        .expect("策略合法");
+
+        logger
+            .write(&event(DiagnosticStage::CompatibilityCheck, None))
+            .await
+            .expect("应拒绝不合法恢复记录");
+
+        let repaired = fs::read_to_string(slot).expect("应读取修复后的槽位");
+        assert!(!repaired.contains(mutate.1));
+        for line in repaired.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("每行必须是完整 JSON");
+        }
+    }
+}
+
+#[tokio::test]
 async fn no_fail_sink_absorbs_write_failures_and_queue_pressure() {
     let occupied_path = isolated_directory("sink-failure");
     fs::write(&occupied_path, b"not a directory").expect("应创建占位文件");

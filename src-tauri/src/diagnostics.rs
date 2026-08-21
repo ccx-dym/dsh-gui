@@ -23,7 +23,7 @@ static TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// use dsh_desktop_lib::diagnostics::DiagnosticTraceId;
 /// let _ = DiagnosticTraceId::parse("sk-proj-user-controlled");
 /// ```
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 struct DiagnosticTraceId(String);
 
@@ -77,7 +77,7 @@ impl OperationTrace {
 }
 
 /// 可记录的有限阶段白名单；外部错误正文无法伪装成阶段字段。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticStage {
     ActivationCommit,
@@ -110,7 +110,7 @@ pub enum DiagnosticStage {
 }
 
 /// 可记录的有限错误类别白名单，不携带底层 source 或动态上下文。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticErrorKind {
     ActivationBusy,
@@ -139,8 +139,16 @@ pub enum DiagnosticErrorKind {
 }
 
 /// 固定字段的本地诊断事件；类型上不提供 headers、env、body 或任意文本字段。
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// 外部 JSON 不能反序列化为生产事件，因此恢复文件也无法成为任意事件注入入口。
+///
+/// ```compile_fail
+/// use dsh_desktop_lib::diagnostics::DiagnosticEvent;
+/// let _: DiagnosticEvent = serde_json::from_str(
+///     r#"{"elapsed_ms":0,"retry":0,"stage":"runtime_start","trace_id":"runtime-sk-proj-secret"}"#,
+/// ).unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DiagnosticEvent {
     elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +158,34 @@ pub struct DiagnosticEvent {
     retry: u32,
     stage: DiagnosticStage,
     trace_id: DiagnosticTraceId,
+}
+
+/// 仅用于校验已有 JSONL 的私有 DTO；它不会转换成 `DiagnosticEvent` 或进入 sink。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedDiagnosticEvent {
+    #[serde(rename = "elapsed_ms")]
+    _elapsed_ms: u64,
+    #[serde(default)]
+    error_kind: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "pid")]
+    _pid: Option<u32>,
+    #[serde(rename = "retry")]
+    _retry: u32,
+    stage: String,
+    trace_id: String,
+}
+
+impl PersistedDiagnosticEvent {
+    fn is_valid(&self) -> bool {
+        is_generated_trace_id(&self.trace_id)
+            && is_persisted_stage(&self.stage)
+            && self
+                .error_kind
+                .as_deref()
+                .is_none_or(is_persisted_error_kind)
+    }
 }
 
 impl DiagnosticEvent {
@@ -330,8 +366,8 @@ fn repair_jsonl_prefix(file: &mut std::fs::File) -> io::Result<()> {
             break;
         }
         let document = &line[..line.len() - 1];
-        let valid = serde_json::from_slice::<DiagnosticEvent>(document)
-            .is_ok_and(|event| is_generated_trace_id(&event.trace_id.0));
+        let valid = serde_json::from_slice::<PersistedDiagnosticEvent>(document)
+            .is_ok_and(|event| event.is_valid());
         if !valid {
             break;
         }
@@ -356,6 +392,68 @@ fn is_generated_trace_id(value: &str) -> bool {
         && pid.is_some_and(|part| u32::from_str_radix(part, 16).is_ok())
         && time_entropy.is_some_and(|part| u128::from_str_radix(part, 16).is_ok())
         && sequence.is_some_and(|part| u64::from_str_radix(part, 16).is_ok())
+}
+
+fn is_persisted_stage(value: &str) -> bool {
+    matches!(
+        value,
+        "activation_commit"
+            | "activation_prepare"
+            | "activation_recovery"
+            | "activation_rollback"
+            | "archive_install"
+            | "close_to_tray"
+            | "download_attempt"
+            | "download_complete"
+            | "manifest_verify"
+            | "official_check"
+            | "compatibility_check"
+            | "probe_complete"
+            | "probe_start"
+            | "runtime_failed"
+            | "runtime_ready"
+            | "runtime_start"
+            | "runtime_stopping"
+            | "snapshot_prepare"
+            | "single_instance_focus"
+            | "single_instance_show"
+            | "single_instance_window"
+            | "tray_exit"
+            | "tray_hide"
+            | "tray_open"
+            | "tray_restart"
+            | "update_probe"
+            | "update_check"
+    )
+}
+
+fn is_persisted_error_kind(value: &str) -> bool {
+    matches!(
+        value,
+        "activation_busy"
+            | "already_running"
+            | "deployment_changed"
+            | "health_timeout"
+            | "invalid_launch_path"
+            | "invalid_loopback_port"
+            | "invalid_url"
+            | "io_error"
+            | "main_window_missing"
+            | "missing_loopback_port"
+            | "mock_runtime_disabled"
+            | "output_readiness_timeout"
+            | "probe_operation_in_progress"
+            | "probe_requires_stopped_runtime"
+            | "process_error"
+            | "process_exited_early"
+            | "runtime_failure"
+            | "startup_abort_timeout"
+            | "startup_abort_unavailable"
+            | "startup_aborted"
+            | "state_poisoned"
+            | "tauri_error"
+            | "update_failure"
+    )
 }
 
 fn write_slot(
