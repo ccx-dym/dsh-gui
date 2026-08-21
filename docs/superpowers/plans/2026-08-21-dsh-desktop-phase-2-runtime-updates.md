@@ -23,6 +23,7 @@ Node 24 + `@deepseek-ai/dsh` Web runtime；发现官方 npm 新版时只通知�
 - `futures-util = =0.3.34`：带大小上限的响应流；
 - `sha2 = =0.10.9`：runtime 包 SHA-256；
 - `semver = =1.0.28`：官方版本与兼容约束；
+- `url = =2.5.8`：结构化校验 HTTPS artifact URL，拒绝凭据、fragment 与伪装 scheme；
 - `ed25519-dalek = =3.0.0`：兼容清单 detached signature 验证；
 - `zip = =8.4.0`，仅 `deflate`：解压 runtime 包并执行 Zip Slip 防护。
 - `tauri-plugin-notification = =2.3.3`：Windows 系统通知、点击恢复窗口；只在 Task 11
