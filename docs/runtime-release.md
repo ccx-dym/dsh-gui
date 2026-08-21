@@ -15,8 +15,9 @@ SHA-256。制作阶段只执行 `npm ci`，不会用 `latest`、`npx`、全局�
 }
 ```
 
-执行 `npm install --package-lock-only --ignore-scripts --no-audit --no-fund --legacy-peer-deps`，
-避免 npm 自动扩张 peer 图；同一选项会固定用于发布的 `npm ci`。然后人工检查：
+执行 `npm install --package-lock-only --ignore-scripts --no-audit --no-fund`，使用 npm
+标准 peer 解析生成完整运行闭包。禁止 `--legacy-peer-deps`：它会跳过 DSH app-boot 等包的
+必需 peer，使 CLI 在启动时出现 `ERR_MODULE_NOT_FOUND`。然后人工检查：
 
 - lock root 与 `node_modules/@deepseek-ai/dsh` 都是目标 exact version；
 - registry、integrity、可选平台包和 install scripts；

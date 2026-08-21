@@ -20,6 +20,10 @@ const installedNames = new Set(
     .filter(([packagePath]) => packagePath !== "")
     .map(([packagePath, metadata]) => metadata.name ?? packagePath.slice(packagePath.lastIndexOf("node_modules/") + 13)),
 );
+assert.ok(
+  installedNames.has("@deepseek-ai/cordis-plugin-group"),
+  "官方 DSH CLI import closure 必须包含 dsh-app-boot 的 cordis-plugin-group peer",
+);
 const missing = [];
 for (const [packagePath, metadata] of Object.entries(packages)) {
   for (const dependency of Object.keys(metadata.dependencies ?? {})) {
@@ -29,6 +33,21 @@ for (const [packagePath, metadata] of Object.entries(packages)) {
   }
 }
 assert.deepEqual(missing, [], `lock 缺少 required dependency 条目:\n${missing.join("\n")}`);
+
+const missingRequiredPeers = [];
+for (const [packagePath, metadata] of Object.entries(packages)) {
+  for (const peer of Object.keys(metadata.peerDependencies ?? {})) {
+    if (metadata.peerDependenciesMeta?.[peer]?.optional === true) continue;
+    if (!installedNames.has(peer)) {
+      missingRequiredPeers.push(`${packagePath} -> peer ${peer}`);
+    }
+  }
+}
+assert.deepEqual(
+  missingRequiredPeers,
+  [],
+  `lock 缺少 non-optional peer runtime closure:\n${missingRequiredPeers.join("\n")}`,
+);
 
 const actualInstallScripts = Object.entries(packages)
   .filter(([, metadata]) => metadata.hasInstallScript === true)

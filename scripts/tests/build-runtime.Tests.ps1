@@ -83,6 +83,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -90,11 +92,14 @@ fn main() {
         && args.get(1).is_some_and(|value| value == "ci")
     {
         if args.iter().any(|value| value == "--ignore-scripts") { std::process::exit(10); }
+        if args.iter().any(|value| value == "--legacy-peer-deps") { std::process::exit(12); }
         let prefix = PathBuf::from(&args[args.iter().position(|value| value == "--prefix").unwrap() + 1]);
         let package = prefix.join("node_modules").join("@deepseek-ai").join("dsh");
         fs::create_dir_all(package.join("lib")).unwrap();
         fs::write(package.join("package.json"), r#"{"name":"@deepseek-ai/dsh","version":"0.1.1-rc.1","license":"MIT"}"#).unwrap();
         fs::write(package.join("lib").join("bin.js"), "").unwrap();
+        fs::create_dir_all(package.join("fixtures")).unwrap();
+        fs::write(package.join("fixtures").join("package.json"), "{}").unwrap();
         return;
     }
     if args.iter().any(|value| value == "--help") { return; }
@@ -102,10 +107,13 @@ fn main() {
         if !args.iter().any(|value| value == "--no-open") { std::process::exit(11); }
         let port: u16 = args[args.iter().position(|value| value == "--port").unwrap() + 1].parse().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request);
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").unwrap();
+        for attempt in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            if attempt == 0 { thread::sleep(Duration::from_millis(1_200)); }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+        }
         return;
     }
     std::process::exit(2);

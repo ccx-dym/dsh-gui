@@ -125,7 +125,7 @@ $appRoot = Join-Path $stageRoot 'app'
 New-Item -ItemType Directory -Path $appRoot | Out-Null
 Copy-Item -LiteralPath $packagePath, $lockPath, $installScriptsPath -Destination $appRoot
 $npmCli = Join-Path $nodeRoot 'node_modules\npm\bin\npm-cli.js'
-& (Join-Path $nodeRoot 'node.exe') $npmCli ci --prefix $appRoot --omit=dev --no-audit --no-fund --legacy-peer-deps
+& (Join-Path $nodeRoot 'node.exe') $npmCli ci --prefix $appRoot --omit=dev --no-audit --no-fund
 if ($LASTEXITCODE -ne 0) { throw 'npm ci 安装 runtime 失败。' }
 
 $installedPackagePath = Join-Path $appRoot 'node_modules\@deepseek-ai\dsh\package.json'
@@ -177,6 +177,13 @@ try {
         catch [System.Net.WebException] {
             Start-Sleep -Milliseconds 100
         }
+        catch [System.Threading.Tasks.TaskCanceledException] {
+            # Web 进程可能已监听但仍在初始化首个响应；单次超时必须服从总 20 秒截止时间。
+            Start-Sleep -Milliseconds 100
+        }
+        catch [System.TimeoutException] {
+            Start-Sleep -Milliseconds 100
+        }
     }
     if (-not $ready) { throw 'DSH Web 回环 smoke 未在 20 秒内就绪。' }
 }
@@ -189,11 +196,22 @@ finally {
     $stderrDrain.GetAwaiter().GetResult() | Out-Null
 }
 
-# notices 先落盘，使它本身也进入随后生成的 payload 文件摘要清单。
-$notices = Get-ChildItem -LiteralPath (Join-Path $appRoot 'node_modules') -Recurse -Filter package.json | ForEach-Object {
-    $package = Get-Content -Raw -LiteralPath $_.FullName | ConvertFrom-Json
-    [ordered]@{ name = $package.name; version = $package.version; license = $package.license }
-} | Sort-Object name, version
+# lock path 是 npm package root 的权威边界；递归找 package.json 会误收包内 fixture/资源清单。
+$notices = $lock['packages'].GetEnumerator() | Where-Object {
+    -not [string]::IsNullOrEmpty($_.Key) -and
+    (Test-Path -LiteralPath (Join-Path $appRoot $_.Key) -PathType Container)
+} | ForEach-Object {
+    $packageName = $_.Value['name']
+    if ([string]::IsNullOrEmpty($packageName)) {
+        $packageName = $_.Key.Substring($_.Key.LastIndexOf('node_modules/') + 13)
+    }
+    [ordered]@{
+        path = $_.Key
+        name = $packageName
+        version = $_.Value['version']
+        license = $_.Value['license']
+    }
+} | Sort-Object name, version, path
 $notices | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stageRoot 'THIRD_PARTY_NOTICES.json') -Encoding utf8NoBOM
 
 # inventory 覆盖全部 runtime payload；它不能包含自身摘要，发布方另行摘要最终 ZIP。
