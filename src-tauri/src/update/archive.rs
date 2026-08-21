@@ -1,4 +1,4 @@
-use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 use crate::paths::RuntimeLayout;
 use crate::runtime::install_state::InstalledRuntime;
 use crate::update::download::DownloadedArtifact;
@@ -41,7 +41,6 @@ pub struct ArchiveInstallRequest {
     pub layout: RuntimeLayout,
     pub runtime: InstalledRuntime,
     pub node_version: Version,
-    pub trace_id: String,
 }
 
 impl ArchiveInstallRequest {
@@ -51,7 +50,6 @@ impl ArchiveInstallRequest {
     /// :param layout: 不可变运行时目录布局。
     /// :param runtime: 待安装的固定 DSH 版本及清单摘要。
     /// :param node_version: 签名兼容清单指定的 Node 版本。
-    /// :param trace_id: 单段 staging 诊断标识。
     /// :return: 解压前会再次对同一打开文件句柄核对大小和摘要的请求。
     /// :raises: 此转换不访问文件系统，不产生错误。
     pub fn from_downloaded(
@@ -59,7 +57,6 @@ impl ArchiveInstallRequest {
         layout: RuntimeLayout,
         runtime: InstalledRuntime,
         node_version: Version,
-        trace_id: String,
     ) -> Self {
         Self {
             archive_path: downloaded.verified_path,
@@ -68,7 +65,6 @@ impl ArchiveInstallRequest {
             layout,
             runtime,
             node_version,
-            trace_id,
         }
     }
 }
@@ -175,16 +171,17 @@ impl RuntimeArchiveInstaller {
     /// 压缩和磁盘操作全部移入 blocking worker，避免阻塞 Tauri/Tokio 事件循环。失败时
     /// staging 会原样保留给后续结构化诊断；源 `.verified` 文件也始终保留。
     ///
-    /// :param request: 已验证压缩包、固定版本布局、Node/DSH 版本和安全 trace 标识。
+    /// :param request: 已验证压缩包、固定版本布局与 Node/DSH 版本。
+    /// :param diagnostics: 提供内部生成 staging 标识的类型化更新上下文。
     /// :return: rename 成功后实际不可变目录及 inventory 统计。
     /// :raises ArchiveInstallError: ZIP 路径/类型/资源上限、payload 闭包、版本、文件系统
     ///   边界或原子 rename 不符合约束时返回稳定错误类别。
     pub async fn install(
         &self,
         request: ArchiveInstallRequest,
+        diagnostics: &DiagnosticContext,
     ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
-        self.install_inner(request, &DiagnosticContext::noop(TraceKind::Update))
-            .await
+        self.install_inner(request, diagnostics).await
     }
 
     /// 使用共享 trace 安装已验证运行时，不记录归档路径或内容。
@@ -195,10 +192,9 @@ impl RuntimeArchiveInstaller {
     /// :raises ArchiveInstallError: 验证、资源或文件系统边界失败时返回。
     pub async fn install_with_context(
         &self,
-        mut request: ArchiveInstallRequest,
+        request: ArchiveInstallRequest,
         diagnostics: &DiagnosticContext,
     ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
-        request.trace_id = diagnostics.trace_str().to_owned();
         self.install_inner(request, diagnostics).await
     }
 
@@ -210,8 +206,11 @@ impl RuntimeArchiveInstaller {
         let started = std::time::Instant::now();
         diagnostics.record(DiagnosticStage::ArchiveInstall, 0, 0, None, None);
         let policy = self.policy;
+        let trace_id = diagnostics.trace_str().to_owned();
         let result =
-            match tokio::task::spawn_blocking(move || install_blocking(request, policy)).await {
+            match tokio::task::spawn_blocking(move || install_blocking(request, policy, &trace_id))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(ArchiveInstallError::Worker),
             };
@@ -448,11 +447,12 @@ fn digest_file_with_checkpoint(
 fn install_blocking(
     request: ArchiveInstallRequest,
     policy: ArchiveInstallPolicy,
+    trace_id: &str,
 ) -> Result<InstalledRuntimeArchive, ArchiveInstallError> {
     if request.runtime.node_version != request.node_version {
         return Err(ArchiveInstallError::RuntimeDescriptorMismatch);
     }
-    validate_trace_id(&request.trace_id)?;
+    validate_trace_id(trace_id)?;
     validate_source_path(&request.archive_path)?;
     let mut archive_file = open_verified_archive(&request.archive_path)?;
     validate_source_archive(&archive_file)?;
@@ -495,7 +495,7 @@ fn install_blocking(
     }
 
     let target = canonical_root.join(request.runtime.version.to_string());
-    let staging = canonical_root.join(format!(".staging-{}", request.trace_id));
+    let staging = canonical_root.join(format!(".staging-{trace_id}"));
     if fs::symlink_metadata(&staging).is_ok() {
         return Err(ArchiveInstallError::StagingAlreadyExists);
     }
@@ -1230,6 +1230,7 @@ mod tests {
     use super::{
         ArchiveInstallError, ArchiveInstallPolicy, ArchiveInstallRequest, RuntimeArchiveInstaller,
     };
+    use crate::diagnostics::{DiagnosticContext, TraceKind};
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::install_state::InstalledRuntime;
     use crate::update::download::DownloadedArtifact;
@@ -1385,7 +1386,11 @@ mod tests {
         cursor.into_inner()
     }
 
-    fn request(root: &Path, archive_path: PathBuf, trace_id: &str) -> ArchiveInstallRequest {
+    fn diagnostics() -> DiagnosticContext {
+        DiagnosticContext::noop(TraceKind::Update)
+    }
+
+    fn request(root: &Path, archive_path: PathBuf, _trace_id: &str) -> ArchiveInstallRequest {
         let bytes = fs::read(&archive_path).expect("downloaded artifact");
         ArchiveInstallRequest::from_downloaded(
             DownloadedArtifact {
@@ -1396,7 +1401,6 @@ mod tests {
             layout(root),
             runtime(),
             Version::parse(NODE_VERSION).expect("node version"),
-            trace_id.to_owned(),
         )
     }
 
@@ -1411,7 +1415,7 @@ mod tests {
         fs::write(&archive_path, bytes).expect("archive");
         RuntimeArchiveInstaller::new(policy)
             .expect("policy")
-            .install(request(&root, archive_path, "trace_01"))
+            .install(request(&root, archive_path, "trace_01"), &diagnostics())
             .await
     }
 
@@ -1426,7 +1430,7 @@ mod tests {
 
         let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
             .expect("policy")
-            .install(install_request)
+            .install(install_request, &diagnostics())
             .await
             .expect_err("runtime descriptor and archive validation must use the same Node");
 
@@ -1446,7 +1450,10 @@ mod tests {
 
         let installed = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
             .expect("policy")
-            .install(request(&root, archive_path.clone(), "trace_ok"))
+            .install(
+                request(&root, archive_path.clone(), "trace_ok"),
+                &diagnostics(),
+            )
             .await
             .expect("install");
 
@@ -1611,7 +1618,10 @@ mod tests {
 
         let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
             .expect("policy")
-            .install(request(&root, archive_path, "trace_existing"))
+            .install(
+                request(&root, archive_path, "trace_existing"),
+                &diagnostics(),
+            )
             .await
             .expect_err("immutable target");
         assert!(matches!(error, ArchiveInstallError::TargetAlreadyExists));
@@ -1680,22 +1690,21 @@ mod tests {
         let original = archive_bytes(&valid_payload());
         let archive_path = root.join("artifact.verified");
         fs::write(&archive_path, &original).expect("original download");
-        let mut bound = request(&root, archive_path.clone(), "trace_size");
+        let bound = request(&root, archive_path.clone(), "trace_size");
 
         fs::write(&archive_path, b"replacement").expect("replace downloaded path");
         let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
             .expect("policy")
-            .install(bound.clone())
+            .install(bound.clone(), &diagnostics())
             .await
             .expect_err("replaced size must fail");
         assert!(matches!(error, ArchiveInstallError::ArtifactSizeMismatch));
 
         fs::write(&archive_path, vec![b'x'; original.len()])
             .expect("replace with equal-size bytes");
-        bound.trace_id = "trace_digest".to_owned();
         let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
             .expect("policy")
-            .install(bound)
+            .install(bound, &diagnostics())
             .await
             .expect_err("replaced digest must fail");
         assert!(matches!(error, ArchiveInstallError::ArtifactDigestMismatch));
@@ -1791,24 +1800,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_trace_ids_that_could_alias_staging_paths() {
-        for (index, trace_id) in ["", ".", "..", "a/b", r"a\b", "with space"]
-            .iter()
-            .enumerate()
-        {
-            let root = test_root(&format!("trace-{index}"));
-            fs::create_dir_all(&root).expect("root");
-            let archive_path = root.join("artifact.verified");
-            fs::write(&archive_path, archive_bytes(&valid_payload())).expect("archive");
-
-            let error = RuntimeArchiveInstaller::new(ArchiveInstallPolicy::default())
-                .expect("policy")
-                .install(request(&root, archive_path, trace_id))
-                .await
-                .expect_err("invalid trace");
-
-            assert!(matches!(error, ArchiveInstallError::InvalidTraceId));
-        }
+    async fn generated_trace_id_is_safe_for_staging_directory() {
+        let diagnostics = diagnostics();
+        assert!(super::validate_trace_id(diagnostics.trace_str()).is_ok());
+        assert_eq!(Path::new(diagnostics.trace_str()).components().count(), 1);
     }
 
     #[test]

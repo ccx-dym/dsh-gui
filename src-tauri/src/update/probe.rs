@@ -416,13 +416,14 @@ impl RuntimeProbe {
     /// :param cancellation: 可中断短片轮询的取消令牌。
     /// :return: 只含稳定字段的成功或失败报告；预检失败返回结构化错误。
     /// :raises ProbeError: 路径/资源/状态预检失败，或 blocking worker 无法完成时返回。
-    pub async fn probe(
+    async fn probe_inner(
         &self,
         workspace: ProbeWorkspace,
-        trace_id: String,
+        trace_id: &str,
         cancellation: ProbeCancellation,
     ) -> Result<ProbeReport, ProbeError> {
-        validate_trace_id(&trace_id)?;
+        validate_trace_id(trace_id)?;
+        let trace_id = trace_id.to_owned();
         let _execution_permit = workspace._permit.clone();
         let probe_started = Instant::now();
         let deadline = probe_started
@@ -586,7 +587,7 @@ impl RuntimeProbe {
     /// :param diagnostics: 调用链共享的类型化诊断上下文。
     /// :return: 不含运行时输出正文的探活报告。
     /// :raises ProbeError: workspace、资源或 worker 边界失败时返回。
-    pub async fn probe_with_context(
+    pub async fn probe(
         &self,
         workspace: ProbeWorkspace,
         cancellation: ProbeCancellation,
@@ -595,7 +596,7 @@ impl RuntimeProbe {
         let started = Instant::now();
         diagnostics.record(DiagnosticStage::ProbeStart, 0, 0, None, None);
         let result = self
-            .probe(workspace, diagnostics.trace_str().to_owned(), cancellation)
+            .probe_inner(workspace, diagnostics.trace_str(), cancellation)
             .await;
         let (retry, failed) = match &result {
             Ok(report) => (report.retry_count, report.error_kind.is_some()),

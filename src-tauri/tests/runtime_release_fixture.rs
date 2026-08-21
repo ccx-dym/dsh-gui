@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dsh_desktop_lib::update::manifest::{ManifestError, ManifestVerifier};
+use dsh_desktop_lib::{
+    diagnostics::{DiagnosticContext, TraceKind},
+    update::manifest::{ManifestError, ManifestVerifier},
+};
 use ed25519_dalek::SigningKey;
 use semver::Version;
 
@@ -56,14 +59,15 @@ fn runtime_release_fixture_signs_raw_bytes_and_rejects_tampering() {
     )
     .unwrap();
     let manifest = fs::read(&manifest_path).expect("应能读取清单原始 bytes");
+    let diagnostics = DiagnosticContext::noop(TraceKind::Update);
     verifier
-        .verify(&manifest, &signature)
+        .verify(&manifest, &signature, &diagnostics)
         .expect("原始 bytes 应通过 Rust 验证");
 
     let mut tampered = manifest;
     tampered[0] ^= 1;
     assert!(matches!(
-        verifier.verify(&tampered, &signature),
+        verifier.verify(&tampered, &signature, &diagnostics),
         Err(ManifestError::SignatureVerification)
     ));
 }

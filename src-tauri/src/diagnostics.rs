@@ -1,7 +1,7 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions as SyncOpenOptions;
 use std::io;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ static TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// use dsh_desktop_lib::diagnostics::DiagnosticTraceId;
 /// let _ = DiagnosticTraceId::parse("sk-proj-user-controlled");
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 struct DiagnosticTraceId(String);
 
@@ -77,7 +77,7 @@ impl OperationTrace {
 }
 
 /// 可记录的有限阶段白名单；外部错误正文无法伪装成阶段字段。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticStage {
     ActivationCommit,
@@ -110,7 +110,7 @@ pub enum DiagnosticStage {
 }
 
 /// 可记录的有限错误类别白名单，不携带底层 source 或动态上下文。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticErrorKind {
     ActivationBusy,
@@ -139,7 +139,8 @@ pub enum DiagnosticErrorKind {
 }
 
 /// 固定字段的本地诊断事件；类型上不提供 headers、env、body 或任意文本字段。
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticEvent {
     elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,11 +304,13 @@ fn reclaim_oversized_slots(
         let path = directory.join(format!("{LOG_PREFIX}{slot}{LOG_SUFFIX}"));
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
-                let file = open_validated_slot(&path)?;
+                let mut file = open_validated_slot(&path)?;
                 if file.metadata()?.len() > policy.max_file_bytes {
                     // 超限旧槽位可能含截断 JSONL；验证完成后在原句柄内收敛，不删除。
                     file.set_len(0)?;
                     file.sync_data()?;
+                } else {
+                    repair_jsonl_prefix(&mut file)?;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -315,6 +318,44 @@ fn reclaim_oversized_slots(
         }
     }
     Ok(())
+}
+
+fn repair_jsonl_prefix(file: &mut std::fs::File) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut valid_end = 0_usize;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        let document = &line[..line.len() - 1];
+        let valid = serde_json::from_slice::<DiagnosticEvent>(document)
+            .is_ok_and(|event| is_generated_trace_id(&event.trace_id.0));
+        if !valid {
+            break;
+        }
+        valid_end += line.len();
+    }
+    if valid_end != bytes.len() {
+        // 仅在已验证的同一句柄上截到首个坏行，保留此前完整事件且不调用删除 API。
+        file.set_len(valid_end as u64)?;
+        file.sync_data()?;
+    }
+    Ok(())
+}
+
+fn is_generated_trace_id(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let kind = parts.next();
+    let pid = parts.next();
+    let time_entropy = parts.next();
+    let sequence = parts.next();
+    parts.next().is_none()
+        && matches!(kind, Some("activation" | "runtime" | "update"))
+        && pid.is_some_and(|part| u32::from_str_radix(part, 16).is_ok())
+        && time_entropy.is_some_and(|part| u128::from_str_radix(part, 16).is_ok())
+        && sequence.is_some_and(|part| u64::from_str_radix(part, 16).is_ok())
 }
 
 fn write_slot(

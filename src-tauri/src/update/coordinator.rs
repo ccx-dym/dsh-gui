@@ -19,7 +19,7 @@ use super::{
     manifest::VerifiedManifest,
     version_source::{CompatibilitySource, OfficialVersionSource, SourceError},
 };
-use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 use crate::domain::UpdateNotice;
 
 const UPDATE_STATE_SCHEMA: u32 = 1;
@@ -286,12 +286,16 @@ impl UpdateCoordinator {
     /// :param current: 当前已安装 DSH 版本；首次安装为 `None`。
     /// :return: 通知、可选受信清单、去重结论和下次检查时间。
     /// :raises UpdateStateError: 状态文件或时钟失败时返回。
-    pub async fn check(
+    #[cfg(test)]
+    async fn check(
         &self,
         current: Option<&Version>,
     ) -> Result<UpdateCheckResult, UpdateStateError> {
-        self.check_with_context(current, &DiagnosticContext::noop(TraceKind::Update))
-            .await
+        self.check_with_context(
+            current,
+            &DiagnosticContext::noop(crate::diagnostics::TraceKind::Update),
+        )
+        .await
     }
 
     /// 使用共享诊断上下文执行官方与兼容检查。
@@ -404,39 +408,65 @@ impl UpdateCoordinator {
     ///
     /// :param coordinator: 共享协调器。
     /// :param current: 当前安装版本快照。
+    /// :param diagnostics: 由启动入口创建并贯穿定时检查的类型化上下文。
     /// :return: 可观测的后台任务句柄。
     /// :raises UpdateStateError: 由任务结果返回，而非在 UI 线程抛出。
     pub fn spawn_startup_check(
         coordinator: Arc<Self>,
         current: Option<Version>,
+        diagnostics: DiagnosticContext,
     ) -> JoinHandle<Result<ScheduledCheckResult, UpdateStateError>> {
         tokio::spawn(async move {
             tokio::time::sleep(coordinator.schedule.startup_delay).await;
-            coordinator.check_if_due(current.as_ref()).await
+            coordinator
+                .check_if_due(current.as_ref(), &diagnostics)
+                .await
         })
     }
 
     /// 仅在持久化截止时间到期时执行检查；到期判断与状态提交共用同一进程锁。
     ///
     /// :param current: 当前安装版本快照。
+    /// :param diagnostics: 与实际网络检查共享的类型化上下文。
     /// :return: 未到期时返回 `Skipped`，到期时返回实际检查结果。
     /// :raises UpdateStateError: 状态、时钟或检查后的状态提交失败时返回。
     pub async fn check_if_due(
         &self,
         current: Option<&Version>,
+        diagnostics: &DiagnosticContext,
     ) -> Result<ScheduledCheckResult, UpdateStateError> {
+        let started = std::time::Instant::now();
+        diagnostics.record(DiagnosticStage::UpdateCheck, 0, 0, None, None);
         let _guard = self.check_lock.lock().await;
         let state = self.state_store.load().await?;
         if self.time.now_epoch_secs()? < state.next_check_epoch_secs {
+            diagnostics.record(
+                DiagnosticStage::UpdateCheck,
+                started.elapsed().as_millis() as u64,
+                0,
+                None,
+                None,
+            );
             return Ok(ScheduledCheckResult::Skipped {
                 next_check_epoch_secs: state.next_check_epoch_secs,
             });
         }
-        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
-        self.check_with_state(current, state, &diagnostics)
+        let result = self
+            .check_with_state(current, state, diagnostics)
             .await
             .map(Box::new)
-            .map(ScheduledCheckResult::Checked)
+            .map(ScheduledCheckResult::Checked);
+        diagnostics.record(
+            DiagnosticStage::UpdateCheck,
+            started.elapsed().as_millis() as u64,
+            0,
+            None,
+            result
+                .as_ref()
+                .err()
+                .map(|_| DiagnosticErrorKind::UpdateFailure),
+        );
+        result
     }
 
     /// 返回只读的到期提示，供设置页展示；不作为发起检查的前置门禁。
@@ -575,7 +605,10 @@ mod tests {
         future::Future,
         path::PathBuf,
         pin::Pin,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -585,6 +618,7 @@ mod tests {
         PersistedUpdateState, ScheduledCheckResult, UpdateCoordinator, UpdateSchedule,
         UpdateStateError, UpdateStateStore, UpdateTimeSource, decide_notice, notification_key,
     };
+    use crate::diagnostics::{DiagnosticContext, DiagnosticEvent, DiagnosticSink, TraceKind};
     use crate::domain::UpdateNotice;
     use crate::update::{
         manifest::{CompatibilityManifestV1, RuntimeArtifact, VerifiedManifest},
@@ -594,6 +628,15 @@ mod tests {
     };
 
     struct FixedOfficial(Result<OfficialRelease, SourceError>);
+
+    #[derive(Default)]
+    struct CountingDiagnostics(AtomicUsize);
+
+    impl DiagnosticSink for CountingDiagnostics {
+        fn record(&self, _event: DiagnosticEvent) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     impl OfficialVersionSource for FixedOfficial {
         fn latest<'a>(
@@ -608,8 +651,9 @@ mod tests {
     struct FixedCompatibility(Result<Option<VerifiedManifest>, SourceError>);
 
     impl CompatibilitySource for FixedCompatibility {
-        fn latest_compatible<'a>(
+        fn latest_compatible_with_context<'a>(
             &'a self,
+            _diagnostics: &'a DiagnosticContext,
         ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
         {
             let result = self.0.clone();
@@ -939,7 +983,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let result = UpdateCoordinator::spawn_startup_check(coordinator, None)
+        let sink = Arc::new(CountingDiagnostics::default());
+        let diagnostics = DiagnosticContext::begin(TraceKind::Update, sink.clone());
+        let result = UpdateCoordinator::spawn_startup_check(coordinator, None, diagnostics)
             .await
             .unwrap()
             .unwrap();
@@ -950,5 +996,6 @@ mod tests {
             }
         ));
         assert_eq!(store.load().await.unwrap().next_check_epoch_secs, 500);
+        assert_eq!(sink.0.load(Ordering::Relaxed), 2);
     }
 }

@@ -188,22 +188,15 @@ pub trait CompatibilitySource: Send + Sync {
     ///
     /// :return: endpoint 返回 404 时为 `None`，验证成功时为受信清单。
     /// :raises SourceError: 网络、签名、平台、架构或最低桌面版本校验失败时返回。
-    fn latest_compatible<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>;
-
-    /// 使用共享更新上下文获取并验证清单；默认实现保持第三方 source 兼容。
+    /// 使用共享更新上下文获取并验证清单。
     ///
     /// :param diagnostics: 同一次检查共享的类型化上下文。
     /// :return: endpoint 不存在时为 None，验证成功时为受信清单。
     /// :raises SourceError: 网络或验证失败时返回稳定错误。
     fn latest_compatible_with_context<'a>(
         &'a self,
-        _diagnostics: &'a DiagnosticContext,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
-    {
-        self.latest_compatible()
-    }
+        diagnostics: &'a DiagnosticContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>;
 }
 
 /// 固定查询官方 `@deepseek-ai/dsh` 的 npm source。
@@ -297,7 +290,7 @@ impl SignedCompatibilitySource {
 
     async fn fetch_compatible(
         &self,
-        diagnostics: Option<&DiagnosticContext>,
+        diagnostics: &DiagnosticContext,
     ) -> Result<Option<VerifiedManifest>, SourceError> {
         let Some(manifest) = fetch_bytes(
             self.transport.as_ref(),
@@ -323,12 +316,9 @@ impl SignedCompatibilitySource {
         let signature = std::str::from_utf8(&signature)
             .map_err(|_| SourceError::InvalidResponse)?
             .trim();
-        let verified = match diagnostics {
-            Some(context) => self
-                .verifier
-                .verify_with_context(&manifest, signature, context),
-            None => self.verifier.verify(&manifest, signature),
-        };
+        let verified = self
+            .verifier
+            .verify_with_context(&manifest, signature, diagnostics);
         verified
             .map(Some)
             .map_err(|_| SourceError::CompatibilityVerification)
@@ -336,19 +326,12 @@ impl SignedCompatibilitySource {
 }
 
 impl CompatibilitySource for SignedCompatibilitySource {
-    fn latest_compatible<'a>(
-        &'a self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
-    {
-        Box::pin(async move { self.fetch_compatible(None).await })
-    }
-
     fn latest_compatible_with_context<'a>(
         &'a self,
         diagnostics: &'a DiagnosticContext,
     ) -> Pin<Box<dyn Future<Output = Result<Option<VerifiedManifest>, SourceError>> + Send + 'a>>
     {
-        Box::pin(async move { self.fetch_compatible(Some(diagnostics)).await })
+        Box::pin(async move { self.fetch_compatible(diagnostics).await })
     }
 }
 
@@ -537,6 +520,7 @@ mod tests {
         SourceHttpResponse, SourceHttpTransport, SourcePolicy, TransportError,
         decode_canonical_sha512, fetch_bytes, parse_npm_document,
     };
+    use crate::diagnostics::{DiagnosticContext, TraceKind};
 
     struct ScriptedTransport {
         replies: Mutex<VecDeque<Result<SourceHttpResponse, TransportError>>>,
@@ -769,7 +753,7 @@ mod tests {
         )
         .unwrap();
         let verified = source
-            .latest_compatible()
+            .latest_compatible_with_context(&DiagnosticContext::noop(TraceKind::Update))
             .await
             .unwrap()
             .expect("存在兼容清单");
@@ -797,7 +781,13 @@ mod tests {
             verifier.clone(),
         )
         .unwrap();
-        assert!(absent.latest_compatible().await.unwrap().is_none());
+        assert!(
+            absent
+                .latest_compatible_with_context(&DiagnosticContext::noop(TraceKind::Update))
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let invalid = SignedCompatibilitySource::new(
             Url::parse("https://updates.example.invalid/manifest.json").unwrap(),
@@ -817,7 +807,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            invalid.latest_compatible().await,
+            invalid
+                .latest_compatible_with_context(&DiagnosticContext::noop(TraceKind::Update))
+                .await,
             Err(SourceError::CompatibilityVerification)
         );
     }

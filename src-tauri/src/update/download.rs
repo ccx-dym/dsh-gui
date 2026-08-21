@@ -21,7 +21,7 @@ use tokio::{
 use url::Url;
 
 use super::manifest::RuntimeArtifact;
-use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 
 /// 下载器的资源与重试边界。
 #[derive(Clone, Debug)]
@@ -93,7 +93,6 @@ impl DownloadCancellation {
 pub struct DownloadRequest<'a> {
     pub artifact: &'a RuntimeArtifact,
     pub updates_dir: &'a Path,
-    pub trace_id: &'a str,
     pub cancellation: DownloadCancellation,
 }
 
@@ -142,12 +141,14 @@ pub enum DownloadError {
 pub trait ArtifactDownloader: Send + Sync {
     /// 下载并验证一个清单资源。
     ///
-    /// :param request: 已验证清单给出的资源、隔离根目录、trace id 与取消句柄。
+    /// :param request: 已验证清单给出的资源、隔离根目录与取消句柄。
+    /// :param diagnostics: 提供内部生成 trace 的类型化更新上下文。
     /// :return: 成功时返回 `.verified` 文件元数据。
     /// :raises DownloadError: URL、网络、资源上限或完整性校验失败时返回。
     fn download<'a>(
         &'a self,
         request: DownloadRequest<'a>,
+        diagnostics: &'a DiagnosticContext,
     ) -> Pin<Box<dyn Future<Output = Result<DownloadedArtifact, DownloadError>> + Send + 'a>>;
 }
 
@@ -218,12 +219,13 @@ impl HttpsDownloader {
         diagnostics: &DiagnosticContext,
     ) -> Result<DownloadedArtifact, DownloadError> {
         self.validate_url(request.artifact.url.as_str())?;
-        validate_trace_id(request.trace_id)?;
+        let trace_id = diagnostics.trace_str();
+        validate_trace_id(trace_id)?;
         if request.artifact.size > self.policy.max_artifact_bytes {
             return Err(DownloadError::SizeLimitExceeded);
         }
 
-        let trace_dir = request.updates_dir.join(request.trace_id);
+        let trace_dir = request.updates_dir.join(trace_id);
         fs::create_dir_all(&trace_dir)
             .await
             .map_err(|_| DownloadError::FileSystem)?;
@@ -235,7 +237,7 @@ impl HttpsDownloader {
         let canonical_trace = fs::canonicalize(&trace_dir)
             .await
             .map_err(|_| DownloadError::FileSystem)?;
-        validate_canonical_trace_path(&canonical_updates, &canonical_trace, request.trace_id)?;
+        validate_canonical_trace_path(&canonical_updates, &canonical_trace, trace_id)?;
         let part_path = canonical_trace.join("artifact.part");
         let verified_path = canonical_trace.join("artifact.verified");
         if fs::try_exists(&verified_path)
@@ -308,7 +310,11 @@ impl HttpsDownloader {
                     if retry_index >= self.policy.max_retries {
                         return Err(error);
                     }
-                    let delay = retry_after.unwrap_or_else(|| self.backoff(retry_index));
+                    let delay = select_retry_delay(
+                        retry_after,
+                        self.policy.max_retry_after,
+                        self.backoff(retry_index),
+                    );
                     retry_index += 1;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if delay >= remaining {
@@ -481,18 +487,16 @@ impl ArtifactDownloader for HttpsDownloader {
     fn download<'a>(
         &'a self,
         request: DownloadRequest<'a>,
+        diagnostics: &'a DiagnosticContext,
     ) -> Pin<Box<dyn Future<Output = Result<DownloadedArtifact, DownloadError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.download_inner(&request, &DiagnosticContext::noop(TraceKind::Update))
-                .await
-        })
+        Box::pin(async move { self.download_inner(&request, diagnostics).await })
     }
 }
 
 impl HttpsDownloader {
     /// 使用共享更新上下文下载，使所有 attempt/retry 沿用同一 trace。
     ///
-    /// :param request: 受信 artifact、更新根与取消句柄；其旧 trace 会被安全覆盖。
+    /// :param request: 受信 artifact、更新根与取消句柄。
     /// :param diagnostics: 调用链共享的类型化诊断上下文。
     /// :return: 大小和摘要均通过验证的暂存文件。
     /// :raises DownloadError: 网络、取消、资源或完整性边界失败时返回。
@@ -501,13 +505,7 @@ impl HttpsDownloader {
         request: DownloadRequest<'_>,
         diagnostics: &DiagnosticContext,
     ) -> Result<DownloadedArtifact, DownloadError> {
-        let safe_request = DownloadRequest {
-            artifact: request.artifact,
-            updates_dir: request.updates_dir,
-            trace_id: diagnostics.trace_str(),
-            cancellation: request.cancellation,
-        };
-        self.download_inner(&safe_request, diagnostics).await
+        self.download_inner(&request, diagnostics).await
     }
 }
 
@@ -600,6 +598,16 @@ fn parse_retry_after(response: &reqwest::Response, maximum: Duration) -> Option<
     Some(Duration::from_secs(seconds).min(maximum))
 }
 
+fn select_retry_delay(
+    retry_after: Option<Duration>,
+    maximum_retry_after: Duration,
+    fallback_backoff: Duration,
+) -> Duration {
+    retry_after
+        .map(|delay| delay.min(maximum_retry_after))
+        .unwrap_or(fallback_backoff)
+}
+
 fn jitter(maximum: Duration) -> Duration {
     if maximum.is_zero() {
         return Duration::ZERO;
@@ -618,7 +626,7 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -632,8 +640,9 @@ mod tests {
 
     use super::{
         ArtifactDownloader, DownloadCancellation, DownloadError, DownloadPolicy, DownloadRequest,
-        HttpsDownloader,
+        HttpsDownloader, select_retry_delay,
     };
+    use crate::diagnostics::{DiagnosticContext, TraceKind};
     use crate::update::manifest::RuntimeArtifact;
 
     #[derive(Clone)]
@@ -732,16 +741,19 @@ mod tests {
         downloader: &HttpsDownloader,
         artifact: &RuntimeArtifact,
         root: &std::path::Path,
-        trace_id: &str,
+        _trace_id: &str,
         cancellation: DownloadCancellation,
     ) -> Result<super::DownloadedArtifact, DownloadError> {
+        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
         downloader
-            .download(DownloadRequest {
-                artifact,
-                updates_dir: root,
-                trace_id,
-                cancellation,
-            })
+            .download(
+                DownloadRequest {
+                    artifact,
+                    updates_dir: root,
+                    cancellation,
+                },
+                &diagnostics,
+            )
             .await
     }
 
@@ -790,10 +802,12 @@ mod tests {
         .expect("verified download");
 
         assert_eq!(
-            downloaded.verified_path,
-            std::fs::canonicalize(&root)
-                .expect("canonical updates")
-                .join("trace_01/artifact.verified")
+            downloaded.verified_path.parent().and_then(Path::parent),
+            Some(
+                std::fs::canonicalize(&root)
+                    .expect("canonical updates")
+                    .as_path()
+            )
         );
         assert_eq!(
             std::fs::read(downloaded.verified_path).expect("verified bytes"),
@@ -915,15 +929,28 @@ mod tests {
         retry_policy.max_backoff = Duration::from_millis(200);
         retry_policy.max_retry_after = Duration::from_millis(10);
         let downloader = HttpsDownloader::new_for_test(retry_policy).expect("test client");
-        let started = std::time::Instant::now();
-
         assert!(
             run_download(&downloader, &artifact, &root, "trace", Default::default())
                 .await
                 .is_ok()
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn retry_after_is_deterministically_capped_before_backoff_selection() {
+        assert_eq!(
+            select_retry_delay(
+                Some(Duration::from_secs(999)),
+                Duration::from_millis(10),
+                Duration::from_millis(200),
+            ),
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            select_retry_delay(None, Duration::from_millis(10), Duration::from_millis(200)),
+            Duration::from_millis(200),
+        );
     }
 
     #[tokio::test]
@@ -1026,18 +1053,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_trace_id_path_escape() {
+    async fn generated_trace_id_is_a_single_safe_path_segment() {
         let (url, _) = spawn_server(Vec::new());
         let artifact = artifact(url, b"unused", None);
         let root = test_root("trace");
         let downloader = HttpsDownloader::new_for_test(policy()).expect("test client");
-
-        for trace_id in ["../escape", "..", "a/b", "a\\b", "", "."] {
-            let error = run_download(&downloader, &artifact, &root, trace_id, Default::default())
-                .await
-                .expect_err("invalid trace id must fail");
-            assert!(matches!(error, DownloadError::InvalidTraceId));
-        }
+        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
+        let trace_id = diagnostics.trace_str();
+        assert!(super::validate_trace_id(trace_id).is_ok());
+        assert_eq!(Path::new(trace_id).components().count(), 1);
+        let _ = downloader
+            .download(
+                DownloadRequest {
+                    artifact: &artifact,
+                    updates_dir: &root,
+                    cancellation: Default::default(),
+                },
+                &diagnostics,
+            )
+            .await;
     }
 
     #[tokio::test]
@@ -1046,12 +1080,21 @@ mod tests {
         let (url, attempts) = spawn_server(Vec::new());
         let artifact = artifact(url, body, None);
         let root = test_root("existing");
-        let trace_dir = root.join("trace");
+        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
+        let trace_dir = root.join(diagnostics.trace_str());
         std::fs::create_dir_all(&trace_dir).expect("trace dir");
         std::fs::write(trace_dir.join("artifact.verified"), b"old").expect("existing file");
         let downloader = HttpsDownloader::new_for_test(policy()).expect("test client");
 
-        let error = run_download(&downloader, &artifact, &root, "trace", Default::default())
+        let error = downloader
+            .download(
+                DownloadRequest {
+                    artifact: &artifact,
+                    updates_dir: &root,
+                    cancellation: Default::default(),
+                },
+                &diagnostics,
+            )
             .await
             .expect_err("existing verified must fail");
 

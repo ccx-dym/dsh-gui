@@ -255,6 +255,74 @@ async fn preexisting_oversized_truncated_jsonl_is_safely_reclaimed_in_place() {
 }
 
 #[tokio::test]
+async fn under_limit_partial_jsonl_is_truncated_to_its_last_valid_line() {
+    let directory = isolated_directory("partial-recovery");
+    fs::create_dir_all(&directory).expect("应创建日志目录");
+    let slot = directory.join("diagnostics-0.jsonl");
+    let valid = serde_json::to_vec(&event(DiagnosticStage::OfficialCheck, None))
+        .expect("合法事件应可序列化");
+    let mut fixture = valid.clone();
+    fixture.push(b'\n');
+    fixture.extend_from_slice(br#"{"trace_id":"sk-proj-partial""#);
+    fs::write(&slot, fixture).expect("应预置小于上限的半行");
+    let logger = DiagnosticLogger::new(
+        directory,
+        DiagnosticPolicy {
+            max_file_bytes: 1024,
+            slot_count: 2,
+        },
+    )
+    .expect("策略合法");
+
+    logger
+        .write(&event(DiagnosticStage::CompatibilityCheck, None))
+        .await
+        .expect("应保留合法前缀并修复半行");
+
+    let repaired = fs::read(&slot).expect("应读取修复后的槽位");
+    assert!(repaired.starts_with(&[valid.as_slice(), b"\n"].concat()));
+    assert!(!String::from_utf8_lossy(&repaired).contains("sk-proj-partial"));
+    for line in repaired
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        serde_json::from_slice::<serde_json::Value>(line).expect("每行必须是完整 JSON");
+    }
+}
+
+#[tokio::test]
+async fn complete_json_with_a_non_generated_secret_trace_is_not_preserved() {
+    let directory = isolated_directory("secret-trace-recovery");
+    fs::create_dir_all(&directory).expect("应创建日志目录");
+    let slot = directory.join("diagnostics-0.jsonl");
+    let mut forged = serde_json::to_value(event(DiagnosticStage::OfficialCheck, None))
+        .expect("合法事件应可序列化");
+    forged["trace_id"] = serde_json::Value::String("update-sk-proj-AbCdEf123".to_owned());
+    let mut bytes = serde_json::to_vec(&forged).expect("伪造夹具应可序列化");
+    bytes.push(b'\n');
+    fs::write(&slot, bytes).expect("应预置完整但非生成 trace 的 JSONL");
+    let logger = DiagnosticLogger::new(
+        directory,
+        DiagnosticPolicy {
+            max_file_bytes: 1024,
+            slot_count: 2,
+        },
+    )
+    .expect("策略合法");
+
+    logger
+        .write(&event(DiagnosticStage::CompatibilityCheck, None))
+        .await
+        .expect("应拒绝保留非生成 trace");
+
+    let repaired = fs::read_to_string(slot).expect("应读取修复后的槽位");
+    assert!(!repaired.contains("sk-proj-AbCdEf123"));
+    for line in repaired.lines() {
+        serde_json::from_str::<serde_json::Value>(line).expect("每行必须是完整 JSON");
+    }
+}
+
+#[tokio::test]
 async fn no_fail_sink_absorbs_write_failures_and_queue_pressure() {
     let occupied_path = isolated_directory("sink-failure");
     fs::write(&occupied_path, b"not a directory").expect("应创建占位文件");
@@ -344,6 +412,133 @@ async fn existing_hardlinked_slot_is_rejected_without_modifying_its_content() {
         fs::read(&slot).expect("应读取原槽位"),
         b"trusted previous log\n"
     );
+}
+
+#[cfg(windows)]
+struct RestoredWindowsDacl {
+    path: Vec<u16>,
+    original_dacl: *mut windows::Win32::Security::ACL,
+    original_descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+    added_dacl: *mut windows::Win32::Security::ACL,
+}
+
+#[cfg(windows)]
+impl Drop for RestoredWindowsDacl {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+        use windows::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows::core::PWSTR;
+
+        unsafe {
+            let _ = SetNamedSecurityInfoW(
+                PWSTR(self.path.as_mut_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(self.original_dacl),
+                None,
+            );
+            let _ = LocalFree(Some(HLOCAL(self.added_dacl.cast())));
+            let _ = LocalFree(Some(HLOCAL(self.original_descriptor.0)));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn grant_everyone_write(path: &std::path::Path) -> RestoredWindowsDacl {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR,
+        PSID, WinWorldSid,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let mut wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut original_dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut original_dacl),
+            None,
+            &mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "应能读取测试槽位 DACL");
+    assert!(!original_dacl.is_null(), "测试槽位不得使用 null DACL");
+
+    let mut sid_size = 0_u32;
+    let _ = unsafe { CreateWellKnownSid(WinWorldSid, None, None, &mut sid_size) };
+    assert!(sid_size > 0, "应能查询 Everyone SID 大小");
+    let mut sid = vec![0_u8; sid_size as usize];
+    let everyone = PSID(sid.as_mut_ptr().cast());
+    unsafe { CreateWellKnownSid(WinWorldSid, None, Some(everyone), &mut sid_size) }
+        .expect("应能创建 Everyone SID");
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_WRITE.0,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: Default::default(),
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstrName: PWSTR(everyone.0.cast()),
+        },
+    };
+    let mut added_dacl: *mut ACL = std::ptr::null_mut();
+    let status = unsafe { SetEntriesInAclW(Some(&[entry]), Some(original_dacl), &mut added_dacl) };
+    assert_eq!(status, ERROR_SUCCESS, "应能构造宽泛测试 DACL");
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            PWSTR(wide.as_mut_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(added_dacl),
+            None,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS, "应能设置宽泛测试 DACL");
+    RestoredWindowsDacl {
+        path: wide,
+        original_dacl,
+        original_descriptor: descriptor,
+        added_dacl,
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn everyone_write_ace_is_rejected_and_original_dacl_is_restored() {
+    let directory = isolated_directory("broad-dacl");
+    fs::create_dir_all(&directory).expect("应创建日志目录");
+    let slot = directory.join("diagnostics-0.jsonl");
+    fs::write(&slot, b"").expect("应创建固定槽位");
+    let _restore = grant_everyone_write(&slot);
+    let logger = DiagnosticLogger::new(directory, DiagnosticPolicy::default()).expect("策略合法");
+
+    let result = logger
+        .write(&event(DiagnosticStage::RuntimeStart, None))
+        .await;
+
+    assert!(result.is_err(), "Everyone 写 ACE 必须被生产检查拒绝");
 }
 
 #[cfg(windows)]

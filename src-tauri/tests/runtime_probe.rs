@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use dsh_desktop_lib::app_controller::ProbeLease;
+use dsh_desktop_lib::diagnostics::{DiagnosticContext, TraceKind};
 use dsh_desktop_lib::paths::{AppPaths, RuntimeLayout};
 use dsh_desktop_lib::runtime::command::RuntimeLaunchSpec;
 use dsh_desktop_lib::runtime::health::ReadyProbe;
@@ -28,6 +29,10 @@ enum ProcessMode {
     NoStdout,
     ExitEarly,
     StopFails,
+}
+
+fn diagnostics() -> DiagnosticContext {
+    DiagnosticContext::noop(TraceKind::Update)
 }
 
 struct FakeProcess {
@@ -326,8 +331,8 @@ async fn empty_candidate_requires_both_readiness_gates_and_is_reclaimed() {
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_success".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("probe execution");
@@ -391,11 +396,7 @@ async fn project_workspace_is_canonicalized_before_launch() {
     let (probe, _, specs) = probe(ProcessMode::Ready, true);
 
     let report = probe
-        .probe(
-            workspace,
-            "trace_canonical_workspace".to_owned(),
-            ProbeCancellation::new(),
-        )
+        .probe(workspace, ProbeCancellation::new(), &diagnostics())
         .await
         .expect("probe");
 
@@ -432,8 +433,8 @@ async fn runtime_dependency_modified_during_probe_cannot_pass_inventory_recheck(
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_runtime_mutated".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("report");
@@ -477,8 +478,8 @@ async fn runtime_extra_file_created_during_probe_cannot_pass_inventory_recheck()
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_runtime_extra".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("report");
@@ -499,8 +500,8 @@ async fn stdout_without_http_is_invalid_webui_and_reclaims_process_tree() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_http".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("probe execution");
@@ -518,8 +519,8 @@ async fn missing_stdout_times_out_even_when_http_is_ready() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_stdout".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("probe execution");
@@ -536,8 +537,8 @@ async fn early_nonzero_exit_is_typed_and_reclaimed() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_exit".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("probe execution");
@@ -558,7 +559,7 @@ async fn cancellation_interrupts_wait_and_reclaims_process_tree() {
     });
 
     let report = probe
-        .probe(fixture.workspace(), "trace_cancel".to_owned(), cancellation)
+        .probe(fixture.workspace(), cancellation, &diagnostics())
         .await
         .expect("probe execution");
 
@@ -574,8 +575,8 @@ async fn cleanup_failure_overrides_readiness_success_without_leaking_detail() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_cleanup".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("cleanup failure is reported");
@@ -616,8 +617,8 @@ async fn insufficient_space_is_a_failed_report_before_any_process_starts() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_space".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("preflight is reported");
@@ -667,11 +668,7 @@ async fn cancellation_during_preflight_is_reported_without_launching() {
     });
 
     let report = probe
-        .probe(
-            fixture.fresh_workspace(),
-            "trace_cancel_preflight".to_owned(),
-            cancellation,
-        )
+        .probe(fixture.fresh_workspace(), cancellation, &diagnostics())
         .await
         .expect("cancel report");
 
@@ -705,8 +702,8 @@ async fn total_deadline_includes_slow_preflight() {
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_deadline_preflight".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("deadline report");
@@ -731,8 +728,8 @@ async fn hardlinked_candidate_file_is_rejected_without_following_it() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_link".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("unsafe candidate is reported");
@@ -773,8 +770,8 @@ async fn empty_directory_fanout_counts_toward_candidate_entry_limit() {
     let report = probe
         .probe(
             fixture.workspace(),
-            "trace_entries".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("entry limit is reported");
@@ -809,8 +806,8 @@ async fn candidate_marker_from_a_different_trace_is_not_reused() {
     let error = probe
         .probe(
             fixture.workspace(),
-            "trace_state".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect_err("a candidate marker cannot be rebound to a different trace");
@@ -861,8 +858,8 @@ async fn unsafe_candidate_acl_is_rejected_before_process_launch() {
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_acl".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("acl failure report");
@@ -875,16 +872,16 @@ async fn unsafe_candidate_acl_is_rejected_before_process_launch() {
 async fn passed_state_reader_rejects_runtime_or_trace_substitution() {
     let fixture = Fixture::new("passed-reader");
     let (probe, _, _) = probe(ProcessMode::Ready, true);
-    let trace = "trace_passed_reader";
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            trace.to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("probe");
     assert_eq!(report.phase, ProbePhase::Passed);
+    let trace = report.trace_id.as_str();
     assert!(
         read_passed_generation_state(&fixture.layout, &fixture.candidate, &fixture.runtime, trace,)
             .is_ok()
@@ -978,8 +975,8 @@ async fn panicking_health_worker_still_drops_managed_process() {
     let report = probe
         .probe(
             fixture.fresh_workspace(),
-            "trace_panic".to_owned(),
             ProbeCancellation::new(),
+            &diagnostics(),
         )
         .await
         .expect("panic is stable report");

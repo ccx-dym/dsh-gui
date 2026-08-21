@@ -1,4 +1,4 @@
-use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage, TraceKind};
+use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
 use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::Deserialize;
@@ -94,18 +94,16 @@ impl ManifestVerifier {
     ///
     /// :param manifest_bytes: 网络响应中的原始清单字节。
     /// :param signature_hex: 对原始字节签名的 64-byte 小写 hex。
+    /// :param diagnostics: 同一次更新操作共享的类型化上下文。
     /// :return: 类型化清单及同一原始字节的 SHA-256 摘要。
     /// :raises ManifestError: 签名、JSON 结构或任一安全字段不符合约束时返回。
     pub fn verify(
         &self,
         manifest_bytes: &[u8],
         signature_hex: &str,
+        diagnostics: &DiagnosticContext,
     ) -> Result<VerifiedManifest, ManifestError> {
-        self.verify_with_context(
-            manifest_bytes,
-            signature_hex,
-            &DiagnosticContext::noop(TraceKind::Update),
-        )
+        self.verify_with_context(manifest_bytes, signature_hex, diagnostics)
     }
 
     /// 使用调用方操作上下文验证清单，使同一 trace 可贯穿后续下载与激活。
@@ -114,7 +112,7 @@ impl ManifestVerifier {
     /// :param signature_hex: detached signature，不进入诊断事件。
     /// :param diagnostics: 调用链共享的类型化诊断上下文。
     /// :return: 签名与字段均通过验证的清单。
-    /// :raises ManifestError: 与 `verify` 相同的稳定验证错误。
+    /// :raises ManifestError: 签名、JSON 结构或字段验证失败时返回稳定错误。
     pub fn verify_with_context(
         &self,
         manifest_bytes: &[u8],

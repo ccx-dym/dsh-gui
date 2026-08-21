@@ -98,38 +98,9 @@ pub trait ActivationProbe: Send + Sync {
         runtime: &'a InstalledRuntime,
         candidate: &'a DataGeneration,
         project_workspace: &'a Path,
-        trace_id: &'a str,
-        lease: ProbeLease,
-    ) -> BoxFuture<'a, Result<(), ActivationError>>;
-
-    /// 使用共享诊断上下文执行 probe；第三方实现默认保持原行为。
-    ///
-    /// :param layout: 固定 runtime/data 布局。
-    /// :param runtime: 目标运行时描述。
-    /// :param candidate: 隔离数据 generation。
-    /// :param project_workspace: 已验证项目目录。
-    /// :param lease: 激活事务持有的 probe lease。
-    /// :param diagnostics: 同一次激活共享的诊断上下文。
-    /// :return: probe 通过时返回空结果。
-    /// :raises ActivationError: workspace 或探活失败时返回。
-    fn probe_with_context<'a>(
-        &'a self,
-        layout: &'a RuntimeLayout,
-        runtime: &'a InstalledRuntime,
-        candidate: &'a DataGeneration,
-        project_workspace: &'a Path,
         lease: ProbeLease,
         diagnostics: &'a DiagnosticContext,
-    ) -> BoxFuture<'a, Result<(), ActivationError>> {
-        self.probe(
-            layout,
-            runtime,
-            candidate,
-            project_workspace,
-            diagnostics.trace_str(),
-            lease,
-        )
-    }
+    ) -> BoxFuture<'a, Result<(), ActivationError>>;
 }
 
 /// 将 Task 8 的真实异步 probe 接入激活事务。
@@ -155,8 +126,8 @@ impl ActivationProbe for RuntimeProbeAdapter {
         runtime: &'a InstalledRuntime,
         candidate: &'a DataGeneration,
         project_workspace: &'a Path,
-        trace_id: &'a str,
         lease: ProbeLease,
+        diagnostics: &'a DiagnosticContext,
     ) -> BoxFuture<'a, Result<(), ActivationError>> {
         async move {
             let node_version = runtime.node_version.clone();
@@ -170,7 +141,7 @@ impl ActivationProbe for RuntimeProbeAdapter {
             )?;
             let report = self
                 .probe
-                .probe(workspace, trace_id.to_owned(), ProbeCancellation::new())
+                .probe(workspace, ProbeCancellation::new(), diagnostics)
                 .await?;
             if report.phase != ProbePhase::Passed {
                 return Err(ActivationError::ProbeRejected);
@@ -178,62 +149,6 @@ impl ActivationProbe for RuntimeProbeAdapter {
             Ok(())
         }
         .boxed()
-    }
-
-    fn probe_with_context<'a>(
-        &'a self,
-        layout: &'a RuntimeLayout,
-        runtime: &'a InstalledRuntime,
-        candidate: &'a DataGeneration,
-        project_workspace: &'a Path,
-        lease: ProbeLease,
-        diagnostics: &'a DiagnosticContext,
-    ) -> BoxFuture<'a, Result<(), ActivationError>> {
-        async move {
-            let workspace = ProbeWorkspace::new(
-                layout.clone(),
-                runtime.clone(),
-                runtime.node_version.clone(),
-                candidate.clone(),
-                project_workspace.to_path_buf(),
-                &lease,
-            )?;
-            let report = self
-                .probe
-                .probe_with_context(workspace, ProbeCancellation::new(), diagnostics)
-                .await?;
-            if report.phase != ProbePhase::Passed {
-                return Err(ActivationError::ProbeRejected);
-            }
-            Ok(())
-        }
-        .boxed()
-    }
-}
-
-struct ContextualActivationProbe<'a> {
-    inner: &'a dyn ActivationProbe,
-    diagnostics: &'a DiagnosticContext,
-}
-
-impl ActivationProbe for ContextualActivationProbe<'_> {
-    fn probe<'a>(
-        &'a self,
-        layout: &'a RuntimeLayout,
-        runtime: &'a InstalledRuntime,
-        candidate: &'a DataGeneration,
-        project_workspace: &'a Path,
-        _trace_id: &'a str,
-        lease: ProbeLease,
-    ) -> BoxFuture<'a, Result<(), ActivationError>> {
-        self.inner.probe_with_context(
-            layout,
-            runtime,
-            candidate,
-            project_workspace,
-            lease,
-            self.diagnostics,
-        )
     }
 }
 
@@ -243,7 +158,6 @@ pub struct ActivationRequest {
     pub runtime: InstalledRuntime,
     pub candidate: DataGeneration,
     pub activated_at: String,
-    pub trace_id: String,
 }
 
 /// 激活或单次恢复的稳定终态。
@@ -446,6 +360,27 @@ impl SnapshotAclInspector for SystemSnapshotAclInspector {
 }
 
 impl RuntimeActivator {
+    #[cfg(test)]
+    async fn activate(
+        &self,
+        session: ActivationSession,
+        request: ActivationRequest,
+        probe: &dyn ActivationProbe,
+        checkpoints: &dyn ActivationCheckpointSink,
+    ) -> Result<ActivationOutcome, ActivationError> {
+        let diagnostics = DiagnosticContext::noop(crate::diagnostics::TraceKind::Update);
+        self.activate_inner(session, request, probe, checkpoints, &diagnostics)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn recover(
+        &self,
+        session: ActivationSession,
+    ) -> Result<ActivationOutcome, ActivationError> {
+        self.recover_inner(session).await
+    }
+
     /// 创建绑定固定 runtime/data/settings 根的激活器。
     ///
     /// :param layout: 预定义运行时、generation 与漫游设置布局。
@@ -513,12 +448,13 @@ impl RuntimeActivator {
     /// :param checkpoints: journal 崩溃点观察器。
     /// :return: 新版已就绪、旧版已回滚或 fresh 保持未激活的终态。
     /// :raises ActivationError: 快照、probe、pointer、首启或回滚失败时返回。
-    pub async fn activate(
+    async fn activate_inner(
         &self,
         session: ActivationSession,
         request: ActivationRequest,
         probe: &dyn ActivationProbe,
         checkpoints: &dyn ActivationCheckpointSink,
+        diagnostics: &DiagnosticContext,
     ) -> Result<ActivationOutcome, ActivationError> {
         session.claim_transaction()?;
         let prior = match self.store.load() {
@@ -547,15 +483,15 @@ impl RuntimeActivator {
                 &request.runtime,
                 &request.candidate,
                 &workspace,
-                &request.trace_id,
                 session.probe_lease(),
+                diagnostics,
             )
             .await?;
         let passed = read_passed_generation_state(
             &self.layout,
             &request.candidate,
             &request.runtime,
-            &request.trace_id,
+            diagnostics.trace_str(),
         )?;
         if passed.runtime() != &request.runtime || passed.candidate() != &request.candidate {
             return Err(ActivationError::InvalidJournal);
@@ -568,7 +504,7 @@ impl RuntimeActivator {
         );
         let mut journal = ActivationJournal {
             schema: ACTIVATION_SCHEMA,
-            activation_id: request.trace_id,
+            activation_id: diagnostics.trace_str().to_owned(),
             prior: prior
                 .as_ref()
                 .map(JournalDeployment::from_active)
@@ -619,21 +555,16 @@ impl RuntimeActivator {
     pub async fn activate_with_context(
         &self,
         session: ActivationSession,
-        mut request: ActivationRequest,
+        request: ActivationRequest,
         probe: &dyn ActivationProbe,
         checkpoints: &dyn ActivationCheckpointSink,
         diagnostics: &DiagnosticContext,
     ) -> Result<ActivationOutcome, ActivationError> {
-        request.trace_id = diagnostics.trace_str().to_owned();
         let started = std::time::Instant::now();
         diagnostics.record(DiagnosticStage::ActivationPrepare, 0, 0, None, None);
         diagnostics.record(DiagnosticStage::SnapshotPrepare, 0, 0, None, None);
-        let contextual_probe = ContextualActivationProbe {
-            inner: probe,
-            diagnostics,
-        };
         let result = self
-            .activate(session, request, &contextual_probe, checkpoints)
+            .activate_inner(session, request, probe, checkpoints, diagnostics)
             .await;
         let stage = match &result {
             Ok(ActivationOutcome::Activated) => DiagnosticStage::ActivationCommit,
@@ -660,7 +591,7 @@ impl RuntimeActivator {
     /// :param session: 启动阶段取得的独占激活会话。
     /// :return: 恢复 target/prior、fresh 未激活或无待恢复事务的终态。
     /// :raises ActivationError: journal/pointer 不一致或恢复启动失败时返回。
-    pub async fn recover(
+    async fn recover_inner(
         &self,
         session: ActivationSession,
     ) -> Result<ActivationOutcome, ActivationError> {
@@ -771,7 +702,7 @@ impl RuntimeActivator {
     ) -> Result<ActivationOutcome, ActivationError> {
         let started = std::time::Instant::now();
         diagnostics.record(DiagnosticStage::ActivationRecovery, 0, 0, None, None);
-        let result = self.recover(session).await;
+        let result = self.recover_inner(session).await;
         diagnostics.record(
             DiagnosticStage::ActivationRecovery,
             started.elapsed().as_millis() as u64,
@@ -1250,6 +1181,7 @@ mod tests {
         ActivationRequest, RuntimeActivator, SnapshotPathRegistry, SnapshotPolicy,
     };
     use crate::app_controller::{AppController, ProbeLease, RuntimeLifecycle};
+    use crate::diagnostics::DiagnosticContext;
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::RuntimeError;
     use crate::runtime::install_state::{
@@ -1319,7 +1251,6 @@ mod tests {
                 runtime: self.new_runtime.clone(),
                 candidate: self.candidate.clone(),
                 activated_at: "2026-08-22T01:00:00Z".to_owned(),
-                trace_id: "activation-test-001".to_owned(),
             }
         }
     }
@@ -1366,8 +1297,8 @@ mod tests {
             runtime: &'a InstalledRuntime,
             candidate: &'a DataGeneration,
             _project_workspace: &'a Path,
-            trace_id: &'a str,
             _lease: ProbeLease,
+            diagnostics: &'a DiagnosticContext,
         ) -> BoxFuture<'a, Result<(), super::ActivationError>> {
             async move {
                 let state = layout.generation_root().join(".state").join(&candidate.id);
@@ -1378,7 +1309,7 @@ mod tests {
                     "runtime_version": runtime.version.to_string(),
                     "manifest_digest": runtime.manifest_digest,
                     "state": "passed",
-                    "trace_id": trace_id,
+                    "trace_id": diagnostics.trace_str(),
                 });
                 fs::write(
                     state.join("passed.json"),

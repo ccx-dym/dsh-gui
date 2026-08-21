@@ -1,4 +1,7 @@
-use dsh_desktop_lib::update::manifest::{ManifestError, ManifestVerifier};
+use dsh_desktop_lib::{
+    diagnostics::{DiagnosticContext, TraceKind},
+    update::manifest::{ManifestError, ManifestVerifier},
+};
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
 
@@ -17,6 +20,10 @@ fn canonical_hex(bytes: &[u8]) -> String {
 
 fn verifier() -> ManifestVerifier {
     verifier_for("0.1.0")
+}
+
+fn diagnostics() -> DiagnosticContext {
+    DiagnosticContext::noop(TraceKind::Update)
 }
 
 fn verifier_for(current_desktop_version: &str) -> ManifestVerifier {
@@ -39,7 +46,7 @@ fn sign(bytes: &[u8]) -> String {
 fn signed_json(
     json: String,
 ) -> Result<dsh_desktop_lib::update::manifest::VerifiedManifest, ManifestError> {
-    verifier().verify(json.as_bytes(), &sign(json.as_bytes()))
+    verifier().verify(json.as_bytes(), &sign(json.as_bytes()), &diagnostics())
 }
 
 fn valid_json() -> String {
@@ -53,7 +60,7 @@ fn replace_once(from: &str, to: &str) -> String {
 #[test]
 fn valid_signed_manifest_returns_typed_fields_and_raw_digest() {
     let verified = verifier()
-        .verify(VALID_MANIFEST, &sign(VALID_MANIFEST))
+        .verify(VALID_MANIFEST, &sign(VALID_MANIFEST), &diagnostics())
         .expect("规范且签名正确的清单应通过");
 
     assert_eq!(verified.manifest.schema, 1);
@@ -100,7 +107,7 @@ fn signature_is_checked_against_exact_raw_bytes_before_parsing() {
     tampered[index] = b'W';
 
     assert!(matches!(
-        verifier().verify(&tampered, &signature),
+        verifier().verify(&tampered, &signature, &diagnostics()),
         Err(ManifestError::SignatureVerification)
     ));
 }
@@ -117,7 +124,11 @@ fn strict_verification_rejects_weak_key_and_small_order_signature_points() {
     weak_signature[0] = 1;
 
     assert!(matches!(
-        weak_verifier.verify(VALID_MANIFEST, &canonical_hex(&weak_signature)),
+        weak_verifier.verify(
+            VALID_MANIFEST,
+            &canonical_hex(&weak_signature),
+            &diagnostics()
+        ),
         Err(ManifestError::SignatureVerification)
     ));
 }
@@ -131,7 +142,7 @@ fn wrong_key_and_malformed_key_or_signature_are_rejected_without_echoing_secrets
     )
     .unwrap();
     assert!(matches!(
-        wrong_verifier.verify(VALID_MANIFEST, &sign(VALID_MANIFEST)),
+        wrong_verifier.verify(VALID_MANIFEST, &sign(VALID_MANIFEST), &diagnostics()),
         Err(ManifestError::SignatureVerification)
     ));
 
@@ -143,7 +154,7 @@ fn wrong_key_and_malformed_key_or_signature_are_rejected_without_echoing_secrets
     }
     for invalid_signature in ["00".repeat(63), "AA".repeat(64), "gg".repeat(64)] {
         let error = verifier()
-            .verify(VALID_MANIFEST, &invalid_signature)
+            .verify(VALID_MANIFEST, &invalid_signature, &diagnostics())
             .expect_err("非规范签名必须失败");
         assert!(matches!(error, ManifestError::InvalidSignatureEncoding));
         assert!(!error.to_string().contains(&invalid_signature));
@@ -154,7 +165,7 @@ fn wrong_key_and_malformed_key_or_signature_are_rejected_without_echoing_secrets
 fn parsing_happens_only_after_signature_and_denies_unknown_fields() {
     let unsigned_invalid = br#"{"schema":1,"secret":"DO_NOT_ECHO"}"#;
     let error = verifier()
-        .verify(unsigned_invalid, &"00".repeat(64))
+        .verify(unsigned_invalid, &"00".repeat(64), &diagnostics())
         .expect_err("签名错误必须先于 JSON 错误");
     assert!(matches!(error, ManifestError::SignatureVerification));
 
@@ -229,7 +240,7 @@ fn minimum_desktop_version_rejects_older_stable_and_prerelease_clients() {
     );
     let bytes = stable_minimum.as_bytes();
     assert!(matches!(
-        verifier_for("0.2.0-rc.1").verify(bytes, &sign(bytes)),
+        verifier_for("0.2.0-rc.1").verify(bytes, &sign(bytes), &diagnostics()),
         Err(ManifestError::DesktopVersionTooOld { required, current })
             if required == Version::parse("0.2.0").unwrap()
                 && current == Version::parse("0.2.0-rc.1").unwrap()
