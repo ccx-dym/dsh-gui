@@ -28,6 +28,13 @@ impl InstalledRuntime {
                 version: version.to_owned(),
                 source,
             })?;
+        let digest_is_canonical = manifest_digest.len() == 64
+            && manifest_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if !digest_is_canonical {
+            return Err(InstallStateError::InvalidManifestDigest);
+        }
         Ok(Self {
             version: parsed,
             manifest_digest,
@@ -97,6 +104,8 @@ pub enum InstallStateError {
         version: String,
         source: semver::Error,
     },
+    #[error("兼容清单摘要不是规范的小写 SHA-256 hex")]
+    InvalidManifestDigest,
     #[error("无效的数据 generation 标识: {id}")]
     InvalidGeneration { id: String },
     #[error("deployment.json 不是完整有效的 JSON: {source}")]
@@ -105,6 +114,10 @@ pub enum InstallStateError {
     UnknownSchema { schema: u32 },
     #[error("deployment 字段 {field} 逃逸固定根目录")]
     PathEscape { field: &'static str },
+    #[error("待激活的 {target} 目录不存在")]
+    DeploymentTargetMissing { target: &'static str },
+    #[error("待激活的 {target} 路径不是目录")]
+    DeploymentTargetNotDirectory { target: &'static str },
     #[error("安装状态 I/O 失败（{operation} {path}）: {source}")]
     Io {
         operation: &'static str,
@@ -191,19 +204,19 @@ impl InstallStateStore {
 
     /// 将 runtime 与 data 配对写入同一个原子激活指针。
     ///
-    /// 先准备两个完整目录，再在 deployment 文件同目录写入并 flush 临时文件；最后一次
-    /// rename 才让新配对对读取方可见，因此不会观察到 runtime/data 各自更新的中间态。
+    /// 先验证安装器已经准备好两个完整目录，再在 deployment 文件同目录写入并 flush
+    /// 临时文件；最后一次 rename 才让新配对对读取方可见，因此不会观察到 runtime/data
+    /// 各自更新的中间态。此处绝不创建内容目录，避免把缺失安装误激活为空目录。
     ///
     /// :param deployment: 要一次激活的运行时与 generation 配对。
     /// :return: 目录准备与指针提交完成时返回 `Ok(())`。
-    /// :raises InstallStateError: 创建目录、序列化、写入、flush 或 rename 失败时返回。
+    /// :raises InstallStateError: 目标目录缺失/不是目录，或创建设置目录、序列化、写入、
+    ///   flush、rename 失败时返回。
     pub fn save(&self, deployment: &ActiveDeployment) -> Result<(), InstallStateError> {
         let runtime_dir = self.layout.runtime_dir(&deployment.runtime);
         let generation_dir = self.layout.generation_dir(&deployment.data);
-        for directory in [&runtime_dir, &generation_dir] {
-            fs::create_dir_all(directory)
-                .map_err(|source| io_error("create_dir_all", directory, source))?;
-        }
+        validate_deployment_directory("runtime", &runtime_dir)?;
+        validate_deployment_directory("generation", &generation_dir)?;
 
         let destination = self.layout.deployment_file();
         let parent = destination.parent().ok_or(InstallStateError::PathEscape {
@@ -241,6 +254,23 @@ impl InstallStateStore {
             .map_err(|source| io_error("rename", destination, source))?;
         Ok(())
     }
+}
+
+fn validate_deployment_directory(
+    target: &'static str,
+    path: &Path,
+) -> Result<(), InstallStateError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InstallStateError::DeploymentTargetMissing { target });
+        }
+        Err(source) => return Err(io_error("metadata", path, source)),
+    };
+    if !metadata.is_dir() {
+        return Err(InstallStateError::DeploymentTargetNotDirectory { target });
+    }
+    Ok(())
 }
 
 fn validate_relative_dir(
@@ -294,6 +324,13 @@ mod tests {
         )
     }
 
+    fn prepare_deployment_dirs(layout: &RuntimeLayout, deployment: &ActiveDeployment) {
+        fs::create_dir_all(layout.runtime_dir(&deployment.runtime))
+            .expect("应能创建 runtime 测试目录");
+        fs::create_dir_all(layout.generation_dir(&deployment.data))
+            .expect("应能创建 generation 测试目录");
+    }
+
     #[test]
     fn installed_runtime_rejects_non_strict_semver() {
         for invalid in ["1", "1.2", "v1.2.3", "1.2.3/escape", " 1.2.3"] {
@@ -301,6 +338,21 @@ mod tests {
                 InstalledRuntime::new(invalid, "a".repeat(64)),
                 Err(InstallStateError::InvalidVersion { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn installed_runtime_rejects_non_canonical_manifest_digest_without_echoing_it() {
+        for invalid in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+            "A".repeat(64),
+        ] {
+            let error = InstalledRuntime::new("1.2.3", invalid.clone())
+                .expect_err("非规范 SHA-256 摘要必须被拒绝");
+            assert!(matches!(error, InstallStateError::InvalidManifestDigest));
+            assert!(!error.to_string().contains(&invalid));
         }
     }
 
@@ -374,6 +426,8 @@ mod tests {
         let store = InstallStateStore::new(layout.clone());
         let first = deployment("1.2.3", "generation-001");
         let second = deployment("1.2.4", "generation-002");
+        prepare_deployment_dirs(&layout, &first);
+        prepare_deployment_dirs(&layout, &second);
 
         store.save(&first).expect("首次写入应成功");
         store.save(&second).expect("目标已存在时也应原子替换");
@@ -387,13 +441,64 @@ mod tests {
     }
 
     #[test]
+    fn save_rejects_missing_runtime_or_generation_without_creating_pointer() {
+        for (missing, create_runtime, create_generation) in
+            [("runtime", false, true), ("generation", true, false)]
+        {
+            let paths = test_paths(missing);
+            let layout = RuntimeLayout::from_paths(&paths);
+            let store = InstallStateStore::new(layout.clone());
+            let active = deployment("1.2.3", "generation-001");
+            if create_runtime {
+                fs::create_dir_all(layout.runtime_dir(&active.runtime))
+                    .expect("应能创建 runtime 测试目录");
+            }
+            if create_generation {
+                fs::create_dir_all(layout.generation_dir(&active.data))
+                    .expect("应能创建 generation 测试目录");
+            }
+
+            assert!(matches!(
+                store.save(&active),
+                Err(InstallStateError::DeploymentTargetMissing { target }) if target == missing
+            ));
+            assert!(!paths.settings.join("deployment.json").exists());
+        }
+    }
+
+    #[test]
+    fn save_rejects_file_target_and_preserves_existing_deployment() {
+        let paths = test_paths("target-file");
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        let first = deployment("1.2.3", "generation-001");
+        prepare_deployment_dirs(&layout, &first);
+        store.save(&first).expect("初始 deployment 应写入成功");
+
+        let second = deployment("1.2.4", "generation-002");
+        let runtime_file = layout.runtime_dir(&second.runtime);
+        fs::create_dir_all(runtime_file.parent().expect("runtime 应有父目录"))
+            .expect("应能创建 runtime 根目录");
+        fs::write(&runtime_file, b"not-a-directory").expect("应能创建同名文件夹具");
+        fs::create_dir_all(layout.generation_dir(&second.data))
+            .expect("应能创建 generation 测试目录");
+
+        assert!(matches!(
+            store.save(&second),
+            Err(InstallStateError::DeploymentTargetNotDirectory { target: "runtime" })
+        ));
+        assert_eq!(store.load().expect("旧 deployment 不得被修改"), first);
+    }
+
+    #[test]
     fn deployment_json_does_not_store_absolute_download_url() {
         let paths = test_paths("serialized-fields");
-        let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        let active = deployment("1.2.3", "generation-001");
+        prepare_deployment_dirs(&layout, &active);
 
-        store
-            .save(&deployment("1.2.3", "generation-001"))
-            .expect("写入应成功");
+        store.save(&active).expect("写入应成功");
         let json = fs::read_to_string(paths.settings.join("deployment.json"))
             .expect("应能读取 deployment JSON");
 
