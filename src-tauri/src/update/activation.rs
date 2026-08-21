@@ -953,12 +953,58 @@ impl RuntimeActivator {
     }
 
     fn load_pending_journal(&self) -> Result<Option<ActivationJournal>, ActivationError> {
+        let mut pending = self
+            .load_journal_history()?
+            .into_iter()
+            .filter(|journal| {
+                matches!(
+                    journal.state,
+                    JournalState::Prepared
+                        | JournalState::Committed
+                        | JournalState::RollingBack
+                        | JournalState::RecoveryRequired
+                )
+            })
+            .collect::<Vec<_>>();
+        if pending.len() > 1 {
+            return Err(ActivationError::RecoveryRequired {
+                failure: ActivationFailure::interrupted_resume(),
+                recovery_code: "multiple_pending_journals".to_owned(),
+            });
+        }
+        Ok(pending.pop())
+    }
+
+    /// 严格解析全部 journal，并确认只剩允许共存的历史终态记录。
+    ///
+    /// :return: 所有 JSON journal 均为 Active/RolledBack/FreshInstallFailed 时返回。
+    /// :raises ActivationError: 文档截断、schema 未知或存在未完成事务时返回。
+    #[cfg(any(not(debug_assertions), test))]
+    pub(crate) fn ensure_terminal_journal_history(&self) -> Result<(), ActivationError> {
+        if self.load_journal_history()?.iter().any(|journal| {
+            matches!(
+                journal.state,
+                JournalState::Prepared
+                    | JournalState::Committed
+                    | JournalState::RollingBack
+                    | JournalState::RecoveryRequired
+            )
+        }) {
+            return Err(ActivationError::RecoveryRequired {
+                failure: ActivationFailure::interrupted_resume(),
+                recovery_code: "unresolved_activation_journal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn load_journal_history(&self) -> Result<Vec<ActivationJournal>, ActivationError> {
         let entries = match fs::read_dir(&self.journal_root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(ActivationError::io(error)),
         };
-        let mut pending = Vec::new();
+        let mut journals = Vec::new();
         for entry in entries {
             let entry = entry.map_err(ActivationError::io)?;
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
@@ -970,23 +1016,9 @@ impl RuntimeActivator {
             if !matches!(journal.schema, LEGACY_ACTIVATION_SCHEMA | ACTIVATION_SCHEMA) {
                 return Err(ActivationError::InvalidJournal);
             }
-            if matches!(
-                journal.state,
-                JournalState::Prepared
-                    | JournalState::Committed
-                    | JournalState::RollingBack
-                    | JournalState::RecoveryRequired
-            ) {
-                pending.push(journal);
-            }
+            journals.push(journal);
         }
-        if pending.len() > 1 {
-            return Err(ActivationError::RecoveryRequired {
-                failure: ActivationFailure::interrupted_resume(),
-                recovery_code: "multiple_pending_journals".to_owned(),
-            });
-        }
-        Ok(pending.pop())
+        Ok(journals)
     }
 }
 

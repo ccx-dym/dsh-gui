@@ -43,11 +43,12 @@ use crate::{
     },
 };
 
+#[cfg(any(not(debug_assertions), test))]
+use crate::update::activation::{RuntimeActivator, SnapshotPolicy};
 #[cfg(not(debug_assertions))]
 use crate::update::{
     activation::{
-        ActivationCheckpointSink, ActivationOutcome, ActivationRequest, RuntimeActivator,
-        RuntimeProbeAdapter, SnapshotPolicy,
+        ActivationCheckpointSink, ActivationOutcome, ActivationRequest, RuntimeProbeAdapter,
     },
     probe::{ProbePolicy, RuntimeProbe},
 };
@@ -860,22 +861,11 @@ fn inspect_orphan_candidate_with(
         return Err("activation_recovery_required");
     }
 
-    // 任意 journal 都必须交还 Task9 恢复矩阵；这里仅识别 journal 尚未落盘的窄窗口。
-    let journal_root = paths.settings.join("activation-journal");
-    match std::fs::read_dir(&journal_root) {
-        Ok(mut entries) => {
-            if entries
-                .next()
-                .transpose()
-                .map_err(|_| "activation_recovery_required")?
-                .is_some()
-            {
-                return Err("activation_recovery_required");
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err("activation_recovery_required"),
-    }
+    // 复用 Task9 唯一严格 parser：历史终态可共存，任何未决或损坏 journal 失败关闭。
+    RuntimeActivator::new(RuntimeLayout::from_paths(paths), SnapshotPolicy::default())
+        .map_err(|_| "activation_recovery_required")?
+        .ensure_terminal_journal_history()
+        .map_err(|_| "activation_recovery_required")?;
 
     let runtime = InstalledRuntime::with_node_version(
         &pending.version,
@@ -894,6 +884,29 @@ fn inspect_orphan_candidate_with(
         Err(InstallStateError::NotInstalled) => Ok(OrphanCandidateDisposition::RetryFresh),
         Ok(_) | Err(_) => Err("activation_recovery_required"),
     }
+}
+
+#[cfg(any(not(debug_assertions), test))]
+async fn recover_orphan_candidate_with<Validate, Restart, RestartFuture>(
+    paths: &AppPaths,
+    pending: &PendingActivation,
+    validate_inventory: Validate,
+    restart_prior: Restart,
+) -> Result<OrphanCandidateDisposition, &'static str>
+where
+    Validate: FnOnce(&InstalledRuntime, &DataGeneration) -> Result<(), ()>,
+    Restart: FnOnce(ActiveDeployment) -> RestartFuture,
+    RestartFuture: std::future::Future<Output = Result<(), ()>>,
+{
+    let disposition = inspect_orphan_candidate_with(paths, pending, validate_inventory)?;
+    if let OrphanCandidateDisposition::RestartPrior(prior) = &disposition {
+        restart_prior(prior.clone())
+            .await
+            .map_err(|_| "activation_recovery_required")?;
+    }
+    write_activation_receipt(paths, pending, &UpdateUiPhase::Failed)
+        .map_err(|_| "activation_recovery_required")?;
+    Ok(disposition)
 }
 
 /// 在 supervisor 启动前恢复旧事务或激活已确认的暂存版本。
@@ -1052,7 +1065,7 @@ async fn cold_bootstrap_inner(
     let candidate = crate::runtime::install_state::DataGeneration::new(&pending.generation)
         .map_err(|_| "activation_recovery_required")?;
     if layout.generation_dir(&candidate).exists() {
-        let disposition = inspect_orphan_candidate_with(
+        recover_orphan_candidate_with(
             &update_controller.paths,
             &pending,
             |runtime, candidate| {
@@ -1066,16 +1079,15 @@ async fn cold_bootstrap_inner(
                     .validate_prepared_candidate(candidate)
                     .map_err(|_| ())
             },
-        )?;
-        if let OrphanCandidateDisposition::RestartPrior(prior) = disposition {
-            app_controller
-                .start_exact_active_runtime(&prior)
-                .await
-                .map_err(|_| "activation_recovery_required")?;
-        }
+            |prior| async move {
+                app_controller
+                    .start_exact_active_runtime(&prior)
+                    .await
+                    .map_err(|_| ())
+            },
+        )
+        .await?;
         // candidate 只作为崩溃证据保留；显式重试会生成全新的 generation id。
-        write_activation_receipt(&update_controller.paths, &pending, &UpdateUiPhase::Failed)
-            .map_err(|_| "activation_recovery_required")?;
         update_controller
             .publish_cold_phase(
                 app,
@@ -1534,7 +1546,7 @@ mod tests {
         ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
         UpdateUiController, UpdateUiPhase, activation_receipt, confirmation_path,
         finish_cold_recovery, inspect_orphan_candidate_with, load_single_confirmed_pending,
-        pending_path, plan_cold_recovery, write_activation_receipt,
+        pending_path, plan_cold_recovery, recover_orphan_candidate_with, write_activation_receipt,
     };
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::install_state::{
@@ -1544,7 +1556,13 @@ mod tests {
         ActivationCheckpoint, ActivationError, ActivationFailure, ActivationFailureStage,
     };
     use crate::update::probe::ProbeError;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[tokio::test]
     async fn missing_release_configuration_is_explicitly_unavailable() {
@@ -1774,16 +1792,108 @@ mod tests {
         (paths, pending, prior)
     }
 
-    #[test]
-    fn orphan_candidate_without_journal_recovers_exact_active_prior() {
+    fn write_activation_journal(paths: &AppPaths, state: &str, label: &str) {
+        let root = paths.settings.join("activation-journal");
+        std::fs::create_dir_all(&root).unwrap();
+        let document = serde_json::json!({
+            "schema": 2,
+            "activation_id": format!("history-{label}"),
+            "prior": null,
+            "target": {
+                "runtime_version": "0.0.9",
+                "manifest_digest": "9".repeat(64),
+                "node_version": "24.15.0",
+                "data_id": "generation-history",
+                "activated_at": "epoch-history",
+                "project_workspace": paths.dsh_home.join("projects/history").to_string_lossy()
+            },
+            "state": state,
+            "failure": null
+        });
+        std::fs::write(
+            root.join(format!("history-{label}.json")),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_active_journal_allows_retryable_orphan_and_restarts_exact_prior() {
         let (paths, pending, prior) = orphan_candidate_fixture("active", true);
-        let result =
-            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())).expect("valid residual");
+        write_activation_journal(&paths, "active", "active");
+        std::fs::write(
+            paths
+                .settings
+                .join("activation-journal/diagnostic-note.txt"),
+            b"ignored non-journal entry",
+        )
+        .unwrap();
+        let restarts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&restarts);
+        let expected = prior.clone().unwrap();
+        let result = recover_orphan_candidate_with(
+            &paths,
+            &pending,
+            |_, _| Ok(()),
+            move |actual| async move {
+                assert_eq!(actual, expected);
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("valid residual");
         assert_eq!(
             result,
             OrphanCandidateDisposition::RestartPrior(prior.unwrap())
         );
-        assert!(!activation_receipt(&paths, &pending).exists());
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        let receipt: super::ActivationReceipt =
+            serde_json::from_slice(&std::fs::read(activation_receipt(&paths, &pending)).unwrap())
+                .unwrap();
+        assert!(matches!(receipt.outcome, UpdateUiPhase::Failed));
+    }
+
+    #[test]
+    fn historical_rolled_back_journal_allows_new_orphan_classification() {
+        let (paths, pending, prior) = orphan_candidate_fixture("rolled-back", true);
+        write_activation_journal(&paths, "rolled_back", "rolled-back");
+        assert_eq!(
+            inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())).unwrap(),
+            OrphanCandidateDisposition::RestartPrior(prior.unwrap())
+        );
+    }
+
+    #[test]
+    fn unresolved_journal_states_reject_orphan_classification() {
+        for state in ["prepared", "recovery_required"] {
+            let (paths, pending, _) = orphan_candidate_fixture(state, true);
+            write_activation_journal(&paths, state, state);
+            assert_eq!(
+                inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())),
+                Err("activation_recovery_required")
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_journal_fails_closed() {
+        for (label, bytes) in [
+            ("truncated", b"{".as_slice()),
+            (
+                "unknown-schema",
+                br#"{"schema":99,"activation_id":"unknown","prior":null,"target":{"runtime_version":"0.0.9","manifest_digest":"9999999999999999999999999999999999999999999999999999999999999999","node_version":"24.15.0","data_id":"generation-history","activated_at":"epoch-history","project_workspace":"C:\\workspace"},"state":"active","failure":null}"#,
+            ),
+        ] {
+            let (paths, pending, _) = orphan_candidate_fixture(label, true);
+            let root = paths.settings.join("activation-journal");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{label}.json")), bytes).unwrap();
+            assert_eq!(
+                inspect_orphan_candidate_with(&paths, &pending, |_, _| Ok(())),
+                Err("activation_recovery_required")
+            );
+        }
     }
 
     #[test]
