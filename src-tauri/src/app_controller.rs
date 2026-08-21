@@ -14,6 +14,7 @@ use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
 use std::env;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(debug_assertions)]
 use std::time::Duration;
@@ -24,6 +25,14 @@ use tauri::{AppHandle, Manager};
 #[cfg(debug_assertions)]
 const MOCK_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(debug_assertions)]
+const RUNTIME_STOP_GRACE: Duration = Duration::from_secs(2);
+
+trait RuntimeLifecycle: Send + Sync + 'static {
+    fn start(&self) -> Result<(), RuntimeError>;
+    fn stop(&self) -> Result<(), RuntimeError>;
+}
+
 #[cfg(any(debug_assertions, test))]
 trait RuntimeUi: Send + Sync + 'static {
     fn emit_status(&self, event: &RuntimeEvent) -> Result<(), RuntimeError>;
@@ -33,6 +42,60 @@ trait RuntimeUi: Send + Sync + 'static {
 #[cfg(debug_assertions)]
 struct TauriRuntimeUi {
     app: AppHandle,
+}
+
+#[cfg(debug_assertions)]
+struct MockRuntimeLifecycle {
+    supervisor: Arc<RuntimeSupervisor>,
+    status: Arc<RwLock<RuntimeStatus>>,
+    app: AppHandle,
+    local_url: tauri::Url,
+}
+
+#[cfg(debug_assertions)]
+impl RuntimeLifecycle for MockRuntimeLifecycle {
+    fn start(&self) -> Result<(), RuntimeError> {
+        let paths =
+            AppPaths::resolve(&self.app).map_err(|error| RuntimeError::Tauri(error.to_string()))?;
+        paths
+            .ensure_exists()
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
+        // 每次启动都重新占用并立即释放一个动态端口，restart 不复用旧 spec/端口。
+        let port = reserve_loopback_port()?;
+        let node = env::var_os("DSH_DESKTOP_NODE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("node.exe"));
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/mock-dsh.mjs");
+        let spec = RuntimeLaunchSpec::mock(node, script, paths.dsh_home, port);
+        let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
+            app: self.app.clone(),
+        });
+        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
+            Arc::clone(&self.status),
+            ui,
+            self.local_url.clone(),
+        ));
+        self.supervisor.start(spec, MOCK_READY_TIMEOUT, sink)
+    }
+
+    fn stop(&self) -> Result<(), RuntimeError> {
+        self.supervisor.stop(RUNTIME_STOP_GRACE)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+struct UnavailableRuntime;
+
+#[cfg(not(debug_assertions))]
+impl RuntimeLifecycle for UnavailableRuntime {
+    fn start(&self) -> Result<(), RuntimeError> {
+        Err(RuntimeError::MockRuntimeDisabled)
+    }
+
+    fn stop(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -164,13 +227,9 @@ fn initial_runtime_status(mock_runtime_enabled: bool) -> RuntimeStatus {
 
 /// 协调运行时状态、后台生命周期任务与单一 Tauri 主窗口。
 pub struct AppController {
-    #[cfg(debug_assertions)]
-    supervisor: Arc<RuntimeSupervisor>,
+    runtime: Arc<dyn RuntimeLifecycle>,
     status: Arc<RwLock<RuntimeStatus>>,
-    #[cfg(debug_assertions)]
-    app: AppHandle,
-    #[cfg(debug_assertions)]
-    local_url: tauri::Url,
+    exit_requested: AtomicBool,
 }
 
 impl AppController {
@@ -185,17 +244,33 @@ impl AppController {
             .ok_or(RuntimeError::MainWindowMissing)?
             .url()
             .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
-        #[cfg(not(debug_assertions))]
-        let _ = (app, local_url);
-        Ok(Self {
-            #[cfg(debug_assertions)]
+        let status = Arc::new(RwLock::new(initial_runtime_status(cfg!(debug_assertions))));
+        #[cfg(debug_assertions)]
+        let runtime: Arc<dyn RuntimeLifecycle> = Arc::new(MockRuntimeLifecycle {
             supervisor: Arc::new(RuntimeSupervisor::new()),
-            status: Arc::new(RwLock::new(initial_runtime_status(cfg!(debug_assertions)))),
-            #[cfg(debug_assertions)]
+            status: Arc::clone(&status),
             app,
-            #[cfg(debug_assertions)]
             local_url,
+        });
+        #[cfg(not(debug_assertions))]
+        let runtime: Arc<dyn RuntimeLifecycle> = {
+            let _ = (app, local_url);
+            Arc::new(UnavailableRuntime)
+        };
+        Ok(Self {
+            runtime,
+            status,
+            exit_requested: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    fn for_test(runtime: Arc<dyn RuntimeLifecycle>) -> Self {
+        Self {
+            runtime,
+            status: Arc::new(RwLock::new(initial_runtime_status(true))),
+            exit_requested: AtomicBool::new(false),
+        }
     }
 
     /// 返回与前端 TypeScript `RuntimeStatus` 字段完全对齐的当前快照。
@@ -213,34 +288,8 @@ impl AppController {
     ///
     /// :return: 启动任务成功提交到后台线程时返回 `Ok(())`。
     /// :raises RuntimeError: 正式构建调用、目录创建、端口申请或重复启动时返回。
-    #[cfg(debug_assertions)]
     pub fn start_mock_runtime(&self) -> Result<(), RuntimeError> {
-        let paths =
-            AppPaths::resolve(&self.app).map_err(|error| RuntimeError::Tauri(error.to_string()))?;
-        paths
-            .ensure_exists()
-            .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
-        let port = reserve_loopback_port()?;
-        let node = env::var_os("DSH_DESKTOP_NODE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("node.exe"));
-        let script =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/mock-dsh.mjs");
-        let spec = RuntimeLaunchSpec::mock(node, script, paths.dsh_home, port);
-        let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
-            app: self.app.clone(),
-        });
-        let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
-            Arc::clone(&self.status),
-            ui,
-            self.local_url.clone(),
-        ));
-        self.supervisor.start(spec, MOCK_READY_TIMEOUT, sink)
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub fn start_mock_runtime(&self) -> Result<(), RuntimeError> {
-        Err(RuntimeError::MockRuntimeDisabled)
+        self.runtime.start()
     }
 
     /// 失败后重新构造端口与模拟启动参数并提交后台启动。
@@ -249,6 +298,41 @@ impl AppController {
     /// :raises RuntimeError: 与 `start_mock_runtime` 相同。
     pub fn retry(&self) -> Result<(), RuntimeError> {
         self.start_mock_runtime()
+    }
+
+    /// 同步停止当前运行时，阻塞操作由运行时实现负责且不持有控制器状态锁。
+    ///
+    /// :return: 运行时已完整停止时返回 `Ok(())`。
+    /// :raises RuntimeError: 运行时停止失败时原样返回。
+    pub fn stop(&self) -> Result<(), RuntimeError> {
+        self.runtime.stop()
+    }
+
+    /// 先完整停止旧运行时，再重新生成启动参数并启动。
+    ///
+    /// :return: 新启动任务成功提交时返回 `Ok(())`。
+    /// :raises RuntimeError: 停止或重新启动任一步失败时返回，后一步不会越过前一步。
+    pub fn restart(&self) -> Result<(), RuntimeError> {
+        self.stop()?;
+        self.start_mock_runtime()
+    }
+
+    /// 请求显式退出；只有运行时停止成功后才开放窗口/应用退出。
+    ///
+    /// :return: 运行时已停止且退出标志已提交时返回 `Ok(())`。
+    /// :raises RuntimeError: 停止失败时返回且退出标志保持 false。
+    pub fn request_exit(&self) -> Result<(), RuntimeError> {
+        self.stop()?;
+        self.exit_requested.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// 返回托盘 Exit 是否已完成运行时停止阶段。
+    ///
+    /// :return: 仅 `request_exit` 成功后为 true。
+    /// :raises: 原子只读操作不产生错误。
+    pub fn exit_requested(&self) -> bool {
+        self.exit_requested.load(Ordering::Acquire)
     }
 }
 
@@ -274,10 +358,91 @@ pub fn retry_runtime(controller: tauri::State<'_, AppController>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{ControllerEventSink, RuntimeUi, initial_runtime_status};
+    use super::{
+        AppController, ControllerEventSink, RuntimeLifecycle, RuntimeUi, initial_runtime_status,
+    };
     use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
     use crate::runtime::{RuntimeError, RuntimeEventSink};
     use std::sync::{Arc, Mutex, RwLock};
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        calls: Mutex<Vec<&'static str>>,
+        fail_stop: bool,
+    }
+
+    impl RuntimeLifecycle for RecordingRuntime {
+        fn start(&self) -> Result<(), RuntimeError> {
+            self.calls.lock().expect("调用记录锁不应中毒").push("start");
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), RuntimeError> {
+            self.calls.lock().expect("调用记录锁不应中毒").push("stop");
+            if self.fail_stop {
+                Err(RuntimeError::Tauri("停止失败".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn stop_delegates_to_runtime_without_holding_controller_state() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime.clone());
+
+        controller.stop().expect("运行时应停止");
+
+        assert_eq!(
+            *runtime.calls.lock().expect("调用记录锁不应中毒"),
+            vec!["stop"]
+        );
+    }
+
+    #[test]
+    fn restart_stops_before_requesting_a_fresh_start() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime.clone());
+
+        controller.restart().expect("运行时应重启");
+
+        assert_eq!(
+            *runtime.calls.lock().expect("调用记录锁不应中毒"),
+            vec!["stop", "start"]
+        );
+    }
+
+    #[test]
+    fn successful_exit_request_stops_before_marking_exit_allowed() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime.clone());
+
+        controller.request_exit().expect("停止成功后应允许退出");
+
+        assert_eq!(
+            *runtime.calls.lock().expect("调用记录锁不应中毒"),
+            vec!["stop"]
+        );
+        assert!(controller.exit_requested());
+    }
+
+    #[test]
+    fn failed_stop_does_not_mark_exit_allowed() {
+        let runtime = Arc::new(RecordingRuntime {
+            fail_stop: true,
+            ..RecordingRuntime::default()
+        });
+        let controller = AppController::for_test(runtime.clone());
+
+        assert!(controller.request_exit().is_err());
+
+        assert_eq!(
+            *runtime.calls.lock().expect("调用记录锁不应中毒"),
+            vec!["stop"]
+        );
+        assert!(!controller.exit_requested());
+    }
 
     #[test]
     fn initial_status_distinguishes_debug_mock_from_release_without_runtime() {
