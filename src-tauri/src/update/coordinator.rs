@@ -375,7 +375,10 @@ impl UpdateCoordinator {
             .map(ScheduledCheckResult::Checked)
     }
 
-    /// 返回到期状态，供托盘周期计时器决定是否发起检查。
+    /// 返回只读的到期提示，供设置页展示；不作为发起检查的前置门禁。
+    ///
+    /// 托盘和其他周期入口必须直接调用 `check_if_due`，由同一把锁原子完成到期判断与
+    /// 检查；若先调用本方法再调用 `check`，两步之间会存在竞态并可能重复网络请求。
     ///
     /// :return: 当前时刻已到达 next-check 时为 `true`。
     /// :raises UpdateStateError: 状态或时钟读取失败时返回。
