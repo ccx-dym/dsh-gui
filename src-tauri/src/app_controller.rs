@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), test))]
 use std::time::Instant;
 use tauri::Emitter;
 use tauri::{AppHandle, Manager};
@@ -135,31 +135,46 @@ impl RuntimeLifecycle for OfficialRuntimeLifecycle {
         // supervisor 自己拥有 60 秒 readiness 截止；外层只作为清理兜底，避免两个
         // 相同截止互相竞态并留下 Starting 子进程。
         let watchdog = OFFICIAL_READY_TIMEOUT + RUNTIME_STOP_GRACE + Duration::from_secs(1);
-        let deadline = Instant::now() + watchdog;
-        loop {
-            match self
-                .status
-                .read()
-                .map_err(|_| RuntimeError::StatePoisoned)?
-                .phase
-            {
-                AppPhase::Ready => return Ok(()),
-                AppPhase::Failed => {
-                    return Err(RuntimeError::Tauri(
-                        "official runtime failed before readiness".to_owned(),
-                    ));
-                }
-                AppPhase::Idle | AppPhase::Starting | AppPhase::Stopping => {}
+        wait_for_official_ready(&self.status, port, watchdog, || {
+            self.supervisor.stop(RUNTIME_STOP_GRACE)
+        })
+    }
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn wait_for_official_ready<F>(
+    status: &Arc<RwLock<RuntimeStatus>>,
+    port: u16,
+    watchdog: Duration,
+    mut stop_on_timeout: F,
+) -> Result<(), RuntimeError>
+where
+    F: FnMut() -> Result<(), RuntimeError>,
+{
+    let deadline = Instant::now() + watchdog;
+    loop {
+        match status
+            .read()
+            .map_err(|_| RuntimeError::StatePoisoned)?
+            .phase
+        {
+            AppPhase::Ready => return Ok(()),
+            AppPhase::Failed => {
+                return Err(RuntimeError::Tauri(
+                    "official runtime failed before readiness".to_owned(),
+                ));
             }
-            if Instant::now() >= deadline {
-                let _ = self.supervisor.stop(RUNTIME_STOP_GRACE);
-                return Err(RuntimeError::HealthTimeout {
-                    port,
-                    timeout_ms: watchdog.as_millis() as u64,
-                });
-            }
-            std::thread::sleep(Duration::from_millis(25));
+            AppPhase::Idle | AppPhase::Starting | AppPhase::Stopping => {}
         }
+        if Instant::now() >= deadline {
+            // 清理失败不能覆盖原始 readiness 超时，但 supervisor 的 stop 至少被可靠触发。
+            let _ = stop_on_timeout();
+            return Err(RuntimeError::HealthTimeout {
+                port,
+                timeout_ms: watchdog.as_millis() as u64,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(25).min(watchdog));
     }
 }
 
@@ -729,6 +744,7 @@ pub fn retry_runtime(controller: tauri::State<'_, AppController>) -> Result<(), 
 mod tests {
     use super::{
         AppController, ControllerEventSink, RuntimeLifecycle, RuntimeUi, initial_runtime_status,
+        wait_for_official_ready,
     };
     use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
     use crate::runtime::install_state::{ActiveDeployment, DataGeneration, InstalledRuntime};
@@ -736,6 +752,7 @@ mod tests {
     use crate::update::activation::{RuntimeBusyProvider, RuntimeBusyState};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingRuntime {
@@ -830,6 +847,27 @@ mod tests {
         assert!(matches!(
             session.claim_transaction(),
             Err(RuntimeError::ProbeOperationInProgress)
+        ));
+    }
+
+    #[test]
+    fn official_ready_watchdog_stops_a_stuck_starting_runtime() {
+        let status = Arc::new(RwLock::new(RuntimeStatus {
+            phase: AppPhase::Starting,
+            ..RuntimeStatus::default()
+        }));
+        let stopped = AtomicBool::new(false);
+
+        let error = wait_for_official_ready(&status, 43123, Duration::from_millis(5), || {
+            stopped.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect_err("watchdog must time out");
+
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            RuntimeError::HealthTimeout { port: 43123, .. }
         ));
     }
 
