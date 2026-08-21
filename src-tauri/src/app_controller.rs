@@ -156,8 +156,10 @@ impl RuntimeEventSink for ControllerEventSink {
                 let url = strict_loopback_url(&url)?;
                 self.ui.navigate_main(&url)
             }
-            RuntimeEvent::Failed { .. } => self.ui.navigate_main(&self.local_url),
-            RuntimeEvent::Starting { .. } | RuntimeEvent::Stopping { .. } => Ok(()),
+            RuntimeEvent::Failed { .. } | RuntimeEvent::Stopping { .. } => {
+                self.ui.navigate_main(&self.local_url)
+            }
+            RuntimeEvent::Starting { .. } => Ok(()),
         }
     }
 }
@@ -573,6 +575,39 @@ mod tests {
                 url: None,
                 elapsed_ms: None,
                 error_code: Some("health_timeout".to_owned()),
+            }
+        );
+        assert_eq!(
+            *ui.navigated.lock().expect("导航记录锁不应中毒"),
+            vec!["http://tauri.localhost/".to_owned()]
+        );
+    }
+
+    #[test]
+    fn stopping_event_updates_snapshot_and_returns_to_local_page_before_runtime_stops() {
+        let ui = Arc::new(FakeUi::default());
+        let (sink, status) = sink(Arc::clone(&ui));
+        *status.write().expect("状态锁不应中毒") = RuntimeStatus {
+            phase: AppPhase::Ready,
+            message: "DSH 已就绪".to_owned(),
+            url: Some("http://127.0.0.1:43127".to_owned()),
+            elapsed_ms: Some(820),
+            error_code: None,
+        };
+
+        sink.emit(RuntimeEvent::Stopping {
+            message: "正在停止 DSH".to_owned(),
+        })
+        .expect("停止事件应在旧服务退出前返回本地页");
+
+        assert_eq!(
+            *status.read().expect("状态锁不应中毒"),
+            RuntimeStatus {
+                phase: AppPhase::Stopping,
+                message: "正在停止 DSH".to_owned(),
+                url: None,
+                elapsed_ms: None,
+                error_code: None,
             }
         );
         assert_eq!(
