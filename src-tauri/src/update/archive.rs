@@ -126,6 +126,8 @@ pub enum ArchiveInstallError {
     InventoryEntryCountLimit,
     #[error("运行时 payload 与 inventory.json 不一致")]
     InventoryMismatch,
+    #[error("运行时 inventory 复核被取消或超过截止时间")]
+    InventoryVerificationAborted,
     #[error("运行时安装 I/O 失败（{operation}）")]
     Io {
         operation: &'static str,
@@ -238,6 +240,167 @@ struct InventoryEntry {
     path: String,
     size: u64,
     sha256: String,
+}
+
+/// 对已安装 runtime 重新执行 inventory 文件闭包、大小和 SHA-256 校验。
+pub(crate) fn verify_installed_runtime_inventory(
+    runtime_dir: &Path,
+    policy: ArchiveInstallPolicy,
+    mut checkpoint: impl FnMut() -> bool,
+) -> Result<(), ArchiveInstallError> {
+    if !checkpoint() {
+        return Err(ArchiveInstallError::InventoryVerificationAborted);
+    }
+    reject_reparse(runtime_dir)?;
+    let canonical_root = fs::canonicalize(runtime_dir)
+        .map_err(|source| io_error("canonicalize_runtime_inventory", source))?;
+    let mut actual = BTreeMap::<String, FileRecord>::new();
+    let mut stack = vec![canonical_root.clone()];
+    let mut file_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    while let Some(directory) = stack.pop() {
+        if !checkpoint() {
+            return Err(ArchiveInstallError::InventoryVerificationAborted);
+        }
+        for entry in
+            fs::read_dir(&directory).map_err(|source| io_error("read_runtime_inventory", source))?
+        {
+            if !checkpoint() {
+                return Err(ArchiveInstallError::InventoryVerificationAborted);
+            }
+            let entry = entry.map_err(|source| io_error("read_runtime_inventory_entry", source))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|source| io_error("metadata_runtime_inventory", source))?;
+            if metadata.file_type().is_symlink() || metadata_is_reparse(&metadata) {
+                return Err(ArchiveInstallError::UnsafeFilesystemBoundary);
+            }
+            let canonical = fs::canonicalize(&path)
+                .map_err(|source| io_error("canonicalize_runtime_entry", source))?;
+            if !canonical.starts_with(&canonical_root) {
+                return Err(ArchiveInstallError::UnsafeFilesystemBoundary);
+            }
+            if metadata.is_dir() {
+                stack.push(canonical);
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(ArchiveInstallError::UnsupportedEntry);
+            }
+            file_count = file_count
+                .checked_add(1)
+                .ok_or(ArchiveInstallError::FileCountLimit)?;
+            if file_count > policy.max_files {
+                return Err(ArchiveInstallError::FileCountLimit);
+            }
+            total_bytes = total_bytes
+                .checked_add(metadata.len())
+                .ok_or(ArchiveInstallError::UnpackedSizeLimit)?;
+            if total_bytes > policy.max_unpacked_bytes {
+                return Err(ArchiveInstallError::UnpackedSizeLimit);
+            }
+            let relative = canonical
+                .strip_prefix(&canonical_root)
+                .map_err(|_| ArchiveInstallError::UnsafeFilesystemBoundary)?;
+            let portable = relative.to_string_lossy().replace('\\', "/");
+            let (_, normalized, _) = normalize_entry(&portable, EntryKind::File)
+                .map_err(|_| ArchiveInstallError::UnsafeFilesystemBoundary)?;
+            let sha256 = if normalized == INVENTORY_FILE {
+                String::new()
+            } else {
+                digest_file_with_checkpoint(&canonical, &mut checkpoint)?
+            };
+            if actual
+                .insert(
+                    normalized,
+                    FileRecord {
+                        size: metadata.len(),
+                        sha256,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ArchiveInstallError::CaseCollision);
+            }
+        }
+    }
+
+    let inventory_record =
+        actual
+            .get(INVENTORY_FILE)
+            .ok_or(ArchiveInstallError::RequiredPayloadMissing {
+                component: "inventory",
+            })?;
+    if inventory_record.size > policy.max_inventory_bytes {
+        return Err(ArchiveInstallError::InventorySizeLimit);
+    }
+    let inventory_bytes = read_limited_file(
+        &canonical_root.join(INVENTORY_FILE),
+        policy.max_inventory_bytes,
+    )?;
+    let inventory: Vec<InventoryEntry> = serde_json::from_slice(&inventory_bytes)
+        .map_err(|_| ArchiveInstallError::InvalidInventory)?;
+    if inventory.len() > policy.max_files {
+        return Err(ArchiveInstallError::InventoryEntryCountLimit);
+    }
+    let mut expected = BTreeMap::new();
+    for item in inventory {
+        if !checkpoint() {
+            return Err(ArchiveInstallError::InventoryVerificationAborted);
+        }
+        let (_, normalized, _) = normalize_entry(&item.path, EntryKind::File)
+            .map_err(|_| ArchiveInstallError::InvalidInventory)?;
+        if normalized == INVENTORY_FILE || !is_canonical_sha256(&item.sha256) {
+            return Err(ArchiveInstallError::InvalidInventory);
+        }
+        if expected
+            .insert(
+                normalized,
+                FileRecord {
+                    size: item.size,
+                    sha256: item.sha256,
+                },
+            )
+            .is_some()
+        {
+            return Err(ArchiveInstallError::InvalidInventory);
+        }
+    }
+    let actual_payload = actual
+        .into_iter()
+        .filter(|(path, _)| path != INVENTORY_FILE)
+        .collect::<BTreeMap<_, _>>();
+    if expected != actual_payload {
+        return Err(ArchiveInstallError::InventoryMismatch);
+    }
+    Ok(())
+}
+
+fn digest_file_with_checkpoint(
+    path: &Path,
+    checkpoint: &mut impl FnMut() -> bool,
+) -> Result<String, ArchiveInstallError> {
+    let mut file = File::open(path).map_err(|source| io_error("hash_runtime_open", source))?;
+    validate_open_regular_file(&file)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if !checkpoint() {
+            return Err(ArchiveInstallError::InventoryVerificationAborted);
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| io_error("hash_runtime_read", source))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn install_blocking(

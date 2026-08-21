@@ -14,6 +14,7 @@ use dsh_desktop_lib::update::probe::{
     ProbeStorageInspector, ProbeWorkspace, RuntimeProbe, read_passed_generation_state,
 };
 use semver::Version;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -78,6 +79,29 @@ struct FakeLauncher {
     mode: ProcessMode,
     stops: Arc<AtomicUsize>,
     specs: Arc<Mutex<Vec<RuntimeLaunchSpec>>>,
+}
+
+enum RuntimeMutation {
+    Rewrite(PathBuf),
+    Add(PathBuf),
+}
+
+struct MutatingLauncher {
+    mutation: RuntimeMutation,
+    stops: Arc<AtomicUsize>,
+}
+
+impl ProcessLauncher for MutatingLauncher {
+    fn spawn(&self, _spec: &RuntimeLaunchSpec) -> Result<Box<dyn RuntimeProcess>, RuntimeError> {
+        match &self.mutation {
+            RuntimeMutation::Rewrite(path) => fs::write(path, b"dependency-v2")?,
+            RuntimeMutation::Add(path) => fs::write(path, b"unexpected")?,
+        }
+        Ok(Box::new(FakeProcess {
+            mode: ProcessMode::Ready,
+            stops: Arc::clone(&self.stops),
+        }))
+    }
 }
 
 impl ProcessLauncher for FakeLauncher {
@@ -145,7 +169,7 @@ struct SlowStorage;
 
 impl ProbeStorageInspector for SlowStorage {
     fn available_bytes(&self, _path: &Path) -> Result<u64, std::io::Error> {
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(250));
         Ok(u64::MAX)
     }
 }
@@ -158,6 +182,7 @@ struct Fixture {
     workspace: PathBuf,
     candidate_dir: PathBuf,
     active_dir: PathBuf,
+    runtime_dependency: PathBuf,
 }
 
 impl Fixture {
@@ -179,6 +204,36 @@ impl Fixture {
         fs::create_dir_all(&cli_dir).expect("cli dir");
         fs::write(node_dir.join("node.exe"), b"node").expect("node");
         fs::write(cli_dir.join("bin.js"), b"export {}").expect("cli");
+        let dependency = runtime_dir.join("app/node_modules/runtime-dependency/data.bin");
+        fs::create_dir_all(dependency.parent().expect("dependency parent"))
+            .expect("dependency dir");
+        fs::write(&dependency, b"dependency-v1").expect("dependency");
+        let inventory_payload = [
+            ("node-v24.15.0-win-x64/node.exe", b"node".as_slice()),
+            (
+                "app/node_modules/@deepseek-ai/dsh/lib/bin.js",
+                b"export {}".as_slice(),
+            ),
+            (
+                "app/node_modules/runtime-dependency/data.bin",
+                b"dependency-v1".as_slice(),
+            ),
+        ];
+        let inventory = inventory_payload
+            .iter()
+            .map(|(path, bytes)| {
+                serde_json::json!({
+                    "path": path,
+                    "size": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            runtime_dir.join("inventory.json"),
+            serde_json::to_vec(&inventory).expect("inventory json"),
+        )
+        .expect("inventory");
         let candidate_dir = layout.generation_dir(&candidate);
         let active_dir = layout.generation_dir(&active);
         let workspace = root.join("workspace");
@@ -194,6 +249,7 @@ impl Fixture {
             workspace,
             candidate_dir,
             active_dir,
+            runtime_dependency: dependency,
         }
     }
 
@@ -241,7 +297,7 @@ fn probe(
     let specs = Arc::new(Mutex::new(Vec::new()));
     let probe = test_probe_with_dependencies(
         ProbePolicy {
-            timeout: Duration::from_millis(80),
+            timeout: Duration::from_millis(500),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
@@ -349,6 +405,91 @@ async fn project_workspace_is_canonicalized_before_launch() {
 }
 
 #[tokio::test]
+async fn runtime_dependency_modified_during_probe_cannot_pass_inventory_recheck() {
+    let fixture = Fixture::new("runtime-mutated");
+    let stops = Arc::new(AtomicUsize::new(0));
+    let probe = RuntimeProbe::with_inspectors(
+        ProbePolicy {
+            timeout: Duration::from_millis(200),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024 * 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(MutatingLauncher {
+            mutation: RuntimeMutation::Rewrite(fixture.runtime_dependency.clone()),
+            stops: Arc::clone(&stops),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(PlentyOfSpace),
+        Arc::new(SafePermissions),
+    )
+    .expect("probe");
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_runtime_mutated".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("report");
+
+    assert_eq!(report.phase, ProbePhase::Failed);
+    assert_eq!(
+        report.error_kind,
+        Some(ProbeErrorKind::RuntimeIntegrityFailed)
+    );
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn runtime_extra_file_created_during_probe_cannot_pass_inventory_recheck() {
+    let fixture = Fixture::new("runtime-extra");
+    let stops = Arc::new(AtomicUsize::new(0));
+    let extra = fixture
+        .runtime_dependency
+        .parent()
+        .expect("parent")
+        .join("extra.bin");
+    let probe = RuntimeProbe::with_inspectors(
+        ProbePolicy {
+            timeout: Duration::from_millis(200),
+            poll_interval: Duration::from_millis(10),
+            stop_grace: Duration::ZERO,
+            max_files: 64,
+            max_candidate_bytes: 1024 * 1024,
+            required_free_bytes: 1,
+        },
+        Arc::new(MutatingLauncher {
+            mutation: RuntimeMutation::Add(extra),
+            stops: Arc::clone(&stops),
+        }),
+        Arc::new(FakeHealth { ready: true }),
+        Arc::new(PlentyOfSpace),
+        Arc::new(SafePermissions),
+    )
+    .expect("probe");
+
+    let report = probe
+        .probe(
+            fixture.fresh_workspace(),
+            "trace_runtime_extra".to_owned(),
+            ProbeCancellation::new(),
+        )
+        .await
+        .expect("report");
+
+    assert_eq!(report.phase, ProbePhase::Failed);
+    assert_eq!(
+        report.error_kind,
+        Some(ProbeErrorKind::RuntimeIntegrityFailed)
+    );
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stdout_without_http_is_invalid_webui_and_reclaims_process_tree() {
     let fixture = Fixture::new("invalid-webui");
     let (probe, stops, _) = probe(ProcessMode::Ready, false);
@@ -410,7 +551,7 @@ async fn cancellation_interrupts_wait_and_reclaims_process_tree() {
     let cancellation = ProbeCancellation::new();
     let cancelling = cancellation.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         cancelling.cancel();
     });
 
@@ -453,7 +594,7 @@ async fn insufficient_space_is_a_failed_report_before_any_process_starts() {
     let specs = Arc::new(Mutex::new(Vec::new()));
     let probe = test_probe_with_dependencies(
         ProbePolicy {
-            timeout: Duration::from_millis(50),
+            timeout: Duration::from_millis(500),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
@@ -569,6 +710,10 @@ async fn total_deadline_includes_slow_preflight() {
         .expect("deadline report");
 
     assert_eq!(report.error_kind, Some(ProbeErrorKind::ReadinessTimeout));
+    assert!(
+        report.elapsed_ms < 150,
+        "preflight timeout must return promptly"
+    );
     assert!(specs.lock().expect("specs").is_empty());
 }
 
@@ -605,7 +750,7 @@ async fn empty_directory_fanout_counts_toward_candidate_entry_limit() {
     let specs = Arc::new(Mutex::new(Vec::new()));
     let probe = test_probe_with_dependencies(
         ProbePolicy {
-            timeout: Duration::from_millis(50),
+            timeout: Duration::from_millis(500),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             // 状态文件位于 candidate 外；两个空目录恰好不应超过此上限。
@@ -693,7 +838,7 @@ async fn unsafe_candidate_acl_is_rejected_before_process_launch() {
     let specs = Arc::new(Mutex::new(Vec::new()));
     let probe = RuntimeProbe::with_inspectors(
         ProbePolicy {
-            timeout: Duration::from_millis(80),
+            timeout: Duration::from_millis(500),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
@@ -812,7 +957,7 @@ async fn panicking_health_worker_still_drops_managed_process() {
     let drops = Arc::new(AtomicUsize::new(0));
     let probe = test_probe_with_dependencies(
         ProbePolicy {
-            timeout: Duration::from_millis(80),
+            timeout: Duration::from_millis(500),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
@@ -896,6 +1041,47 @@ fn active_candidate_is_loaded_from_trusted_deployment_and_rejected() {
         error,
         dsh_desktop_lib::update::probe::ProbeError::CandidateIsActive
     ));
+}
+
+#[test]
+fn cloned_lease_cannot_construct_two_probe_workspaces_concurrently() {
+    let fixture = Fixture::new("lease-claim");
+    let lease = ProbeLease::for_test();
+    let clone = lease.clone();
+    let first = ProbeWorkspace::new(
+        fixture.layout.clone(),
+        fixture.runtime.clone(),
+        Version::parse("24.15.0").expect("node"),
+        fixture.candidate.clone(),
+        fixture.workspace.clone(),
+        &lease,
+    )
+    .expect("first workspace");
+
+    let second = ProbeWorkspace::new(
+        fixture.layout.clone(),
+        fixture.runtime.clone(),
+        Version::parse("24.15.0").expect("node"),
+        fixture.candidate.clone(),
+        fixture.workspace.clone(),
+        &clone,
+    )
+    .expect_err("second concurrent workspace must be rejected");
+    assert!(matches!(
+        second,
+        dsh_desktop_lib::update::probe::ProbeError::ProbeAlreadyActive
+    ));
+
+    drop(first);
+    ProbeWorkspace::new(
+        fixture.layout,
+        fixture.runtime,
+        Version::parse("24.15.0").expect("node"),
+        fixture.candidate,
+        fixture.workspace,
+        &clone,
+    )
+    .expect("permit should be reusable after drop");
 }
 
 #[test]

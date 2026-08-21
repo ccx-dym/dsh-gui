@@ -241,7 +241,30 @@ pub struct AppController {
 /// 释放门禁，避免调用方伪造“已停止”快照或在异步探活中途启动第二个 DSH。
 #[derive(Clone, Debug)]
 pub struct ProbeLease {
-    _guard: Arc<OperationGuard>,
+    inner: Arc<ProbeLeaseInner>,
+}
+
+#[derive(Debug)]
+struct ProbeLeaseInner {
+    _guard: OperationGuard,
+    probe_active: AtomicBool,
+}
+
+/// 单个 lease 上一次独占 probe execution 的所有权。
+#[derive(Clone, Debug)]
+pub(crate) struct ProbeExecutionPermit {
+    _ownership: Arc<ProbeExecutionOwnership>,
+}
+
+#[derive(Debug)]
+struct ProbeExecutionOwnership {
+    inner: Arc<ProbeLeaseInner>,
+}
+
+impl Drop for ProbeExecutionOwnership {
+    fn drop(&mut self) {
+        self.inner.probe_active.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -266,8 +289,23 @@ impl ProbeLease {
     pub fn for_test() -> Self {
         let gate = Arc::new(AtomicBool::new(true));
         Self {
-            _guard: Arc::new(OperationGuard { gate }),
+            inner: Arc::new(ProbeLeaseInner {
+                _guard: OperationGuard { gate },
+                probe_active: AtomicBool::new(false),
+            }),
         }
+    }
+
+    pub(crate) fn claim_probe(&self) -> Result<ProbeExecutionPermit, RuntimeError> {
+        self.inner
+            .probe_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| RuntimeError::ProbeOperationInProgress)?;
+        Ok(ProbeExecutionPermit {
+            _ownership: Arc::new(ProbeExecutionOwnership {
+                inner: Arc::clone(&self.inner),
+            }),
+        })
     }
 }
 
@@ -405,7 +443,10 @@ impl AppController {
         let guard = self.acquire_operation()?;
         match self.status().phase {
             crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => Ok(ProbeLease {
-                _guard: Arc::new(guard),
+                inner: Arc::new(ProbeLeaseInner {
+                    _guard: guard,
+                    probe_active: AtomicBool::new(false),
+                }),
             }),
             crate::domain::AppPhase::Starting
             | crate::domain::AppPhase::Ready
@@ -613,6 +654,22 @@ mod tests {
             .start_mock_runtime()
             .expect("dropping lease must reopen lifecycle operations");
         assert_eq!(*runtime.calls.lock().expect("calls"), vec!["start"]);
+    }
+
+    #[test]
+    fn cloned_lease_allows_only_one_active_probe_permit() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let controller = AppController::for_test(runtime);
+        let lease = controller.runtime_stopped_for_probe().expect("lease");
+        let clone = lease.clone();
+        let first = lease.claim_probe().expect("first probe claim");
+
+        assert!(matches!(
+            clone.claim_probe(),
+            Err(RuntimeError::ProbeOperationInProgress)
+        ));
+        drop(first);
+        clone.claim_probe().expect("claim is released on drop");
     }
 
     #[test]

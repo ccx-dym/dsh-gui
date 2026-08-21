@@ -1,4 +1,4 @@
-use crate::app_controller::ProbeLease;
+use crate::app_controller::{ProbeExecutionPermit, ProbeLease};
 use crate::paths::RuntimeLayout;
 use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
 use crate::runtime::health::{HealthProbe, ReadyProbe};
@@ -6,6 +6,9 @@ use crate::runtime::install_state::{
     DataGeneration, InstallStateError, InstallStateStore, InstalledRuntime,
 };
 use crate::runtime::{ProcessLauncher, RuntimeError, RuntimeProcess, WindowsProcessLauncher};
+use crate::update::archive::{
+    ArchiveInstallError, ArchiveInstallPolicy, verify_installed_runtime_inventory,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -55,6 +58,7 @@ pub enum ProbeErrorKind {
     WorkerFailed,
     StateWriteFailed,
     CandidateRejected,
+    RuntimeIntegrityFailed,
 }
 
 /// 可安全写入诊断日志的隔离探活报告。
@@ -200,7 +204,7 @@ pub struct ProbeWorkspace {
     candidate: DataGeneration,
     active: Option<DataGeneration>,
     project_workspace: PathBuf,
-    _lease: ProbeLease,
+    _permit: ProbeExecutionPermit,
 }
 
 impl ProbeWorkspace {
@@ -222,6 +226,9 @@ impl ProbeWorkspace {
         project_workspace: PathBuf,
         lease: &ProbeLease,
     ) -> Result<Self, ProbeError> {
+        let permit = lease
+            .claim_probe()
+            .map_err(|_| ProbeError::ProbeAlreadyActive)?;
         let active = load_active_generation(&layout)?;
         if active.as_ref().is_some_and(|value| value == &candidate) {
             return Err(ProbeError::CandidateIsActive);
@@ -250,7 +257,7 @@ impl ProbeWorkspace {
             candidate,
             active,
             project_workspace,
-            _lease: lease.clone(),
+            _permit: permit,
         })
     }
 }
@@ -318,6 +325,8 @@ pub enum ProbeError {
     DeadlineExceeded,
     #[error("探活已取消")]
     Cancelled,
+    #[error("同一个 lease 已有探活正在执行")]
+    ProbeAlreadyActive,
 }
 
 /// 使用同一受管进程/Job Object 能力执行隔离兼容探活。
@@ -408,8 +417,7 @@ impl RuntimeProbe {
         cancellation: ProbeCancellation,
     ) -> Result<ProbeReport, ProbeError> {
         validate_trace_id(&trace_id)?;
-        // workspace 会移入 blocking worker；额外 clone 保证 lease 覆盖最终状态落盘。
-        let _operation_lease = workspace._lease.clone();
+        let _execution_permit = workspace._permit.clone();
         let probe_started = Instant::now();
         let deadline = probe_started
             .checked_add(self.policy.timeout)
@@ -427,7 +435,7 @@ impl RuntimeProbe {
         let preflight_storage = Arc::clone(&self.storage);
         let preflight_permissions = Arc::clone(&self.permissions);
         let preflight_cancel = cancellation.clone();
-        let preflight = tokio::task::spawn_blocking(move || {
+        let mut preflight_task = tokio::task::spawn_blocking(move || {
             scan_candidate(
                 &preflight_dir,
                 preflight_policy,
@@ -446,8 +454,19 @@ impl RuntimeProbe {
                     Ok(())
                 }
             })
-        })
-        .await;
+        });
+        let timeout_cancel = cancellation.clone();
+        let wait_cancel = cancellation.clone();
+        let preflight = tokio::select! {
+            result = &mut preflight_task => result,
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                timeout_cancel.cancel();
+                Ok(Err(ProbeError::DeadlineExceeded))
+            }
+            _ = wait_for_probe_cancellation(wait_cancel) => {
+                Ok(Err(ProbeError::Cancelled))
+            }
+        };
         if !matches!(&preflight, Ok(Ok(()))) {
             let preflight_kind = match &preflight {
                 Ok(Err(ProbeError::Cancelled)) => ProbeErrorKind::Cancelled,
@@ -555,6 +574,12 @@ impl RuntimeProbe {
     }
 }
 
+async fn wait_for_probe_cancellation(cancellation: ProbeCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn validate_policy(policy: ProbePolicy) -> Result<(), ProbeError> {
     for (field, invalid) in [
         (
@@ -601,6 +626,7 @@ struct WorkspaceBoundaries {
     runtime_root: DirectoryGuard,
     runtime_dir: DirectoryGuard,
     candidate_guard: DirectoryGuard,
+    project_workspace: DirectoryGuard,
     candidate: PathBuf,
 }
 
@@ -609,7 +635,8 @@ impl WorkspaceBoundaries {
         self.generation_root.revalidate()?;
         self.runtime_root.revalidate()?;
         self.runtime_dir.revalidate()?;
-        self.candidate_guard.revalidate()
+        self.candidate_guard.revalidate()?;
+        self.project_workspace.revalidate()
     }
 }
 
@@ -661,6 +688,7 @@ fn validate_workspace(workspace: &ProbeWorkspace) -> Result<WorkspaceBoundaries,
         runtime_root: DirectoryGuard::open(&runtime_root)?,
         runtime_dir: DirectoryGuard::open(&runtime_dir)?,
         candidate_guard: DirectoryGuard::open(&candidate)?,
+        project_workspace: DirectoryGuard::open(&workspace.project_workspace)?,
         candidate,
     })
 }
@@ -1225,15 +1253,12 @@ fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetTokenInformation,
         IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY,
         TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerSid, WinLocalSystemSid,
-    };
-    use windows::Win32::Storage::FileSystem::{
-        DELETE, FILE_DELETE_CHILD, FILE_GENERIC_WRITE, WRITE_DAC, WRITE_OWNER,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::PCWSTR;
@@ -1307,12 +1332,6 @@ fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
             "untrusted owner",
         ));
     }
-    let write_mask = FILE_GENERIC_WRITE.0
-        | GENERIC_WRITE.0
-        | DELETE.0
-        | FILE_DELETE_CHILD.0
-        | WRITE_DAC.0
-        | WRITE_OWNER.0;
     let ace_count = unsafe { (*dacl).AceCount };
     for index in 0..u32::from(ace_count) {
         let mut raw_ace: *mut c_void = std::ptr::null_mut();
@@ -1337,7 +1356,7 @@ fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
             continue;
         }
         let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
-        if ace.Mask & write_mask == 0 {
+        if !mask_grants_sensitive_write(ace.Mask) {
             continue;
         }
         let sid = PSID((&raw const ace.SidStart).cast_mut().cast::<c_void>());
@@ -1355,6 +1374,23 @@ fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn mask_grants_sensitive_write(mask: u32) -> bool {
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_DELETE_CHILD, FILE_GENERIC_WRITE, WRITE_DAC, WRITE_OWNER,
+    };
+
+    let dangerous = GENERIC_ALL.0
+        | GENERIC_WRITE.0
+        | FILE_GENERIC_WRITE.0
+        | DELETE.0
+        | FILE_DELETE_CHILD.0
+        | WRITE_DAC.0
+        | WRITE_OWNER.0;
+    mask & dangerous != 0
 }
 
 #[cfg(windows)]
@@ -1414,6 +1450,9 @@ fn run_probe_worker(
     if validate_active_snapshot(workspace).is_err() {
         return failed(started, 0, ProbeErrorKind::CandidateRejected);
     }
+    if let Err(kind) = verify_runtime_closure(workspace, deadline, &cancellation) {
+        return failed(started, 0, kind);
+    }
     let prepared = boundaries
         .revalidate()
         .map_err(|_| RuntimeError::InvalidLaunchPath {
@@ -1463,9 +1502,40 @@ fn run_probe_worker(
             elapsed_ms,
         );
     }
+    if let Err(kind) = verify_runtime_closure(workspace, deadline, &cancellation) {
+        // 完整性不一致始终优先；若进程阶段已得到稳定失败类别，则截止/取消仅表示
+        // 复核未能完成，不应把 InvalidWebUi 等更具体的原始结论覆盖掉。
+        if kind == ProbeErrorKind::RuntimeIntegrityFailed || outcome.0.is_none() {
+            return failed(started, outcome.1, kind);
+        }
+    }
     match outcome.0 {
         None => (ProbePhase::Passed, outcome.1, None, elapsed_ms),
         Some(error) => (ProbePhase::Failed, outcome.1, Some(error), elapsed_ms),
+    }
+}
+
+fn verify_runtime_closure(
+    workspace: &ProbeWorkspace,
+    deadline: Instant,
+    cancellation: &ProbeCancellation,
+) -> Result<(), ProbeErrorKind> {
+    // 候选数据的扫描额度与已安装 runtime 的清单额度是两个独立安全域；复核沿用
+    // 安装器的默认上限，避免候选的小额度错误拒绝合法 runtime。
+    let archive_policy = ArchiveInstallPolicy::default();
+    let runtime_dir = workspace.layout.runtime_dir(&workspace.runtime);
+    let result = verify_installed_runtime_inventory(&runtime_dir, archive_policy, || {
+        !cancellation.is_cancelled() && Instant::now() < deadline
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(ArchiveInstallError::InventoryVerificationAborted) if cancellation.is_cancelled() => {
+            Err(ProbeErrorKind::Cancelled)
+        }
+        Err(ArchiveInstallError::InventoryVerificationAborted) => {
+            Err(ProbeErrorKind::ReadinessTimeout)
+        }
+        Err(_) => Err(ProbeErrorKind::RuntimeIntegrityFailed),
     }
 }
 
@@ -1678,9 +1748,11 @@ fn failed(
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::FileGuard;
+    use super::{FileGuard, mask_grants_sensitive_write};
     use std::fs::{self, OpenOptions};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
 
     #[test]
     fn file_guard_denies_in_place_writes_while_identity_is_trusted() {
@@ -1695,5 +1767,19 @@ mod tests {
         assert!(OpenOptions::new().write(true).open(&path).is_err());
         guard.revalidate().expect("same identity");
         assert_eq!(guard.read_bounded(16).expect("read"), b"trusted");
+    }
+
+    #[test]
+    fn dacl_mask_rejects_generic_and_acl_takeover_rights() {
+        for mask in [
+            GENERIC_ALL.0,
+            GENERIC_WRITE.0,
+            WRITE_DAC.0,
+            WRITE_OWNER.0,
+            FILE_DELETE_CHILD.0,
+        ] {
+            assert!(mask_grants_sensitive_write(mask));
+        }
+        assert!(!mask_grants_sensitive_write(1));
     }
 }
