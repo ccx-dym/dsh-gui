@@ -1,4 +1,5 @@
 use crate::paths::RuntimeLayout;
+use crate::runtime::atomic_file::replace_file;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -6,7 +7,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-const DEPLOYMENT_SCHEMA: u32 = 1;
+const LEGACY_DEPLOYMENT_SCHEMA: u32 = 1;
+const DEPLOYMENT_SCHEMA: u32 = 2;
 
 /// 已安装且可被激活的固定 DSH 运行时版本。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +258,30 @@ struct UninstalledDocument {
     changed_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyDeploymentDocument {
+    schema: u32,
+    runtime: LegacyRuntimeDocument,
+    data: DataDocument,
+    activated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRuntimeDocument {
+    version: String,
+    relative_dir: String,
+    manifest_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyActivationSettings {
+    schema: u32,
+    project_workspace: String,
+}
+
 /// 在漫游设置目录维护单一原子 deployment 指针。
 pub struct InstallStateStore {
     layout: RuntimeLayout,
@@ -290,7 +316,10 @@ impl InstallStateStore {
         if raw.get("status").is_some() {
             let document: UninstalledDocument = serde_json::from_value(raw)
                 .map_err(|source| InstallStateError::InvalidJson { source })?;
-            if document.schema != DEPLOYMENT_SCHEMA {
+            if !matches!(
+                document.schema,
+                LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
+            ) {
                 return Err(InstallStateError::UnknownSchema {
                     schema: document.schema,
                 });
@@ -300,44 +329,25 @@ impl InstallStateStore {
             }
             return Err(InstallStateError::UnknownStatus);
         }
-        if let Some(schema) = raw.get("schema").and_then(serde_json::Value::as_u64)
-            && schema != u64::from(DEPLOYMENT_SCHEMA)
-        {
-            return Err(InstallStateError::UnknownSchema {
-                schema: u32::try_from(schema).unwrap_or(u32::MAX),
-            });
+        let schema = raw
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(InstallStateError::UnknownSchema { schema: u32::MAX })?;
+        if !matches!(schema, LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA) {
+            return Err(InstallStateError::UnknownSchema { schema });
         }
-        let document: DeploymentDocument = serde_json::from_value(raw)
+        if let Ok(document) = serde_json::from_value::<DeploymentDocument>(raw.clone()) {
+            return deployment_from_document(document);
+        }
+        if schema != LEGACY_DEPLOYMENT_SCHEMA {
+            let document: DeploymentDocument = serde_json::from_value(raw)
+                .map_err(|source| InstallStateError::InvalidJson { source })?;
+            return deployment_from_document(document);
+        }
+        let legacy: LegacyDeploymentDocument = serde_json::from_value(raw)
             .map_err(|source| InstallStateError::InvalidJson { source })?;
-        if document.schema != DEPLOYMENT_SCHEMA {
-            return Err(InstallStateError::UnknownSchema {
-                schema: document.schema,
-            });
-        }
-
-        let runtime = InstalledRuntime::with_node_version(
-            &document.runtime.version,
-            document.runtime.manifest_digest,
-            &document.runtime.node_version,
-        )?;
-        let data = DataGeneration::new(&document.data.id)?;
-        let project_workspace = validate_project_workspace(Path::new(&document.project_workspace))?;
-        validate_relative_dir(
-            "runtime",
-            &document.runtime.relative_dir,
-            Path::new("dsh").join(runtime.version.to_string()),
-        )?;
-        validate_relative_dir(
-            "data",
-            &document.data.relative_dir,
-            Path::new("generations").join(&data.id),
-        )?;
-        Ok(ActiveDeployment::with_project_workspace(
-            runtime,
-            data,
-            document.activated_at,
-            project_workspace,
-        ))
+        self.load_legacy(legacy)
     }
 
     /// 将 runtime 与 data 配对写入同一个原子激活指针。
@@ -397,7 +407,7 @@ impl InstallStateStore {
         file.sync_all()
             .map_err(|source| io_error("flush", &temporary, source))?;
         drop(file);
-        fs::rename(&temporary, destination)
+        replace_file(&temporary, destination)
             .map_err(|source| io_error("rename", destination, source))?;
         Ok(())
     }
@@ -425,6 +435,126 @@ impl InstallStateStore {
             "deployment-uninstalled.json.tmp",
             &bytes,
         )
+    }
+
+    fn load_legacy(
+        &self,
+        document: LegacyDeploymentDocument,
+    ) -> Result<ActiveDeployment, InstallStateError> {
+        if document.schema != LEGACY_DEPLOYMENT_SCHEMA {
+            return Err(InstallStateError::UnknownSchema {
+                schema: document.schema,
+            });
+        }
+        let version = Version::parse(&document.runtime.version).map_err(|source| {
+            InstallStateError::InvalidVersion {
+                version: document.runtime.version.clone(),
+                source,
+            }
+        })?;
+        validate_relative_dir(
+            "runtime",
+            &document.runtime.relative_dir,
+            Path::new("dsh").join(version.to_string()),
+        )?;
+        let data = DataGeneration::new(&document.data.id)?;
+        validate_relative_dir(
+            "data",
+            &document.data.relative_dir,
+            Path::new("generations").join(&data.id),
+        )?;
+        let node_version =
+            infer_legacy_node_version(&self.layout.runtime_root().join(&document.runtime.version))?;
+        let settings_path = self
+            .layout
+            .deployment_file()
+            .parent()
+            .ok_or(InstallStateError::PathEscape { field: "settings" })?
+            .join("activation-settings.json");
+        let bytes = fs::read(&settings_path).map_err(|source| {
+            io_error("read_legacy_activation_settings", &settings_path, source)
+        })?;
+        let settings: LegacyActivationSettings = serde_json::from_slice(&bytes)
+            .map_err(|source| InstallStateError::InvalidJson { source })?;
+        if settings.schema != LEGACY_DEPLOYMENT_SCHEMA {
+            return Err(InstallStateError::UnknownSchema {
+                schema: settings.schema,
+            });
+        }
+        let runtime = InstalledRuntime::with_node_version(
+            &document.runtime.version,
+            document.runtime.manifest_digest,
+            &node_version,
+        )?;
+        Ok(ActiveDeployment::with_project_workspace(
+            runtime,
+            data,
+            document.activated_at,
+            validate_project_workspace(Path::new(&settings.project_workspace))?,
+        ))
+    }
+}
+
+fn deployment_from_document(
+    document: DeploymentDocument,
+) -> Result<ActiveDeployment, InstallStateError> {
+    if !matches!(
+        document.schema,
+        LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
+    ) {
+        return Err(InstallStateError::UnknownSchema {
+            schema: document.schema,
+        });
+    }
+    let runtime = InstalledRuntime::with_node_version(
+        &document.runtime.version,
+        document.runtime.manifest_digest,
+        &document.runtime.node_version,
+    )?;
+    let data = DataGeneration::new(&document.data.id)?;
+    let project_workspace = validate_project_workspace(Path::new(&document.project_workspace))?;
+    validate_relative_dir(
+        "runtime",
+        &document.runtime.relative_dir,
+        Path::new("dsh").join(runtime.version.to_string()),
+    )?;
+    validate_relative_dir(
+        "data",
+        &document.data.relative_dir,
+        Path::new("generations").join(&data.id),
+    )?;
+    Ok(ActiveDeployment::with_project_workspace(
+        runtime,
+        data,
+        document.activated_at,
+        project_workspace,
+    ))
+}
+
+fn infer_legacy_node_version(runtime_dir: &Path) -> Result<String, InstallStateError> {
+    let mut versions = Vec::new();
+    let entries = fs::read_dir(runtime_dir)
+        .map_err(|source| io_error("read_legacy_runtime", runtime_dir, source))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| io_error("read_legacy_runtime_entry", runtime_dir, source))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(version) = name
+            .strip_prefix("node-v")
+            .and_then(|value| value.strip_suffix("-win-x64"))
+        else {
+            continue;
+        };
+        if Version::parse(version).is_ok() && entry.path().join("node.exe").is_file() {
+            versions.push(version.to_owned());
+        }
+    }
+    if versions.len() == 1 {
+        Ok(versions.remove(0))
+    } else {
+        Err(InstallStateError::MissingDescriptor {
+            field: "legacy_node_version",
+        })
     }
 }
 
@@ -465,7 +595,7 @@ fn write_atomic(
     file.sync_all()
         .map_err(|source| io_error("flush", &temporary, source))?;
     drop(file);
-    fs::rename(&temporary, destination).map_err(|source| io_error("rename", destination, source))
+    replace_file(&temporary, destination).map_err(|source| io_error("rename", destination, source))
 }
 
 fn validate_deployment_directory(
@@ -567,7 +697,7 @@ mod tests {
         let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
         fs::create_dir_all(&paths.settings).expect("settings");
         for json in [
-            r#"{"schema":2,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z"}"#,
+            r#"{"schema":3,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z"}"#,
             r#"{"schema":1,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z","extra":true}"#,
         ] {
             fs::write(paths.settings.join("deployment.json"), json).expect("pointer");
@@ -635,13 +765,59 @@ mod tests {
 
         fs::write(
             paths.settings.join("deployment.json"),
-            br#"{"schema":2,"runtime":{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"data":{"id":"generation-001","relative_dir":"generations/generation-001"},"activated_at":"2026-08-21T09:30:00Z"}"#,
+            br#"{"schema":3,"runtime":{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"data":{"id":"generation-001","relative_dir":"generations/generation-001"},"activated_at":"2026-08-21T09:30:00Z"}"#,
         )
         .expect("应能写入未知 schema JSON");
         assert!(matches!(
             store.load(),
-            Err(InstallStateError::UnknownSchema { schema: 2 })
+            Err(InstallStateError::UnknownSchema { schema: 3 })
         ));
+    }
+
+    #[test]
+    fn legacy_schema_one_loads_from_local_node_and_trusted_workspace_without_network() {
+        let paths = test_paths("legacy-migration");
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        let workspace = paths.dsh_home.join("legacy-workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        fs::create_dir_all(layout.runtime_root().join("1.2.3/node-v24.15.0-win-x64"))
+            .expect("node dir");
+        fs::write(
+            layout
+                .runtime_root()
+                .join("1.2.3/node-v24.15.0-win-x64/node.exe"),
+            b"node",
+        )
+        .expect("node");
+        fs::create_dir_all(layout.generation_root().join("generation-001")).expect("generation");
+        fs::create_dir_all(&paths.settings).expect("settings");
+        fs::write(
+            paths.settings.join("activation-settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "project_workspace": workspace,
+            }))
+            .expect("settings json"),
+        )
+        .expect("settings");
+        fs::write(
+            paths.settings.join("deployment.json"),
+            format!(
+                r#"{{"schema":1,"runtime":{{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"{}"}},"data":{{"id":"generation-001","relative_dir":"generations/generation-001"}},"activated_at":"2026-08-21T09:30:00Z"}}"#,
+                "a".repeat(64)
+            ),
+        )
+        .expect("legacy pointer");
+
+        let loaded = store.load().expect("legacy pointer should migrate offline");
+
+        assert_eq!(loaded.runtime.node_version.to_string(), "24.15.0");
+        assert_eq!(
+            loaded.project_workspace.as_deref(),
+            Some(workspace.as_path())
+        );
     }
 
     #[test]

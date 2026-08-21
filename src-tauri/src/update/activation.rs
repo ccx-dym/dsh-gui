@@ -30,6 +30,7 @@ impl RuntimeBusyProvider for UnknownRuntimeBusyProvider {
 use crate::app_controller::{ActivationSession, ProbeLease};
 use crate::paths::RuntimeLayout;
 use crate::runtime::RuntimeError;
+use crate::runtime::atomic_file::replace_file;
 use crate::runtime::install_state::{
     ActiveDeployment, DataGeneration, InstallStateError, InstallStateStore, InstalledRuntime,
     validate_project_workspace,
@@ -41,13 +42,15 @@ use crate::update::probe::{
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
-const ACTIVATION_SCHEMA: u32 = 1;
+const LEGACY_ACTIVATION_SCHEMA: u32 = 1;
+const ACTIVATION_SCHEMA: u32 = 2;
 const SETTINGS_SCHEMA: u32 = 1;
 const REPARSE_POINT_ATTRIBUTE: u32 = 0x400;
 
@@ -78,6 +81,7 @@ pub enum ActivationCheckpoint {
     PointerCommitted,
     JournalCommitted,
     BeforeFirstStart,
+    RollingBackPersisted,
 }
 
 /// 可注入的崩溃点观察器；生产实现通常是 no-op。
@@ -157,12 +161,42 @@ pub struct ActivationRequest {
 }
 
 /// 激活或单次恢复的稳定终态。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActivationOutcome {
     Activated,
-    RolledBack,
-    FreshInstallFailed,
+    RolledBack { failure: ActivationFailure },
+    FreshInstallFailed { failure: ActivationFailure },
     NothingToRecover,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationFailureStage {
+    TargetStart,
+    RecoveryResume,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationFailure {
+    pub stage: ActivationFailureStage,
+    pub error_code: String,
+}
+
+impl ActivationFailure {
+    fn runtime(stage: ActivationFailureStage, error: &RuntimeError) -> Self {
+        Self {
+            stage,
+            error_code: error.code().to_owned(),
+        }
+    }
+
+    fn interrupted_resume() -> Self {
+        Self {
+            stage: ActivationFailureStage::RecoveryResume,
+            error_code: "activation_interrupted".to_owned(),
+        }
+    }
 }
 
 /// 激活、回滚或崩溃恢复失败。
@@ -170,6 +204,8 @@ pub enum ActivationOutcome {
 pub enum ActivationError {
     #[error("激活 I/O 失败: {0}")]
     Io(#[source] std::io::Error),
+    #[error("激活后台文件任务异常退出")]
+    WorkerFailed,
     #[error("安装状态失败: {0}")]
     InstallState(#[from] InstallStateError),
     #[error("candidate probe 证明无效: {0}")]
@@ -188,8 +224,11 @@ pub enum ActivationError {
     InvalidJournal,
     #[error("activation 在 {checkpoint:?} 被模拟中断")]
     Interrupted { checkpoint: ActivationCheckpoint },
-    #[error("新版与旧版恢复均失败，需要人工恢复")]
-    RecoveryRequired,
+    #[error("新版失败后恢复未完成，需要人工恢复（{failure:?}，recovery={recovery_code}）")]
+    RecoveryRequired {
+        failure: ActivationFailure,
+        recovery_code: String,
+    },
 }
 
 impl ActivationError {
@@ -203,6 +242,7 @@ impl ActivationError {
 enum JournalState {
     Prepared,
     Committed,
+    RollingBack,
     Active,
     RolledBack,
     FreshInstallFailed,
@@ -218,6 +258,8 @@ pub struct ActivationJournal {
     prior: Option<JournalDeployment>,
     target: JournalDeployment,
     state: JournalState,
+    #[serde(default)]
+    failure: Option<ActivationFailure>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -278,11 +320,31 @@ struct ActivationSettings {
 /// 串行准备 candidate、严格 probe、提交 pointer，并在首启失败时回滚配对。
 pub struct RuntimeActivator {
     layout: RuntimeLayout,
-    store: InstallStateStore,
+    store: Arc<dyn DeploymentStore>,
     policy: SnapshotPolicy,
     settings_file: PathBuf,
     journal_root: PathBuf,
     acl: Arc<dyn SnapshotAclInspector>,
+}
+
+trait DeploymentStore: Send + Sync {
+    fn load(&self) -> Result<ActiveDeployment, InstallStateError>;
+    fn save(&self, deployment: &ActiveDeployment) -> Result<(), InstallStateError>;
+    fn mark_uninstalled(&self, changed_at: &str) -> Result<(), InstallStateError>;
+}
+
+impl DeploymentStore for InstallStateStore {
+    fn load(&self) -> Result<ActiveDeployment, InstallStateError> {
+        InstallStateStore::load(self)
+    }
+
+    fn save(&self, deployment: &ActiveDeployment) -> Result<(), InstallStateError> {
+        InstallStateStore::save(self, deployment)
+    }
+
+    fn mark_uninstalled(&self, changed_at: &str) -> Result<(), InstallStateError> {
+        InstallStateStore::mark_uninstalled(self, changed_at)
+    }
 }
 
 trait SnapshotAclInspector: Send + Sync {
@@ -312,7 +374,7 @@ impl RuntimeActivator {
             .settings_dir()
             .map_err(|error| ActivationError::Io(std::io::Error::other(error.to_string())))?;
         Ok(Self {
-            store: InstallStateStore::new(layout.clone()),
+            store: Arc::new(InstallStateStore::new(layout.clone())),
             settings_file: settings.join("activation-settings.json"),
             journal_root: settings.join("activation-journal"),
             layout,
@@ -324,6 +386,12 @@ impl RuntimeActivator {
     #[cfg(test)]
     fn with_acl_inspector(mut self, acl: Arc<dyn SnapshotAclInspector>) -> Self {
         self.acl = acl;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_store(mut self, store: Arc<dyn DeploymentStore>) -> Self {
+        self.store = store;
         self
     }
 
@@ -361,11 +429,12 @@ impl RuntimeActivator {
     /// :raises ActivationError: 快照、probe、pointer、首启或回滚失败时返回。
     pub async fn activate(
         &self,
-        session: &ActivationSession,
+        session: ActivationSession,
         request: ActivationRequest,
         probe: &dyn ActivationProbe,
         checkpoints: &dyn ActivationCheckpointSink,
     ) -> Result<ActivationOutcome, ActivationError> {
+        session.claim_transaction()?;
         let prior = match self.store.load() {
             Ok(value) => Some(value),
             Err(InstallStateError::NotInstalled) => None,
@@ -382,7 +451,8 @@ impl RuntimeActivator {
             None => self.load_trusted_workspace()?,
         };
         validate_project_workspace(&workspace)?;
-        self.prepare_candidate(prior.as_ref(), &request.candidate)?;
+        self.prepare_candidate(prior.as_ref(), &request.candidate)
+            .await?;
         checkpoints.reached(ActivationCheckpoint::CandidatePrepared)?;
 
         probe
@@ -419,6 +489,7 @@ impl RuntimeActivator {
                 .transpose()?,
             target: JournalDeployment::from_active(&target)?,
             state: JournalState::Prepared,
+            failure: None,
         };
         self.write_journal(&journal)?;
         checkpoints.reached(ActivationCheckpoint::JournalPrepared)?;
@@ -428,13 +499,25 @@ impl RuntimeActivator {
         self.write_journal(&journal)?;
         checkpoints.reached(ActivationCheckpoint::JournalCommitted)?;
         checkpoints.reached(ActivationCheckpoint::BeforeFirstStart)?;
-        match session.start_and_wait_ready(&self.store, &target) {
+        let committed = self.store.load()?;
+        match session.start_and_wait_ready(&committed, &target).await {
             Ok(()) => {
                 journal.state = JournalState::Active;
                 self.write_journal(&journal)?;
                 Ok(ActivationOutcome::Activated)
             }
-            Err(_) => self.rollback_failed_start(session, &mut journal, prior.as_ref()),
+            Err(error) => {
+                let failure =
+                    ActivationFailure::runtime(ActivationFailureStage::TargetStart, &error);
+                self.rollback_failed_start(
+                    &session,
+                    &mut journal,
+                    prior.as_ref(),
+                    failure,
+                    Some(checkpoints),
+                )
+                .await
+            }
         }
     }
 
@@ -443,13 +526,23 @@ impl RuntimeActivator {
     /// :param session: 启动阶段取得的独占激活会话。
     /// :return: 恢复 target/prior、fresh 未激活或无待恢复事务的终态。
     /// :raises ActivationError: journal/pointer 不一致或恢复启动失败时返回。
-    pub fn recover(
+    pub async fn recover(
         &self,
-        session: &ActivationSession,
+        session: ActivationSession,
     ) -> Result<ActivationOutcome, ActivationError> {
+        session.claim_transaction()?;
         let Some(mut journal) = self.load_pending_journal()? else {
             return Ok(ActivationOutcome::NothingToRecover);
         };
+        if journal.state == JournalState::RecoveryRequired {
+            return Err(ActivationError::RecoveryRequired {
+                failure: journal
+                    .failure
+                    .clone()
+                    .unwrap_or_else(ActivationFailure::interrupted_resume),
+                recovery_code: "persisted_recovery_required".to_owned(),
+            });
+        }
         let target = journal.target.clone().into_active()?;
         let prior = journal
             .prior
@@ -461,62 +554,143 @@ impl RuntimeActivator {
             Err(InstallStateError::NotInstalled) => None,
             Err(error) => return Err(error.into()),
         };
+        if journal.state == JournalState::RollingBack {
+            let failure = journal
+                .failure
+                .clone()
+                .unwrap_or_else(ActivationFailure::interrupted_resume);
+            return self
+                .resume_rollback(&session, &mut journal, prior.as_ref(), failure)
+                .await;
+        }
         if current.as_ref() == Some(&target) {
-            return match session.start_and_wait_ready(&self.store, &target) {
+            return match session
+                .start_and_wait_ready(current.as_ref().expect("target checked"), &target)
+                .await
+            {
                 Ok(()) => {
                     journal.state = JournalState::Active;
                     self.write_journal(&journal)?;
                     Ok(ActivationOutcome::Activated)
                 }
-                Err(_) => self.rollback_failed_start(session, &mut journal, prior.as_ref()),
+                Err(error) => {
+                    let failure =
+                        ActivationFailure::runtime(ActivationFailureStage::RecoveryResume, &error);
+                    self.rollback_failed_start(
+                        &session,
+                        &mut journal,
+                        prior.as_ref(),
+                        failure,
+                        None,
+                    )
+                    .await
+                }
             };
         }
         if current == prior {
             if let Some(old) = &prior {
-                if session.start_and_wait_ready(&self.store, old).is_err() {
-                    journal.state = JournalState::RecoveryRequired;
-                    self.write_journal(&journal)?;
-                    return Err(ActivationError::RecoveryRequired);
+                let actual = self.store.load()?;
+                if let Err(error) = session.start_and_wait_ready(&actual, old).await {
+                    let failure =
+                        ActivationFailure::runtime(ActivationFailureStage::RecoveryResume, &error);
+                    return Err(self.recovery_required(
+                        &mut journal,
+                        failure,
+                        "prior_start_failed",
+                    ));
                 }
                 journal.state = JournalState::RolledBack;
                 self.write_journal(&journal)?;
-                return Ok(ActivationOutcome::RolledBack);
+                return Ok(ActivationOutcome::RolledBack {
+                    failure: journal
+                        .failure
+                        .clone()
+                        .unwrap_or_else(ActivationFailure::interrupted_resume),
+                });
             }
             journal.state = JournalState::FreshInstallFailed;
             self.write_journal(&journal)?;
-            return Ok(ActivationOutcome::FreshInstallFailed);
+            return Ok(ActivationOutcome::FreshInstallFailed {
+                failure: journal
+                    .failure
+                    .clone()
+                    .unwrap_or_else(ActivationFailure::interrupted_resume),
+            });
         }
-        journal.state = JournalState::RecoveryRequired;
-        self.write_journal(&journal)?;
-        Err(ActivationError::RecoveryRequired)
+        let failure = journal
+            .failure
+            .clone()
+            .unwrap_or_else(ActivationFailure::interrupted_resume);
+        Err(self.recovery_required(&mut journal, failure, "pointer_mismatch"))
     }
 
-    fn rollback_failed_start(
+    async fn rollback_failed_start(
         &self,
         session: &ActivationSession,
         journal: &mut ActivationJournal,
         prior: Option<&ActiveDeployment>,
+        failure: ActivationFailure,
+        checkpoints: Option<&dyn ActivationCheckpointSink>,
     ) -> Result<ActivationOutcome, ActivationError> {
-        if session.stop().is_err() {
-            journal.state = JournalState::RecoveryRequired;
-            self.write_journal(journal)?;
-            return Err(ActivationError::RecoveryRequired);
+        journal.state = JournalState::RollingBack;
+        journal.failure = Some(failure.clone());
+        self.write_journal(journal)?;
+        if let Some(checkpoints) = checkpoints {
+            checkpoints.reached(ActivationCheckpoint::RollingBackPersisted)?;
+        }
+        self.resume_rollback(session, journal, prior, failure).await
+    }
+
+    async fn resume_rollback(
+        &self,
+        session: &ActivationSession,
+        journal: &mut ActivationJournal,
+        prior: Option<&ActiveDeployment>,
+        failure: ActivationFailure,
+    ) -> Result<ActivationOutcome, ActivationError> {
+        if session.stop().await.is_err() {
+            return Err(self.recovery_required(journal, failure, "target_stop_failed"));
         }
         if let Some(old) = prior {
-            self.store.save(old)?;
-            if session.start_and_wait_ready(&self.store, old).is_err() {
-                journal.state = JournalState::RecoveryRequired;
-                self.write_journal(journal)?;
-                return Err(ActivationError::RecoveryRequired);
+            if self.store.save(old).is_err() {
+                return Err(self.recovery_required(journal, failure, "pointer_restore_failed"));
+            }
+            let actual = self.store.load()?;
+            if session.start_and_wait_ready(&actual, old).await.is_err() {
+                return Err(self.recovery_required(journal, failure, "prior_start_failed"));
             }
             journal.state = JournalState::RolledBack;
             self.write_journal(journal)?;
-            Ok(ActivationOutcome::RolledBack)
+            Ok(ActivationOutcome::RolledBack { failure })
         } else {
-            self.store.mark_uninstalled(&journal.target.activated_at)?;
+            if self
+                .store
+                .mark_uninstalled(&journal.target.activated_at)
+                .is_err()
+            {
+                return Err(self.recovery_required(journal, failure, "mark_uninstalled_failed"));
+            }
             journal.state = JournalState::FreshInstallFailed;
             self.write_journal(journal)?;
-            Ok(ActivationOutcome::FreshInstallFailed)
+            Ok(ActivationOutcome::FreshInstallFailed { failure })
+        }
+    }
+
+    fn recovery_required(
+        &self,
+        journal: &mut ActivationJournal,
+        failure: ActivationFailure,
+        recovery_code: &str,
+    ) -> ActivationError {
+        journal.state = JournalState::RecoveryRequired;
+        journal.failure = Some(failure.clone());
+        let code = match self.write_journal(journal) {
+            Ok(()) => recovery_code.to_owned(),
+            Err(_) => format!("{recovery_code}:journal_persist_failed"),
+        };
+        ActivationError::RecoveryRequired {
+            failure,
+            recovery_code: code,
         }
     }
 
@@ -530,40 +704,60 @@ impl RuntimeActivator {
         validate_project_workspace(Path::new(&document.project_workspace)).map_err(Into::into)
     }
 
-    fn prepare_candidate(
+    async fn prepare_candidate(
         &self,
         prior: Option<&ActiveDeployment>,
         candidate: &DataGeneration,
     ) -> Result<(), ActivationError> {
-        fs::create_dir_all(self.layout.generation_root()).map_err(ActivationError::io)?;
-        validate_plain_dir(self.layout.generation_root())?;
-        let canonical_root = self
-            .layout
-            .generation_root()
-            .canonicalize()
-            .map_err(ActivationError::io)?;
-        let target = self.layout.generation_dir(candidate);
-        if fs::symlink_metadata(&target).is_ok() {
-            return Err(ActivationError::CandidateAlreadyExists);
-        }
-        if let Some(prior) = prior {
-            let source = self.layout.generation_dir(&prior.data);
-            let canonical_source = source.canonicalize().map_err(ActivationError::io)?;
-            if canonical_source.parent() != Some(canonical_root.as_path()) {
-                return Err(ActivationError::UnsafeSnapshot);
-            }
-            copy_generation(&source, &target, self.policy, self.acl.as_ref())?;
-        } else {
-            fs::create_dir(&target).map_err(ActivationError::io)?;
-            self.acl.ensure_private(&target)?;
-        }
-        let canonical_target = target.canonicalize().map_err(ActivationError::io)?;
-        if canonical_target.parent() != Some(canonical_root.as_path()) {
+        let layout = self.layout.clone();
+        let prior = prior.cloned();
+        let candidate = candidate.clone();
+        let policy = self.policy;
+        let acl = Arc::clone(&self.acl);
+        tokio::task::spawn_blocking(move || {
+            prepare_candidate_blocking(&layout, prior.as_ref(), &candidate, policy, acl.as_ref())
+        })
+        .await
+        .map_err(|_| ActivationError::WorkerFailed)?
+    }
+}
+
+fn prepare_candidate_blocking(
+    layout: &RuntimeLayout,
+    prior: Option<&ActiveDeployment>,
+    candidate: &DataGeneration,
+    policy: SnapshotPolicy,
+    acl: &dyn SnapshotAclInspector,
+) -> Result<(), ActivationError> {
+    fs::create_dir_all(layout.generation_root()).map_err(ActivationError::io)?;
+    validate_plain_dir(layout.generation_root())?;
+    let canonical_root = layout
+        .generation_root()
+        .canonicalize()
+        .map_err(ActivationError::io)?;
+    let target = layout.generation_dir(candidate);
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(ActivationError::CandidateAlreadyExists);
+    }
+    if let Some(prior) = prior {
+        let source = layout.generation_dir(&prior.data);
+        let canonical_source = source.canonicalize().map_err(ActivationError::io)?;
+        if canonical_source.parent() != Some(canonical_root.as_path()) {
             return Err(ActivationError::UnsafeSnapshot);
         }
-        Ok(())
+        copy_generation(&source, &target, policy, acl)?;
+    } else {
+        fs::create_dir(&target).map_err(ActivationError::io)?;
+        acl.ensure_private(&target)?;
     }
+    let canonical_target = target.canonicalize().map_err(ActivationError::io)?;
+    if canonical_target.parent() != Some(canonical_root.as_path()) {
+        return Err(ActivationError::UnsafeSnapshot);
+    }
+    Ok(())
+}
 
+impl RuntimeActivator {
     fn journal_path(&self, activation_id: &str) -> Result<PathBuf, ActivationError> {
         let safe = !activation_id.is_empty()
             && activation_id
@@ -601,18 +795,24 @@ impl RuntimeActivator {
             let bytes = fs::read(entry.path()).map_err(ActivationError::io)?;
             let journal: ActivationJournal =
                 serde_json::from_slice(&bytes).map_err(|_| ActivationError::InvalidJournal)?;
-            if journal.schema != ACTIVATION_SCHEMA {
+            if !matches!(journal.schema, LEGACY_ACTIVATION_SCHEMA | ACTIVATION_SCHEMA) {
                 return Err(ActivationError::InvalidJournal);
             }
             if matches!(
                 journal.state,
-                JournalState::Prepared | JournalState::Committed
+                JournalState::Prepared
+                    | JournalState::Committed
+                    | JournalState::RollingBack
+                    | JournalState::RecoveryRequired
             ) {
                 pending.push(journal);
             }
         }
         if pending.len() > 1 {
-            return Err(ActivationError::RecoveryRequired);
+            return Err(ActivationError::RecoveryRequired {
+                failure: ActivationFailure::interrupted_resume(),
+                recovery_code: "multiple_pending_journals".to_owned(),
+            });
         }
         Ok(pending.pop())
     }
@@ -635,7 +835,7 @@ fn atomic_json_write<T: Serialize>(
     file.write_all(&bytes).map_err(ActivationError::io)?;
     file.sync_all().map_err(ActivationError::io)?;
     drop(file);
-    fs::rename(&temporary, destination).map_err(ActivationError::io)
+    replace_file(&temporary, destination).map_err(ActivationError::io)
 }
 
 fn copy_generation(
@@ -655,6 +855,7 @@ fn copy_generation(
     }
     fs::create_dir(target).map_err(ActivationError::io)?;
     acl.ensure_private(target)?;
+    let mut names = SnapshotPathRegistry::default();
     let mut stack = vec![(source.to_path_buf(), target.to_path_buf())];
     while let Some((from, to)) = stack.pop() {
         for entry in fs::read_dir(&from).map_err(ActivationError::io)? {
@@ -663,6 +864,11 @@ fn copy_generation(
             if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
                 return Err(ActivationError::UnsafeSnapshot);
             }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(source)
+                .map_err(|_| ActivationError::UnsafeSnapshot)?;
+            names.register(relative)?;
             let destination = to.join(entry.file_name());
             if metadata.is_dir() {
                 fs::create_dir(&destination).map_err(ActivationError::io)?;
@@ -686,6 +892,7 @@ fn measure_generation(
 ) -> Result<(u64, u64), ActivationError> {
     let mut files = 0_u64;
     let mut bytes = 0_u64;
+    let mut names = SnapshotPathRegistry::default();
     let mut stack = vec![source.to_path_buf()];
     while let Some(directory) = stack.pop() {
         for entry in fs::read_dir(directory).map_err(ActivationError::io)? {
@@ -694,8 +901,13 @@ fn measure_generation(
             if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
                 return Err(ActivationError::UnsafeSnapshot);
             }
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(source)
+                .map_err(|_| ActivationError::UnsafeSnapshot)?;
+            names.register(relative)?;
             if metadata.is_dir() {
-                stack.push(entry.path());
+                stack.push(path);
             } else if metadata.is_file() && !has_multiple_links(&entry.path()) {
                 files = files.saturating_add(1);
                 bytes = bytes.saturating_add(metadata.len());
@@ -708,6 +920,35 @@ fn measure_generation(
         }
     }
     Ok((files, bytes))
+}
+
+#[derive(Default)]
+struct SnapshotPathRegistry {
+    folded: HashSet<String>,
+}
+
+impl SnapshotPathRegistry {
+    fn register(&mut self, relative: &Path) -> Result<(), ActivationError> {
+        let mut folded = String::new();
+        for component in relative.components() {
+            let std::path::Component::Normal(value) = component else {
+                return Err(ActivationError::UnsafeSnapshot);
+            };
+            let value = value.to_str().ok_or(ActivationError::UnsafeSnapshot)?;
+            // NTFS ADS 与 Win32 尾随点/空格会产生不同名称映射，快照必须拒绝。
+            if value.contains(':') || value.ends_with('.') || value.ends_with(' ') {
+                return Err(ActivationError::UnsafeSnapshot);
+            }
+            if !folded.is_empty() {
+                folded.push('/');
+            }
+            folded.push_str(&value.to_lowercase());
+        }
+        if folded.is_empty() || !self.folded.insert(folded) {
+            return Err(ActivationError::UnsafeSnapshot);
+        }
+        Ok(())
+    }
 }
 
 fn validate_plain_dir(path: &Path) -> Result<(), ActivationError> {
@@ -795,7 +1036,7 @@ fn available_bytes(_path: &Path) -> Result<u64, ActivationError> {
 mod tests {
     use super::{
         ActivationCheckpoint, ActivationCheckpointSink, ActivationOutcome, ActivationProbe,
-        ActivationRequest, RuntimeActivator, SnapshotPolicy,
+        ActivationRequest, RuntimeActivator, SnapshotPathRegistry, SnapshotPolicy,
     };
     use crate::app_controller::{AppController, ProbeLease, RuntimeLifecycle};
     use crate::paths::{AppPaths, RuntimeLayout};
@@ -808,7 +1049,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct Fixture {
         layout: RuntimeLayout,
@@ -942,8 +1183,66 @@ mod tests {
 
     struct PermissiveAcl;
 
+    struct SlowAcl;
+
+    struct ConfirmedIdleProvider;
+
+    struct FailingDeploymentStore {
+        inner: InstallStateStore,
+        fail_restore_version: Option<String>,
+        fail_mark_uninstalled: bool,
+    }
+
+    impl super::DeploymentStore for FailingDeploymentStore {
+        fn load(&self) -> Result<ActiveDeployment, InstallStateError> {
+            self.inner.load()
+        }
+
+        fn save(&self, deployment: &ActiveDeployment) -> Result<(), InstallStateError> {
+            if self.fail_restore_version.as_deref() == Some(&deployment.runtime.version.to_string())
+            {
+                return Err(InstallStateError::Io {
+                    operation: "injected pointer restore",
+                    path: PathBuf::from("deployment.json"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected failure",
+                    ),
+                });
+            }
+            self.inner.save(deployment)
+        }
+
+        fn mark_uninstalled(&self, changed_at: &str) -> Result<(), InstallStateError> {
+            if self.fail_mark_uninstalled {
+                return Err(InstallStateError::Io {
+                    operation: "injected mark uninstalled",
+                    path: PathBuf::from("deployment.json"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected failure",
+                    ),
+                });
+            }
+            self.inner.mark_uninstalled(changed_at)
+        }
+    }
+
+    impl super::RuntimeBusyProvider for ConfirmedIdleProvider {
+        fn quiesce(&self) -> super::RuntimeBusyState {
+            super::RuntimeBusyState::ConfirmedIdle
+        }
+    }
+
     impl super::SnapshotAclInspector for PermissiveAcl {
         fn ensure_private(&self, _path: &Path) -> Result<(), super::ActivationError> {
+            Ok(())
+        }
+    }
+
+    impl super::SnapshotAclInspector for SlowAcl {
+        fn ensure_private(&self, _path: &Path) -> Result<(), super::ActivationError> {
+            std::thread::sleep(Duration::from_millis(150));
             Ok(())
         }
     }
@@ -967,7 +1266,7 @@ mod tests {
     }
 
     fn controller(runtime: Arc<RecordingRuntime>) -> AppController {
-        AppController::for_test_with_busy(runtime, Arc::new(super::UnknownRuntimeBusyProvider))
+        AppController::for_test_with_busy(runtime, Arc::new(ConfirmedIdleProvider))
     }
 
     fn activator(fixture: &Fixture) -> RuntimeActivator {
@@ -988,7 +1287,7 @@ mod tests {
             .begin_activation()
             .expect("session");
         let outcome = activator(&fixture)
-            .activate(&session, fixture.request(), &PassedProbe, &NoCrash)
+            .activate(session, fixture.request(), &PassedProbe, &NoCrash)
             .await
             .expect("activation");
 
@@ -1021,11 +1320,15 @@ mod tests {
             .expect("session");
 
         let outcome = activator(&fixture)
-            .activate(&session, fixture.request(), &PassedProbe, &NoCrash)
+            .activate(session, fixture.request(), &PassedProbe, &NoCrash)
             .await
             .expect("controlled rollback");
 
-        assert_eq!(outcome, ActivationOutcome::RolledBack);
+        assert!(matches!(
+            outcome,
+            ActivationOutcome::RolledBack { ref failure }
+                if failure.error_code == "tauri_error"
+        ));
         assert_eq!(
             InstallStateStore::new(fixture.layout.clone())
                 .load()
@@ -1043,6 +1346,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_after_rolling_back_journal_never_restarts_failed_candidate() {
+        let fixture = Fixture::new("rolling-back-recover", true);
+        let runtime = Arc::new(RecordingRuntime::default());
+        *runtime.fail_version.lock().expect("fail version") =
+            Some(fixture.new_runtime.version.to_string());
+        let app = controller(runtime.clone());
+        let session = app.begin_activation().expect("session");
+        let activator = activator(&fixture);
+
+        assert!(matches!(
+            activator
+                .activate(
+                    session,
+                    fixture.request(),
+                    &PassedProbe,
+                    &CrashAt(ActivationCheckpoint::RollingBackPersisted),
+                )
+                .await,
+            Err(super::ActivationError::Interrupted { .. })
+        ));
+        let recovery = app.begin_activation().expect("recovery session");
+        assert!(matches!(
+            activator
+                .recover(recovery)
+                .await
+                .expect("rollback recovery"),
+            ActivationOutcome::RolledBack { .. }
+        ));
+        assert_eq!(
+            runtime.calls.lock().expect("calls").as_slice(),
+            [
+                "start:0.1.2:generation-new",
+                "stop",
+                "start:0.1.1-rc.1:generation-old"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_restore_failure_persists_recovery_required_for_next_start() {
+        let fixture = Fixture::new("restore-persist-failure", true);
+        let runtime = Arc::new(RecordingRuntime::default());
+        *runtime.fail_version.lock().expect("fail version") =
+            Some(fixture.new_runtime.version.to_string());
+        let app = controller(runtime);
+        let session = app.begin_activation().expect("session");
+        let store = Arc::new(FailingDeploymentStore {
+            inner: InstallStateStore::new(fixture.layout.clone()),
+            fail_restore_version: Some(fixture.old.runtime.version.to_string()),
+            fail_mark_uninstalled: false,
+        });
+        let activator = activator(&fixture).with_store(store);
+
+        let error = activator
+            .activate(session, fixture.request(), &PassedProbe, &NoCrash)
+            .await
+            .expect_err("restore must fail closed");
+        assert!(matches!(
+            error,
+            super::ActivationError::RecoveryRequired { ref recovery_code, .. }
+                if recovery_code == "pointer_restore_failed"
+        ));
+        let recovery = app.begin_activation().expect("recovery session");
+        assert!(matches!(
+            activator.recover(recovery).await,
+            Err(super::ActivationError::RecoveryRequired { ref recovery_code, .. })
+                if recovery_code == "persisted_recovery_required"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_uninstalled_pointer_failure_persists_recovery_required() {
+        let fixture = Fixture::new("fresh-persist-failure", false);
+        let runtime = Arc::new(RecordingRuntime::default());
+        *runtime.fail_version.lock().expect("fail version") =
+            Some(fixture.new_runtime.version.to_string());
+        let app = controller(runtime);
+        let session = app.begin_activation().expect("session");
+        let store = Arc::new(FailingDeploymentStore {
+            inner: InstallStateStore::new(fixture.layout.clone()),
+            fail_restore_version: None,
+            fail_mark_uninstalled: true,
+        });
+        let activator = activator(&fixture).with_store(store);
+
+        assert!(matches!(
+            activator
+                .activate(session, fixture.request(), &PassedProbe, &NoCrash)
+                .await,
+            Err(super::ActivationError::RecoveryRequired { ref recovery_code, .. })
+                if recovery_code == "mark_uninstalled_failed"
+        ));
+        let recovery = app.begin_activation().expect("recovery session");
+        assert!(matches!(
+            activator.recover(recovery).await,
+            Err(super::ActivationError::RecoveryRequired { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn fresh_install_failure_keeps_runtime_and_generation_but_persists_uninstalled() {
         let fixture = Fixture::new("fresh", false);
         let runtime = Arc::new(RecordingRuntime::default());
@@ -1052,11 +1455,15 @@ mod tests {
         let session = app.begin_activation().expect("session");
         let activator = activator(&fixture);
         let outcome = activator
-            .activate(&session, fixture.request(), &PassedProbe, &NoCrash)
+            .activate(session, fixture.request(), &PassedProbe, &NoCrash)
             .await
             .expect("fresh failure is controlled");
 
-        assert_eq!(outcome, ActivationOutcome::FreshInstallFailed);
+        assert!(matches!(
+            outcome,
+            ActivationOutcome::FreshInstallFailed { ref failure }
+                if failure.error_code == "tauri_error"
+        ));
         assert!(matches!(
             InstallStateStore::new(fixture.layout.clone()).load(),
             Err(InstallStateError::NotInstalled)
@@ -1067,10 +1474,9 @@ mod tests {
             runtime.calls.lock().expect("calls").as_slice(),
             ["start:0.1.2:generation-new", "stop"]
         );
-        drop(session);
         let offline = app.begin_activation().expect("offline session");
         assert_eq!(
-            activator.recover(&offline).expect("terminal journal"),
+            activator.recover(offline).await.expect("terminal journal"),
             ActivationOutcome::NothingToRecover
         );
     }
@@ -1085,11 +1491,14 @@ mod tests {
             .expect("session");
 
         let error = activator(&fixture)
-            .activate(&session, fixture.request(), &PassedProbe, &NoCrash)
+            .activate(session, fixture.request(), &PassedProbe, &NoCrash)
             .await
             .expect_err("new and old startup failure requires recovery");
 
-        assert!(matches!(error, super::ActivationError::RecoveryRequired));
+        assert!(matches!(
+            error,
+            super::ActivationError::RecoveryRequired { .. }
+        ));
         assert_eq!(
             InstallStateStore::new(fixture.layout.clone())
                 .load()
@@ -1106,8 +1515,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_refuses_to_start_when_authoritative_pointer_is_not_exact_target() {
+    #[tokio::test]
+    async fn session_refuses_to_start_when_authoritative_pointer_is_not_exact_target() {
         let fixture = Fixture::new("pointer-reload", true);
         let runtime = Arc::new(RecordingRuntime::default());
         let session = controller(runtime.clone())
@@ -1120,8 +1529,11 @@ mod tests {
             fixture.workspace,
         );
 
+        let actual = InstallStateStore::new(fixture.layout)
+            .load()
+            .expect("prior");
         assert!(matches!(
-            session.start_and_wait_ready(&InstallStateStore::new(fixture.layout), &target),
+            session.start_and_wait_ready(&actual, &target).await,
             Err(RuntimeError::DeploymentChanged)
         ));
         assert!(runtime.calls.lock().expect("calls").is_empty());
@@ -1136,7 +1548,7 @@ mod tests {
         let activator = activator(&fixture);
         let error = activator
             .activate(
-                &session,
+                session,
                 fixture.request(),
                 &PassedProbe,
                 &CrashAt(ActivationCheckpoint::PointerCommitted),
@@ -1144,11 +1556,9 @@ mod tests {
             .await
             .expect_err("simulated crash");
         assert!(matches!(error, super::ActivationError::Interrupted { .. }));
-        drop(session);
-
         let recovery = app.begin_activation().expect("recovery session");
         assert_eq!(
-            activator.recover(&recovery).expect("recover target"),
+            activator.recover(recovery).await.expect("recover target"),
             ActivationOutcome::Activated
         );
         let active = InstallStateStore::new(fixture.layout.clone())
@@ -1170,7 +1580,7 @@ mod tests {
         assert!(matches!(
             activator
                 .activate(
-                    &session,
+                    session,
                     fixture.request(),
                     &PassedProbe,
                     &CrashAt(ActivationCheckpoint::JournalPrepared),
@@ -1184,13 +1594,12 @@ mod tests {
                 .expect("prior"),
             fixture.old
         );
-        drop(session);
-
         let recovery = app.begin_activation().expect("recovery session");
-        assert_eq!(
-            activator.recover(&recovery).expect("recover prior"),
-            ActivationOutcome::RolledBack
-        );
+        assert!(matches!(
+            activator.recover(recovery).await.expect("recover prior"),
+            ActivationOutcome::RolledBack { ref failure }
+                if failure.error_code == "activation_interrupted"
+        ));
         assert_eq!(
             runtime.calls.lock().expect("calls").as_slice(),
             ["start:0.1.1-rc.1:generation-old"]
@@ -1207,7 +1616,7 @@ mod tests {
         assert!(matches!(
             activator
                 .activate(
-                    &session,
+                    session,
                     fixture.request(),
                     &PassedProbe,
                     &CrashAt(ActivationCheckpoint::BeforeFirstStart),
@@ -1215,12 +1624,11 @@ mod tests {
                 .await,
             Err(super::ActivationError::Interrupted { .. })
         ));
-        drop(session);
-
         let recovery = app.begin_activation().expect("recovery session");
         assert_eq!(
             activator
-                .recover(&recovery)
+                .recover(recovery)
+                .await
                 .expect("recover committed target"),
             ActivationOutcome::Activated
         );
@@ -1248,7 +1656,7 @@ mod tests {
 
         assert!(matches!(
             activator
-                .activate(&session, fixture.request(), &PassedProbe, &NoCrash)
+                .activate(session, fixture.request(), &PassedProbe, &NoCrash)
                 .await,
             Err(super::ActivationError::SnapshotLimit)
         ));
@@ -1258,5 +1666,44 @@ mod tests {
                 .expect("prior"),
             fixture.old
         );
+    }
+
+    #[tokio::test]
+    async fn large_snapshot_work_does_not_block_tokio_worker() {
+        let fixture = Fixture::new("async-snapshot", true);
+        let runtime = Arc::new(RecordingRuntime::default());
+        let session = controller(runtime).begin_activation().expect("session");
+        let activator = activator(&fixture).with_acl_inspector(Arc::new(SlowAcl));
+        let started = Instant::now();
+        let mut activation =
+            Box::pin(activator.activate(session, fixture.request(), &PassedProbe, &NoCrash));
+
+        tokio::select! {
+            result = &mut activation => panic!("blocking snapshot completed too early: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(
+            activation.await.expect("activation"),
+            ActivationOutcome::Activated
+        );
+    }
+
+    #[test]
+    fn snapshot_names_reject_ads_and_windows_case_folded_collisions() {
+        let mut names = SnapshotPathRegistry::default();
+        names
+            .register(Path::new("Data/File.txt"))
+            .expect("first spelling");
+        assert!(matches!(
+            names.register(Path::new("data/file.TXT")),
+            Err(super::ActivationError::UnsafeSnapshot)
+        ));
+
+        let mut names = SnapshotPathRegistry::default();
+        assert!(matches!(
+            names.register(Path::new("secret.txt:stream")),
+            Err(super::ActivationError::UnsafeSnapshot)
+        ));
     }
 }
