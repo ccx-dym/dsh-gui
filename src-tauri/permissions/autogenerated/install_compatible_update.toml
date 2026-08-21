@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-install-compatible-update"
+description = "Enables the install_compatible_update command without any pre-configured scope."
+commands.allow = ["install_compatible_update"]
+
+[[permission]]
+identifier = "deny-install-compatible-update"
+description = "Denies the install_compatible_update command without any pre-configured scope."
+commands.deny = ["install_compatible_update"]

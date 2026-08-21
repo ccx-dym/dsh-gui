@@ -644,6 +644,15 @@ impl AppController {
         self.runtime.start()
     }
 
+    /// 从权威 deployment pointer 启动正式运行时。
+    ///
+    /// :return: 启动任务成功提交时返回。
+    /// :raises RuntimeError: 当前已有生命周期操作或 pointer/运行时无效时返回。
+    pub fn start_active_runtime(&self) -> Result<(), RuntimeError> {
+        let _guard = self.acquire_operation()?;
+        self.runtime.start()
+    }
+
     /// 失败后重新构造端口与模拟启动参数并提交后台启动。
     ///
     /// :return: 新启动任务成功提交时返回 `Ok(())`。

@@ -1,3 +1,13 @@
 fn main() {
-    tauri_build::build();
+    const COMMANDS: &[&str] = &[
+        "get_runtime_status",
+        "retry_runtime",
+        "get_update_state",
+        "check_updates",
+        "install_compatible_update",
+        "confirm_activation",
+    ];
+    let attributes = tauri_build::Attributes::new()
+        .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
+    tauri_build::try_build(attributes).expect("Tauri 构建配置必须有效");
 }

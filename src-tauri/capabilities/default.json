@@ -3,6 +3,15 @@
   "identifier": "local-main",
   "description": "本地启动页的最小窗口权限",
   "local": true,
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "windows": ["main", "updates"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-runtime-status",
+    "allow-retry-runtime",
+    "allow-get-update-state",
+    "allow-check-updates",
+    "allow-install-compatible-update",
+    "allow-confirm-activation"
+  ]
 }

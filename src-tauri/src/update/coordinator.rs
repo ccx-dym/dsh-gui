@@ -383,7 +383,7 @@ impl UpdateCoordinator {
             }
         };
         let key = notification_key(&self.channel, &notice);
-        let should_notify = state.notification_keys.insert(key);
+        let should_notify = insert_bounded_notification_key(&mut state.notification_keys, key);
         // 只有明确的可用状态才把受信 artifact 交给后续安装流程；等待、失败或已是
         // 最新时即使 endpoint 返回了旧/不相关清单，也不能形成旁路安装授权。
         let installable_manifest = if matches!(notice, UpdateNotice::CompatibleAvailable { .. }) {
@@ -484,6 +484,23 @@ impl UpdateCoordinator {
             Ok(self.time.now_epoch_secs()? >= state.next_check_epoch_secs)
         })
     }
+
+    /// 系统通知无法提交时释放对应去重键，允许下次检查重试。
+    ///
+    /// :param notice: 本次检查产生且尚未成功交付的类型化通知。
+    /// :return: 去重状态原子保存完成时返回。
+    /// :raises UpdateStateError: 状态读取、时钟或文件保存失败时返回。
+    pub async fn release_notification(
+        &self,
+        notice: &UpdateNotice,
+    ) -> Result<(), UpdateStateError> {
+        let _guard = self.check_lock.lock().await;
+        let mut state = self.state_store.load().await?;
+        state
+            .notification_keys
+            .remove(&notification_key(&self.channel, notice));
+        self.state_store.save(&state).await
+    }
 }
 
 fn failed_notice(
@@ -560,6 +577,18 @@ fn notification_key(channel: &str, notice: &UpdateNotice) -> String {
         }
     };
     format!("{channel}:{version}:{status}")
+}
+
+fn insert_bounded_notification_key(keys: &mut BTreeSet<String>, key: String) -> bool {
+    const MAX_NOTIFICATION_KEYS: usize = 128;
+    if keys.contains(&key) {
+        return false;
+    }
+    if keys.len() >= MAX_NOTIFICATION_KEYS {
+        // key 不含隐私数据；按稳定字典序回收一项即可维持磁盘与解析上限。
+        keys.pop_first();
+    }
+    keys.insert(key)
 }
 
 #[cfg(windows)]
@@ -765,6 +794,22 @@ mod tests {
     }
 
     #[test]
+    fn notification_keys_remain_bounded_while_new_state_can_notify() {
+        let mut keys = (0..128)
+            .map(|index| format!("stable:1.0.{index}:compatible_available"))
+            .collect::<BTreeSet<_>>();
+        assert!(super::insert_bounded_notification_key(
+            &mut keys,
+            "stable:2.0.0:compatible_available".to_owned(),
+        ));
+        assert_eq!(keys.len(), 128);
+        assert!(!super::insert_bounded_notification_key(
+            &mut keys,
+            "stable:2.0.0:compatible_available".to_owned(),
+        ));
+    }
+
+    #[test]
     fn rejects_truncated_and_unknown_state_schema() {
         assert!(matches!(
             PersistedUpdateState::from_json(br#"{"schema":1"#),
@@ -864,6 +909,28 @@ mod tests {
         assert!(!second_result.should_notify);
         assert_eq!(second_result.next_check_epoch_secs, 45_200);
         assert!(!restarted.is_due().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_notification_delivery_releases_dedup_key_for_retry() {
+        let settings = unique_settings("notification-retry");
+        let coordinator = UpdateCoordinator::new(
+            official("0.2.0"),
+            no_compatibility(),
+            UpdateStateStore::new(&settings),
+            Arc::new(FixedTime(1_000)),
+            UpdateSchedule::default(),
+            "stable".to_owned(),
+        )
+        .unwrap();
+        let first = coordinator.check(None).await.unwrap();
+        assert!(first.should_notify);
+        coordinator
+            .release_notification(&first.notice)
+            .await
+            .unwrap();
+        let retry = coordinator.check(None).await.unwrap();
+        assert!(retry.should_notify);
     }
 
     #[tokio::test]

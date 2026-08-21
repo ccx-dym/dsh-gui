@@ -67,3 +67,30 @@ node scripts/sign-runtime.mjs runtime-out\manifest.json runtime-out\manifest.sig
 签名覆盖清单文件的原始 bytes，输出为 128 个小写 hex 字符的 detached signature。
 脚本不会打印私钥路径、内容或签名。测试所用临时 Ed25519 seed/PEM 只能用于闭环测试，
 不得当作生产密钥。
+
+## 桌面端发布通道配置
+
+正式构建通过构建环境注入以下非敏感发布配置；仓库和安装包源码不硬编码 endpoint，
+也不接受运行时 token：
+
+- `DSH_DESKTOP_NPM_REGISTRY_ROOT`：官方 npm registry 的 HTTPS 根地址；
+- `DSH_DESKTOP_COMPAT_MANIFEST_URL`：兼容清单 HTTPS 地址；
+- `DSH_DESKTOP_COMPAT_SIGNATURE_URL`：detached signature HTTPS 地址；
+- `DSH_DESKTOP_COMPAT_PUBLIC_KEY`：64 位小写 hex Ed25519 发布公钥；
+- `DSH_DESKTOP_UPDATE_CHANNEL`：可选安全 channel 标识，默认 `stable`。
+
+CI 或隔离发布终端可直接按下面方式注入；值均来自已发布并人工复核的 release，不能使用
+示例占位符生成对外安装包：
+
+```powershell
+$env:DSH_DESKTOP_NPM_REGISTRY_ROOT = 'https://registry.npmjs.org/'
+$env:DSH_DESKTOP_COMPAT_MANIFEST_URL = 'https://<受控发布域>/stable/manifest.json'
+$env:DSH_DESKTOP_COMPAT_SIGNATURE_URL = 'https://<受控发布域>/stable/manifest.sig'
+$env:DSH_DESKTOP_COMPAT_PUBLIC_KEY = '<64位小写hex发布公钥>'
+$env:DSH_DESKTOP_UPDATE_CHANNEL = 'stable'
+pnpm tauri build
+```
+
+任一必填项缺失或无效时，桌面端进入明确的“发布通道尚未配置”状态，不联网、不崩溃、
+不提供安装按钮。在线阶段只下载、复核并封存 runtime，再写入不含 URL 的 pending 记录；
+只有用户二次确认且应用下次冷启动时，才会在 supervisor 启动前执行恢复/隔离探活/激活。

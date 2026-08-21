@@ -7,6 +7,13 @@ import {
   type RuntimeEvent,
   type RuntimeStatus,
 } from "./app-state";
+import {
+  createInitialUpdateState,
+  reduceUpdateEvent,
+  updatePresentation,
+  type UpdateState,
+  type UpdateStateEnvelope,
+} from "./runtime-events";
 
 export function renderRuntimeStatus(
   root: HTMLElement,
@@ -96,9 +103,114 @@ if (root === null) {
   throw new Error("缺少 #app 根节点");
 }
 
+const runtimeRoot = document.createElement("div");
+runtimeRoot.className = "desktop__runtime";
+const updateRoot = document.createElement("aside");
+updateRoot.className = "update-console";
+updateRoot.setAttribute("aria-label", "DSH 更新");
+root.replaceChildren(runtimeRoot, updateRoot);
+
+let updateState = createInitialUpdateState();
+let updateBusy = false;
+
+async function resyncUpdateFailure(): Promise<void> {
+  try {
+    const snapshot = await invoke<UpdateStateEnvelope>("get_update_state");
+    updateState = reduceUpdateEvent(updateState, snapshot);
+  } catch {
+    // bridge 整体不可用时只改变安全文案，不伪造 Rust 拥有的单调 revision。
+    updateState = {
+      ...updateState,
+      phase: "failed",
+      errorCode: "update_unavailable",
+      shouldNotify: false,
+    };
+  }
+}
+
+function renderUpdateState(target: HTMLElement, state: UpdateState): void {
+  const presentation = updatePresentation(state);
+  target.replaceChildren();
+  target.dataset.phase = state.phase;
+
+  const rail = document.createElement("div");
+  rail.className = "update-console__rail";
+  const signal = document.createElement("span");
+  signal.className = "update-console__signal";
+  signal.setAttribute("aria-hidden", "true");
+  const eyebrow = document.createElement("p");
+  eyebrow.className = "update-console__eyebrow";
+  eyebrow.textContent = presentation.eyebrow;
+  const heading = document.createElement("h2");
+  heading.textContent = presentation.heading;
+  const body = document.createElement("p");
+  body.className = "update-console__body";
+  body.textContent = presentation.body;
+  rail.append(signal, eyebrow, heading, body);
+
+  if (presentation.details !== undefined) {
+    const details = document.createElement("p");
+    details.className = "update-console__details";
+    details.textContent = presentation.details;
+    rail.append(details);
+  }
+  if (presentation.summary !== undefined) {
+    const summary = document.createElement("p");
+    summary.className = "update-console__summary";
+    summary.dataset.updateSummary = "";
+    // 兼容摘要来自已签名清单，但仍只按文本节点呈现，保持双重防线。
+    summary.textContent = presentation.summary;
+    rail.append(summary);
+  }
+  if (presentation.primaryAction !== undefined) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "update-console__action";
+    button.dataset.updateAction = presentation.primaryAction.command;
+    button.dataset.confirmation = presentation.primaryAction.confirmation ?? "";
+    button.textContent = presentation.primaryAction.label;
+    button.disabled = updateBusy;
+    button.setAttribute("aria-busy", String(updateBusy));
+    rail.append(button);
+  }
+  if (presentation.busy) {
+    const progress = document.createElement("div");
+    progress.className = "update-console__progress";
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", presentation.heading);
+    rail.append(progress);
+  }
+  target.append(rail);
+}
+
 // 事件只绑定在稳定的根节点上；状态重绘会替换按钮，但不会累积监听器。
 root.addEventListener("click", (event: MouseEvent) => {
   if (!(event.target instanceof Element)) {
+    return;
+  }
+  const updateAction = event.target.closest<HTMLButtonElement>(
+    "button[data-update-action]",
+  );
+  if (updateAction !== null && root.contains(updateAction)) {
+    if (updateBusy) return;
+    const confirmation = updateAction.dataset.confirmation;
+    if (confirmation && !window.confirm(confirmation)) return;
+    updateBusy = true;
+    updateAction.disabled = true;
+    updateAction.setAttribute("aria-busy", "true");
+    renderUpdateState(updateRoot, updateState);
+    const command = updateAction.dataset.updateAction!;
+    void invoke<UpdateStateEnvelope>(command, {
+      expectedRevision: updateState.revision,
+    })
+      .then((envelope) => {
+        updateState = reduceUpdateEvent(updateState, envelope);
+      })
+      .catch(resyncUpdateFailure)
+      .finally(() => {
+        updateBusy = false;
+        renderUpdateState(updateRoot, updateState);
+      });
     return;
   }
   const retry = event.target.closest<HTMLButtonElement>(
@@ -111,7 +223,7 @@ root.addEventListener("click", (event: MouseEvent) => {
   retry.setAttribute("aria-busy", "true");
   retry.textContent = "正在重试…";
   void invoke<void>("retry_runtime").catch(() => {
-    renderRuntimeStatus(root, {
+    renderRuntimeStatus(runtimeRoot, {
       phase: "failed",
       message: "重试失败，请稍后再试",
       errorCode: "retry_failed",
@@ -119,7 +231,8 @@ root.addEventListener("click", (event: MouseEvent) => {
   });
 });
 
-renderRuntimeStatus(root, { phase: "starting", message: "正在启动 DSH…" });
+renderRuntimeStatus(runtimeRoot, { phase: "starting", message: "正在启动 DSH…" });
+renderUpdateState(updateRoot, updateState);
 
 async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
   let status = initialRuntimeStatus;
@@ -147,4 +260,25 @@ async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
   }
 }
 
-void initializeRuntimeStatus(root);
+async function initializeUpdateState(): Promise<void> {
+  try {
+    // 与运行时状态一致：先订阅，再取 revision 快照；两者统一择新而非依赖布尔标记。
+    await listen<UpdateStateEnvelope>("update-state", ({ payload }) => {
+      updateState = reduceUpdateEvent(updateState, payload);
+      renderUpdateState(updateRoot, updateState);
+    });
+    const snapshot = await invoke<UpdateStateEnvelope>("get_update_state");
+    updateState = reduceUpdateEvent(updateState, snapshot);
+    renderUpdateState(updateRoot, updateState);
+  } catch {
+    updateState = {
+      ...createInitialUpdateState(),
+      phase: "unavailable",
+      errorCode: "update_unavailable",
+    };
+    renderUpdateState(updateRoot, updateState);
+  }
+}
+
+void initializeRuntimeStatus(runtimeRoot);
+void initializeUpdateState();

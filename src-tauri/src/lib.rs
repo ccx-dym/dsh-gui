@@ -5,6 +5,7 @@ pub mod paths;
 pub mod runtime;
 pub mod tray;
 pub mod update;
+pub mod update_ui;
 
 use app_controller::{AppController, get_runtime_status, retry_runtime};
 use diagnostics::{
@@ -14,6 +15,38 @@ use diagnostics::{
 use paths::AppPaths;
 use tauri::{AppHandle, Manager};
 use tray::{CloseDecision, close_decision, setup_tray};
+use update_ui::{
+    UpdateUiController, check_updates, confirm_activation, get_update_state,
+    install_compatible_update,
+};
+
+pub const UPDATE_COMMAND_NAMES: [&str; 4] = [
+    "get_update_state",
+    "check_updates",
+    "install_compatible_update",
+    "confirm_activation",
+];
+
+/// 更新命令的进程内纵深来源校验；ACL 仍是第一道强制边界。
+///
+/// :param value: 当前 WebView 的完整 URL。
+/// :return: 仅内置 Tauri 启动页来源返回 true。
+/// :raises: URL 解析失败时返回 false，不传播动态错误。
+pub fn update_command_allowed_for_url(value: &str) -> bool {
+    let Ok(url) = tauri::Url::parse(value) else {
+        return false;
+    };
+    let bundled_origin = matches!(
+        (url.scheme(), url.host_str()),
+        ("tauri", Some("localhost")) | ("http", Some("tauri.localhost"))
+    );
+    #[cfg(debug_assertions)]
+    let development_origin =
+        url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && url.port() == Some(1420);
+    #[cfg(not(debug_assertions))]
+    let development_origin = false;
+    bundled_origin || development_origin
+}
 
 /// 启动 DSH Desktop 的单一 Tauri 窗口。
 ///
@@ -47,27 +80,68 @@ pub fn run() {
                     DiagnosticErrorKind::TauriError,
                 );
             }
+            // Windows toast activation 可能在没有可信 payload 的情况下重新启动已注册程序；
+            // single-instance 因而只恢复固定本地更新窗口，不执行任何导航。
+            if let Some(updates) = app.get_webview_window("updates") {
+                let _ = updates.show();
+                let _ = updates.set_focus();
+            }
         }))
-        .invoke_handler(tauri::generate_handler![get_runtime_status, retry_runtime])
+        .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            get_runtime_status,
+            retry_runtime,
+            get_update_state,
+            check_updates,
+            install_compatible_update,
+            confirm_activation
+        ])
         .setup(|app| {
             let paths = AppPaths::resolve(app.handle())?;
             paths.ensure_exists()?;
             let logger = DiagnosticLogger::new(paths.logs.clone(), DiagnosticPolicy::default())?;
-            app.manage(FileDiagnosticSink::new(logger, 256)?);
+            let diagnostic_sink = FileDiagnosticSink::new(logger, 256)?;
+            let update_controller = UpdateUiController::new(paths.clone());
             let controller = AppController::new(app.handle().clone())?;
             #[cfg(debug_assertions)]
             controller.start_mock_runtime()?;
+            app.manage(diagnostic_sink);
+            app.manage(update_controller);
             app.manage(controller);
+            update_ui::spawn_scheduled_update_checks(app.handle().clone());
+            #[cfg(not(debug_assertions))]
+            {
+                let app_handle = app.handle().clone();
+                // release 没有其他自动启动入口；这个任务独占 update/lifecycle gate，因而
+                // supervisor 的第一次 start 必然发生在 recover/pending activation 之后。
+                tauri::async_runtime::spawn(async move {
+                    let sink = app_handle.state::<FileDiagnosticSink>();
+                    let diagnostics = diagnostics::DiagnosticContext::begin(
+                        TraceKind::Update,
+                        std::sync::Arc::new(sink.inner().clone()),
+                    );
+                    let controller = app_handle.state::<AppController>();
+                    let updates = app_handle.state::<UpdateUiController>();
+                    let _ =
+                        update_ui::cold_bootstrap(&app_handle, &controller, &updates, &diagnostics)
+                            .await;
+                });
+            }
             setup_tray(app.handle())?;
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() != "main" {
+            if !matches!(window.label(), "main" | "updates") {
                 return;
             }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
+            if window.label() == "updates" {
+                api.prevent_close();
+                let _ = window.hide();
+                return;
+            }
             let controller = window.state::<AppController>();
             if close_decision(controller.exit_requested()) == CloseDecision::HideToTray {
                 // 即使隐藏失败也阻止默认关闭，避免 DSH 在没有显式 Exit 的情况下被回收。
@@ -132,5 +206,37 @@ mod tests {
 
         assert_eq!(tauri_run_exit_code(Err::<(), _>(PoisonError)), 1);
         assert!(!FORMATTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn command_permissions_allow_only_local_startup_origin() {
+        assert!(super::update_command_allowed_for_url(
+            "tauri://localhost/index.html"
+        ));
+        assert!(super::update_command_allowed_for_url(
+            "http://tauri.localhost/"
+        ));
+        assert!(super::update_command_allowed_for_url(
+            "http://127.0.0.1:1420/"
+        ));
+        assert!(!super::update_command_allowed_for_url(
+            "http://127.0.0.1:43127/"
+        ));
+        assert!(!super::update_command_allowed_for_url(
+            "https://example.invalid/"
+        ));
+    }
+
+    #[test]
+    fn command_permissions_are_strictly_bounded() {
+        assert_eq!(
+            super::UPDATE_COMMAND_NAMES,
+            [
+                "get_update_state",
+                "check_updates",
+                "install_compatible_update",
+                "confirm_activation",
+            ]
+        );
     }
 }

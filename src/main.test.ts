@@ -14,11 +14,114 @@ beforeEach(() => {
   vi.resetModules();
   tauriMocks.invoke.mockReset();
   tauriMocks.listen.mockReset();
-  tauriMocks.invoke.mockResolvedValue({
-    phase: "starting",
-    message: "正在启动 DSH…",
-  });
+  tauriMocks.invoke.mockImplementation(async (command: string) =>
+    command === "get_update_state"
+      ? {
+          revision: 0,
+          state: {
+            revision: 0,
+            phase: "unavailable",
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        }
+      : { phase: "starting", message: "正在启动 DSH…" },
+  );
   tauriMocks.listen.mockResolvedValue(() => undefined);
+});
+
+describe("更新控制台", () => {
+  it("不由可能被节流的 WebView 定时器承担后台检查", async () => {
+    const interval = vi.spyOn(window, "setInterval");
+    await import("./main");
+    expect(interval).not.toHaveBeenCalled();
+    interval.mockRestore();
+  });
+
+  it("先监听更新事件再读取快照", async () => {
+    const order: string[] = [];
+    tauriMocks.listen.mockImplementation(async (name: string) => {
+      if (name === "update-state") order.push("update-listen");
+      return () => undefined;
+    });
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_update_state") {
+        order.push("update-snapshot");
+        return {
+          revision: 0,
+          state: {
+            revision: 0,
+            phase: "uninstalled",
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        };
+      }
+      return { phase: "idle", message: "尚未安装兼容运行时" };
+    });
+
+    await import("./main");
+    await vi.waitFor(() => expect(order).toHaveLength(2));
+    expect(order).toEqual(["update-listen", "update-snapshot"]);
+  });
+
+  it("安装前明确确认并防止重复提交", async () => {
+    const pending = new Promise(() => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    tauriMocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_update_state") {
+        return Promise.resolve({
+          revision: 1,
+          state: {
+            revision: 1,
+            phase: "compatible_available",
+            compatibleVersion: "0.1.2",
+            artifactSize: 108_024_750,
+            compatibilitySummary: "Windows 10/11 x64 验证通过",
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        });
+      }
+      if (command === "install_compatible_update") return pending;
+      return Promise.resolve({ phase: "idle", message: "等待" });
+    });
+    await import("./main");
+    const button = await vi.waitFor(() =>
+      document.querySelector<HTMLButtonElement>("[data-update-action]"),
+    );
+    expect(button?.textContent).toBe("查看并安装");
+    button?.click();
+    button?.click();
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining("0.1.2"),
+    );
+    expect(tauriMocks.invoke.mock.calls.filter(([name]) => name === "install_compatible_update")).toHaveLength(1);
+    expect(button?.disabled).toBe(true);
+  });
+
+  it("release summary 只作为纯文本渲染", async () => {
+    tauriMocks.invoke.mockImplementation(async (command: string) =>
+      command === "get_update_state"
+        ? {
+            revision: 1,
+            state: {
+              revision: 1,
+              phase: "compatible_available",
+              compatibleVersion: "0.1.2",
+              artifactSize: 10,
+              compatibilitySummary: '<img src=x onerror="alert(1)">',
+              notificationsEnabled: true,
+              shouldNotify: false,
+            },
+          }
+        : { phase: "idle", message: "等待" },
+    );
+    await import("./main");
+    await vi.waitFor(() => expect(document.querySelector("[data-update-summary]")).not.toBeNull());
+    expect(document.querySelector("[data-update-summary]")?.textContent).toBe('<img src=x onerror="alert(1)">');
+    expect(document.querySelector("img[src='x']")).toBeNull();
+  });
 });
 
 describe("renderRuntimeStatus", () => {
@@ -250,15 +353,32 @@ describe("启动页", () => {
   });
 
   it("运行时重试失败时不显示 bridge 返回的敏感正文", async () => {
-    tauriMocks.invoke
-      .mockResolvedValueOnce({
+    let retryRequested = false;
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_runtime_status") {
+        return {
         phase: "failed",
         message: "启动超时",
         errorCode: "health_timeout",
-      })
-      .mockRejectedValueOnce(
-        "Authorization: Bearer sk-proj-secret https://host/?api_key=x C:\\用户\\私密.json",
-      );
+        };
+      }
+      if (command === "get_update_state") {
+        return {
+          revision: 0,
+          state: {
+            revision: 0,
+            phase: "unavailable",
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        };
+      }
+      if (command === "retry_runtime" && !retryRequested) {
+        retryRequested = true;
+        throw "Authorization: Bearer sk-proj-secret https://host/?api_key=x C:\\用户\\私密.json";
+      }
+      return undefined;
+    });
 
     await import("./main");
     const retry = await vi.waitFor(() => {

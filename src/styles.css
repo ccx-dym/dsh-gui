@@ -18,6 +18,14 @@ body {
   overflow: hidden;
 }
 
+#app {
+  min-height: 100vh;
+}
+
+.desktop__runtime {
+  min-height: 100vh;
+}
+
 .boot {
   --sky-top: #ffffff;
   --sky-mid: #dff5ff;
@@ -207,6 +215,146 @@ body {
 
   50% {
     transform: translateY(-7px) rotate(0.7deg);
+  }
+}
+
+.update-console {
+  position: fixed;
+  z-index: 5;
+  top: 28px;
+  right: 30px;
+  width: min(370px, calc(100vw - 60px));
+  color: #164766;
+}
+
+.update-console__rail {
+  position: relative;
+  padding: 23px 24px 22px 29px;
+  border: 1px solid rgb(111 197 240 / 42%);
+  border-radius: 4px 20px 20px 4px;
+  background: rgb(255 255 255 / 86%);
+  box-shadow: 0 18px 48px rgb(29 134 190 / 13%);
+  backdrop-filter: blur(18px) saturate(116%);
+}
+
+.update-console__rail::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 4px;
+  background: #39aef0;
+  content: "";
+}
+
+.update-console__signal {
+  position: absolute;
+  top: 25px;
+  right: 24px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #2fb4f7;
+  box-shadow: 0 0 0 3px rgb(47 180 247 / 17%);
+}
+
+.update-console[data-phase="failed"] .update-console__signal,
+.update-console[data-phase="recovery_required"] .update-console__signal {
+  background: #e26d59;
+}
+
+.update-console__eyebrow {
+  margin: 0 30px 8px 0;
+  color: #2d91c5;
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.update-console h2 {
+  margin: 0;
+  color: #123f5c;
+  font-family: "Segoe UI Variable Display", "Microsoft YaHei UI", sans-serif;
+  font-size: 20px;
+  font-weight: 680;
+  letter-spacing: -0.025em;
+}
+
+.update-console__body,
+.update-console__summary {
+  margin: 10px 0 0;
+  color: #4b7087;
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.update-console__details {
+  margin: 15px 0 0;
+  color: #167caf;
+  font-family: "Cascadia Mono", "Microsoft YaHei UI", monospace;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.update-console__summary {
+  max-height: 68px;
+  overflow: auto;
+  padding-left: 12px;
+  border-left: 1px solid #a8ddf5;
+}
+
+.update-console__action {
+  min-height: 38px;
+  margin-top: 18px;
+  padding: 0 17px;
+  border: 1px solid #2ca9e9;
+  border-radius: 999px;
+  color: #fff;
+  background: #249fdc;
+  box-shadow: 0 8px 20px rgb(36 159 220 / 20%);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+}
+
+.update-console__action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 11px 24px rgb(36 159 220 / 28%);
+}
+
+.update-console__action:disabled {
+  cursor: wait;
+  opacity: 0.52;
+}
+
+.update-console__progress {
+  height: 2px;
+  margin-top: 18px;
+  overflow: hidden;
+  background: #d4effc;
+}
+
+.update-console__progress::after {
+  display: block;
+  width: 42%;
+  height: 100%;
+  background: #2faeed;
+  animation: update-scan 1.25s ease-in-out infinite alternate;
+  content: "";
+}
+
+@keyframes update-scan {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(240%); }
+}
+
+@media (max-width: 700px) {
+  .update-console {
+    top: 16px;
+    right: 16px;
+    width: calc(100vw - 32px);
   }
 }
 

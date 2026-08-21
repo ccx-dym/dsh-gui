@@ -19,6 +19,17 @@
         "minWidth": 880,
         "minHeight": 600,
         "resizable": true
+      },
+      {
+        "label": "updates",
+        "title": "DSH Desktop · 更新",
+        "url": "index.html",
+        "width": 760,
+        "height": 620,
+        "minWidth": 640,
+        "minHeight": 520,
+        "visible": false,
+        "resizable": true
       }
     ],
     "security": {

@@ -12,6 +12,7 @@ use tauri::{AppHandle, Manager};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayAction {
     Open,
+    Updates,
     Hide,
     Restart,
     Exit,
@@ -45,6 +46,8 @@ pub trait DesktopUi {
     fn show_main(&self) -> Result<(), RuntimeError>;
     fn focus_main(&self) -> Result<(), RuntimeError>;
     fn hide_main(&self) -> Result<(), RuntimeError>;
+    fn show_updates(&self) -> Result<(), RuntimeError>;
+    fn focus_updates(&self) -> Result<(), RuntimeError>;
     fn exit(&self, code: i32);
 }
 
@@ -56,6 +59,12 @@ impl TauriDesktopUi {
     fn main_window(&self) -> Result<tauri::WebviewWindow, RuntimeError> {
         self.app
             .get_webview_window("main")
+            .ok_or(RuntimeError::MainWindowMissing)
+    }
+
+    fn updates_window(&self) -> Result<tauri::WebviewWindow, RuntimeError> {
+        self.app
+            .get_webview_window("updates")
             .ok_or(RuntimeError::MainWindowMissing)
     }
 }
@@ -76,6 +85,28 @@ impl DesktopUi for TauriDesktopUi {
     fn hide_main(&self) -> Result<(), RuntimeError> {
         self.main_window()?
             .hide()
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))
+    }
+
+    fn show_updates(&self) -> Result<(), RuntimeError> {
+        let window = self.updates_window()?;
+        #[cfg(debug_assertions)]
+        let local_url = "http://127.0.0.1:1420/";
+        #[cfg(not(debug_assertions))]
+        let local_url = "tauri://localhost/index.html";
+        // 每次从托盘进入都重新加载固定本地页，使 listen-first + snapshot 初始化
+        // 再执行一次；这里不接受菜单或通知携带的动态 URL。
+        window
+            .navigate(tauri::Url::parse(local_url).map_err(|_| RuntimeError::MainWindowMissing)?)
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
+        window
+            .show()
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))
+    }
+
+    fn focus_updates(&self) -> Result<(), RuntimeError> {
+        self.updates_window()?
+            .set_focus()
             .map_err(|error| RuntimeError::Tauri(error.to_string()))
     }
 
@@ -105,6 +136,7 @@ pub fn close_decision(exit_requested: bool) -> CloseDecision {
 pub fn tray_action_from_id(id: &str) -> Option<TrayAction> {
     match id {
         "open" => Some(TrayAction::Open),
+        "updates" => Some(TrayAction::Updates),
         "hide" => Some(TrayAction::Hide),
         "restart" => Some(TrayAction::Restart),
         "exit" => Some(TrayAction::Exit),
@@ -129,6 +161,10 @@ pub fn handle_tray_action(
             ui.show_main()?;
             ui.focus_main()
         }
+        TrayAction::Updates => {
+            ui.show_updates()?;
+            ui.focus_updates()
+        }
         TrayAction::Hide => ui.hide_main(),
         TrayAction::Restart => controller.restart(),
         TrayAction::Exit => {
@@ -148,6 +184,7 @@ pub fn handle_tray_action(
 pub fn setup_tray(app: &AppHandle) -> Result<(), RuntimeError> {
     let menu = MenuBuilder::new(app)
         .text("open", "打开 DSH Desktop")
+        .text("updates", "检查更新")
         .text("hide", "隐藏")
         .text("restart", "重启 DSH")
         .text("exit", "退出")
@@ -200,7 +237,7 @@ fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: Diagnost
         return;
     };
     let stage = match action {
-        TrayAction::Open => DiagnosticStage::TrayOpen,
+        TrayAction::Open | TrayAction::Updates => DiagnosticStage::TrayOpen,
         TrayAction::Hide => DiagnosticStage::TrayHide,
         TrayAction::Restart => DiagnosticStage::TrayRestart,
         TrayAction::Exit => DiagnosticStage::TrayExit,
@@ -281,6 +318,16 @@ mod tests {
             Ok(())
         }
 
+        fn show_updates(&self) -> Result<(), RuntimeError> {
+            self.calls.push("show_updates");
+            Ok(())
+        }
+
+        fn focus_updates(&self) -> Result<(), RuntimeError> {
+            self.calls.push("focus_updates");
+            Ok(())
+        }
+
         fn exit(&self, _code: i32) {
             self.calls.push("exit");
         }
@@ -301,8 +348,25 @@ mod tests {
         assert_eq!(tray_action_from_id("open"), Some(TrayAction::Open));
         assert_eq!(tray_action_from_id("hide"), Some(TrayAction::Hide));
         assert_eq!(tray_action_from_id("restart"), Some(TrayAction::Restart));
+        assert_eq!(tray_action_from_id("updates"), Some(TrayAction::Updates));
         assert_eq!(tray_action_from_id("exit"), Some(TrayAction::Exit));
         assert_eq!(tray_action_from_id("退出"), None);
+    }
+
+    #[test]
+    fn updates_action_opens_the_independent_local_update_window() {
+        let calls = CallLog::default();
+        let controller = RecordingController {
+            calls: calls.clone(),
+            fail_exit: false,
+        };
+        let ui = RecordingUi {
+            calls: calls.clone(),
+        };
+
+        handle_tray_action(TrayAction::Updates, &controller, &ui).expect("更新窗口应恢复");
+
+        assert_eq!(calls.values(), vec!["show_updates", "focus_updates"]);
     }
 
     #[test]
