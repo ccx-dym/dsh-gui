@@ -96,8 +96,8 @@ fn is_http_200(response: &[u8]) -> bool {
 mod tests {
     use super::{HealthProbe, ReadyProbe};
     use crate::runtime::RuntimeError;
-    use std::io::Write;
-    use std::net::{Ipv4Addr, Shutdown, TcpListener};
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -109,6 +109,24 @@ mod tests {
         Reset,
     }
 
+    fn read_request_headers(stream: &mut TcpStream) {
+        let mut request = [0_u8; 256];
+        let mut received = 0;
+        while received < request.len() {
+            let read = stream.read(&mut request[received..]).unwrap();
+            if read == 0 {
+                break;
+            }
+            received += read;
+            if request[..received]
+                .windows(4)
+                .any(|bytes| bytes == b"\r\n\r\n")
+            {
+                break;
+            }
+        }
+    }
+
     fn response_server(replies: Vec<Reply>) -> (u16, thread::JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -116,7 +134,13 @@ mod tests {
             for reply in replies {
                 let (mut stream, _) = listener.accept().unwrap();
                 match reply {
-                    Reply::Bytes(bytes) => stream.write_all(bytes).unwrap(),
+                    Reply::Bytes(bytes) => {
+                        // Windows 在关闭仍有未读入站数据的 socket 时可能发送 RST，
+                        // 从而丢弃刚写出的响应。先消费完整请求头，让 fixture 模拟
+                        // 合法 HTTP 服务生命周期，避免把测试服务器竞态误判为探活失败。
+                        read_request_headers(&mut stream);
+                        stream.write_all(bytes).unwrap();
+                    }
                     Reply::Reset => stream.shutdown(Shutdown::Both).unwrap(),
                 }
             }
@@ -157,6 +181,7 @@ mod tests {
             thread::sleep(Duration::from_millis(80));
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
             let (mut stream, _) = listener.accept().unwrap();
+            read_request_headers(&mut stream);
             stream.write_all(OK_RESPONSE).unwrap();
         });
 
