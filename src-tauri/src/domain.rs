@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +35,34 @@ pub enum RuntimeEvent {
     Ready { url: String, elapsed_ms: u64 },
     Failed { code: String, message: String },
     Stopping { message: String },
+}
+
+/// 桌面端更新检查的用户可见结论。
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum UpdateNotice {
+    UpToDate {
+        current: Option<String>,
+        official: String,
+    },
+    OfficialAwaitingCompatibility {
+        current: Option<String>,
+        official: String,
+    },
+    CompatibleAvailable {
+        current: Option<String>,
+        official: String,
+        compatible: String,
+    },
+    CheckFailed {
+        current: Option<String>,
+        version: Option<String>,
+        error_kind: String,
+    },
 }
 
 #[cfg(test)]
