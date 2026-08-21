@@ -111,6 +111,8 @@ pub enum DownloadError {
     InsecureUrl,
     #[error("无法创建 HTTPS 客户端")]
     ClientConfiguration,
+    #[error("下载策略字段无效: {field}")]
+    InvalidPolicy { field: &'static str },
     #[error("trace id 不符合隔离目录规则")]
     InvalidTraceId,
     #[error("目标 verified 文件已存在")]
@@ -131,6 +133,8 @@ pub enum DownloadError {
     HttpStatus { status: u16 },
     #[error("无法安全暂存下载文件")]
     FileSystem,
+    #[error("trace 暂存目录超出 updates 根目录")]
+    UnsafeTraceDirectory,
 }
 
 /// 可替换的异步资源下载边界；返回 boxed future 以保持 trait object 兼容。
@@ -159,8 +163,9 @@ impl HttpsDownloader {
     ///
     /// :param policy: 超时、大小与重试边界。
     /// :return: 配置完成的下载器。
-    /// :raises DownloadError: TLS 客户端无法构建时返回。
+    /// :raises DownloadError: 策略越界或 TLS 客户端无法构建时返回。
     pub fn new(policy: DownloadPolicy) -> Result<Self, DownloadError> {
+        validate_download_policy(&policy)?;
         let client = reqwest::Client::builder()
             .https_only(true)
             .connect_timeout(policy.connect_timeout)
@@ -177,6 +182,7 @@ impl HttpsDownloader {
     /// 仅供当前模块的本地 HTTP server 测试使用；不会编译进生产构建。
     #[cfg(test)]
     fn new_for_test(policy: DownloadPolicy) -> Result<Self, DownloadError> {
+        validate_download_policy(&policy)?;
         let client = reqwest::Client::builder()
             .connect_timeout(policy.connect_timeout)
             .build()
@@ -216,11 +222,20 @@ impl HttpsDownloader {
         }
 
         let trace_dir = request.updates_dir.join(request.trace_id);
-        let part_path = trace_dir.join("artifact.part");
-        let verified_path = trace_dir.join("artifact.verified");
         fs::create_dir_all(&trace_dir)
             .await
             .map_err(|_| DownloadError::FileSystem)?;
+        // `trace_dir` 可能在运行前已被替换为 symlink/junction；只使用经过
+        // canonicalize 且仍严格等于根目录直属 trace 子目录的路径继续写入。
+        let canonical_updates = fs::canonicalize(request.updates_dir)
+            .await
+            .map_err(|_| DownloadError::FileSystem)?;
+        let canonical_trace = fs::canonicalize(&trace_dir)
+            .await
+            .map_err(|_| DownloadError::FileSystem)?;
+        validate_canonical_trace_path(&canonical_updates, &canonical_trace, request.trace_id)?;
+        let part_path = canonical_trace.join("artifact.part");
+        let verified_path = canonical_trace.join("artifact.verified");
         if fs::try_exists(&verified_path)
             .await
             .map_err(|_| DownloadError::FileSystem)?
@@ -228,7 +243,11 @@ impl HttpsDownloader {
             return Err(DownloadError::VerifiedAlreadyExists);
         }
 
-        let deadline = Instant::now() + self.policy.total_timeout;
+        let deadline = Instant::now()
+            .checked_add(self.policy.total_timeout)
+            .ok_or(DownloadError::InvalidPolicy {
+                field: "total_timeout",
+            })?;
         let result = tokio::select! {
             biased;
             _ = request.cancellation.cancelled() => Err(DownloadError::Cancelled),
@@ -457,6 +476,64 @@ fn validate_trace_id(trace_id: &str) -> Result<(), DownloadError> {
     Ok(())
 }
 
+const MAX_POLICY_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn validate_download_policy(policy: &DownloadPolicy) -> Result<(), DownloadError> {
+    let timeout_fields = [
+        ("connect_timeout", policy.connect_timeout),
+        ("response_timeout", policy.response_timeout),
+        ("total_timeout", policy.total_timeout),
+    ];
+    for (field, value) in timeout_fields {
+        if value.is_zero() || value > MAX_POLICY_TIMEOUT {
+            return Err(DownloadError::InvalidPolicy { field });
+        }
+    }
+    if policy.max_artifact_bytes == 0 {
+        return Err(DownloadError::InvalidPolicy {
+            field: "max_artifact_bytes",
+        });
+    }
+    if policy.initial_backoff > policy.max_backoff {
+        return Err(DownloadError::InvalidPolicy {
+            field: "initial_backoff",
+        });
+    }
+    if policy.max_backoff > policy.total_timeout {
+        return Err(DownloadError::InvalidPolicy {
+            field: "max_backoff",
+        });
+    }
+    if policy.max_jitter > policy.total_timeout {
+        return Err(DownloadError::InvalidPolicy {
+            field: "max_jitter",
+        });
+    }
+    if policy.max_retry_after > policy.total_timeout {
+        return Err(DownloadError::InvalidPolicy {
+            field: "max_retry_after",
+        });
+    }
+    if Instant::now().checked_add(policy.total_timeout).is_none() {
+        return Err(DownloadError::InvalidPolicy {
+            field: "total_timeout",
+        });
+    }
+    Ok(())
+}
+
+fn validate_canonical_trace_path(
+    canonical_updates: &Path,
+    canonical_trace: &Path,
+    trace_id: &str,
+) -> Result<(), DownloadError> {
+    validate_trace_id(trace_id)?;
+    if canonical_trace != canonical_updates.join(trace_id) {
+        return Err(DownloadError::UnsafeTraceDirectory);
+    }
+    Ok(())
+}
+
 fn parse_retry_after(response: &reqwest::Response, maximum: Duration) -> Option<Duration> {
     let seconds = response
         .headers()
@@ -659,7 +736,9 @@ mod tests {
 
         assert_eq!(
             downloaded.verified_path,
-            root.join("trace_01/artifact.verified")
+            std::fs::canonicalize(&root)
+                .expect("canonical updates")
+                .join("trace_01/artifact.verified")
         );
         assert_eq!(
             std::fs::read(downloaded.verified_path).expect("verified bytes"),
@@ -927,5 +1006,91 @@ mod tests {
             b"old"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_policy_without_panicking_on_extreme_duration() {
+        fn assert_invalid_policy(expected_field: &'static str, policy: DownloadPolicy) {
+            let error = HttpsDownloader::new(policy)
+                .err()
+                .expect("invalid policy must fail");
+            assert!(matches!(
+                error,
+                DownloadError::InvalidPolicy { field } if field == expected_field
+            ));
+        }
+        assert_invalid_policy(
+            "connect_timeout",
+            DownloadPolicy {
+                connect_timeout: Duration::ZERO,
+                ..DownloadPolicy::default()
+            },
+        );
+        assert_invalid_policy(
+            "response_timeout",
+            DownloadPolicy {
+                response_timeout: Duration::ZERO,
+                ..DownloadPolicy::default()
+            },
+        );
+        assert_invalid_policy(
+            "total_timeout",
+            DownloadPolicy {
+                total_timeout: Duration::ZERO,
+                ..DownloadPolicy::default()
+            },
+        );
+        assert_invalid_policy(
+            "max_artifact_bytes",
+            DownloadPolicy {
+                max_artifact_bytes: 0,
+                ..DownloadPolicy::default()
+            },
+        );
+        assert_invalid_policy(
+            "initial_backoff",
+            DownloadPolicy {
+                initial_backoff: Duration::from_secs(2),
+                max_backoff: Duration::from_secs(1),
+                ..DownloadPolicy::default()
+            },
+        );
+
+        let outcome = std::panic::catch_unwind(|| {
+            HttpsDownloader::new(DownloadPolicy {
+                total_timeout: Duration::MAX,
+                ..DownloadPolicy::default()
+            })
+        });
+        let error = outcome
+            .expect("extreme duration must not panic")
+            .err()
+            .expect("extreme duration must fail");
+        assert!(matches!(
+            error,
+            DownloadError::InvalidPolicy {
+                field: "total_timeout"
+            }
+        ));
+    }
+
+    #[test]
+    fn canonical_trace_boundary_rejects_link_target_outside_updates_root() {
+        let canonical_updates = PathBuf::from(r"C:\Users\tester\AppData\Local\DSH\updates");
+        let canonical_trace = PathBuf::from(r"C:\outside\trace");
+
+        let error =
+            super::validate_canonical_trace_path(&canonical_updates, &canonical_trace, "trace_01")
+                .expect_err("outside canonical target must fail");
+
+        assert!(matches!(error, DownloadError::UnsafeTraceDirectory));
+        assert!(
+            super::validate_canonical_trace_path(
+                &canonical_updates,
+                &canonical_updates.join("trace_01"),
+                "trace_01",
+            )
+            .is_ok()
+        );
     }
 }
