@@ -16,8 +16,16 @@ fn canonical_hex(bytes: &[u8]) -> String {
 }
 
 fn verifier() -> ManifestVerifier {
+    verifier_for("0.1.0")
+}
+
+fn verifier_for(current_desktop_version: &str) -> ManifestVerifier {
     let public_key = SigningKey::from_bytes(&TEST_SIGNING_KEY).verifying_key();
-    ManifestVerifier::new(&canonical_hex(public_key.as_bytes())).expect("测试公钥应有效")
+    ManifestVerifier::new(
+        &canonical_hex(public_key.as_bytes()),
+        Version::parse(current_desktop_version).expect("测试桌面版本应有效"),
+    )
+    .expect("测试公钥应有效")
 }
 
 fn sign(bytes: &[u8]) -> String {
@@ -102,8 +110,9 @@ fn strict_verification_rejects_weak_key_and_small_order_signature_points() {
     // 压缩单位点是有效编码但属于小阶点；普通验证方程可能接受 R=identity、s=0。
     let mut identity = [0_u8; 32];
     identity[0] = 1;
-    let weak_verifier = ManifestVerifier::new(&canonical_hex(&identity))
-        .expect("弱点仍是可解析的 Ed25519 公钥编码");
+    let weak_verifier =
+        ManifestVerifier::new(&canonical_hex(&identity), Version::parse("0.1.0").unwrap())
+            .expect("弱点仍是可解析的 Ed25519 公钥编码");
     let mut weak_signature = [0_u8; 64];
     weak_signature[0] = 1;
 
@@ -116,14 +125,19 @@ fn strict_verification_rejects_weak_key_and_small_order_signature_points() {
 #[test]
 fn wrong_key_and_malformed_key_or_signature_are_rejected_without_echoing_secrets() {
     let wrong_key = SigningKey::from_bytes(&[8; 32]).verifying_key();
-    let wrong_verifier = ManifestVerifier::new(&canonical_hex(wrong_key.as_bytes())).unwrap();
+    let wrong_verifier = ManifestVerifier::new(
+        &canonical_hex(wrong_key.as_bytes()),
+        Version::parse("0.1.0").unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         wrong_verifier.verify(VALID_MANIFEST, &sign(VALID_MANIFEST)),
         Err(ManifestError::SignatureVerification)
     ));
 
     for invalid_key in ["00".repeat(31), "AA".repeat(32), "gg".repeat(32)] {
-        let error = ManifestVerifier::new(&invalid_key).expect_err("非规范公钥必须失败");
+        let error = ManifestVerifier::new(&invalid_key, Version::parse("0.1.0").unwrap())
+            .expect_err("非规范公钥必须失败");
         assert!(matches!(error, ManifestError::InvalidPublicKeyEncoding));
         assert!(!error.to_string().contains(&invalid_key));
     }
@@ -194,6 +208,32 @@ fn versions_must_be_strict_semver() {
             Err(ManifestError::InvalidField { field: actual }) if actual == field
         ));
     }
+}
+
+#[test]
+fn minimum_desktop_version_rejects_older_stable_and_prerelease_clients() {
+    let future = replace_once(
+        "\"minimum_desktop_version\":\"0.1.0\"",
+        "\"minimum_desktop_version\":\"99.0.0\"",
+    );
+    assert!(matches!(
+        signed_json(future),
+        Err(ManifestError::DesktopVersionTooOld { required, current })
+            if required == Version::parse("99.0.0").unwrap()
+                && current == Version::parse("0.1.0").unwrap()
+    ));
+
+    let stable_minimum = replace_once(
+        "\"minimum_desktop_version\":\"0.1.0\"",
+        "\"minimum_desktop_version\":\"0.2.0\"",
+    );
+    let bytes = stable_minimum.as_bytes();
+    assert!(matches!(
+        verifier_for("0.2.0-rc.1").verify(bytes, &sign(bytes)),
+        Err(ManifestError::DesktopVersionTooOld { required, current })
+            if required == Version::parse("0.2.0").unwrap()
+                && current == Version::parse("0.2.0-rc.1").unwrap()
+    ));
 }
 
 #[test]

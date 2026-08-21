@@ -50,6 +50,8 @@ pub enum ManifestError {
     InvalidJson,
     #[error("不支持的兼容清单 schema: {schema}")]
     UnsupportedSchema { schema: u32 },
+    #[error("当前桌面版本 {current} 低于清单要求的最低版本 {required}")]
+    DesktopVersionTooOld { required: Version, current: Version },
     #[error("兼容清单字段无效: {field}")]
     InvalidField { field: &'static str },
 }
@@ -58,21 +60,29 @@ pub enum ManifestError {
 #[derive(Clone, Debug)]
 pub struct ManifestVerifier {
     verifying_key: VerifyingKey,
+    current_desktop_version: Version,
 }
 
 impl ManifestVerifier {
     /// 从规范的 32-byte 小写 hex 公钥创建验证器。
     ///
     /// :param public_key_hex: 发布公钥的 64 个小写十六进制字符。
+    /// :param current_desktop_version: 当前桌面端的严格 semver，用于强制最低版本门禁。
     /// :return: 只持有验证公钥的清单验证器。
     /// :raises ManifestError: 编码、长度或 Ed25519 公钥无效时返回
     ///   `InvalidPublicKeyEncoding`。
-    pub fn new(public_key_hex: &str) -> Result<Self, ManifestError> {
+    pub fn new(
+        public_key_hex: &str,
+        current_desktop_version: Version,
+    ) -> Result<Self, ManifestError> {
         let bytes = decode_canonical_hex::<32>(public_key_hex)
             .ok_or(ManifestError::InvalidPublicKeyEncoding)?;
         let verifying_key = VerifyingKey::from_bytes(&bytes)
             .map_err(|_| ManifestError::InvalidPublicKeyEncoding)?;
-        Ok(Self { verifying_key })
+        Ok(Self {
+            verifying_key,
+            current_desktop_version,
+        })
     }
 
     /// 验证原始清单字节的 detached signature，再执行严格解析与字段校验。
@@ -99,6 +109,12 @@ impl ManifestVerifier {
         let raw: RawManifest =
             serde_json::from_slice(manifest_bytes).map_err(|_| ManifestError::InvalidJson)?;
         let manifest = CompatibilityManifestV1::try_from(raw)?;
+        if manifest.minimum_desktop_version > self.current_desktop_version {
+            return Err(ManifestError::DesktopVersionTooOld {
+                required: manifest.minimum_desktop_version,
+                current: self.current_desktop_version.clone(),
+            });
+        }
         Ok(VerifiedManifest {
             manifest,
             manifest_digest: sha256_hex(manifest_bytes),
