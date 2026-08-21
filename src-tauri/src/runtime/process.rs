@@ -1,5 +1,5 @@
 use super::command::RuntimeLaunchSpec;
-use super::{ReadinessSignal, RuntimeError};
+use super::{ReadinessSignal, RuntimeError, StartupAbort};
 use std::ffi::c_void;
 use std::io::Read;
 use std::mem::size_of;
@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::{Error as WindowsError, PCWSTR};
 
 /// 受 Windows Job Object 约束的 DSH 子进程。
@@ -27,6 +28,17 @@ pub struct ManagedChild {
     job: Option<OwnedHandle>,
     child: Child,
     output: RuntimeOutputSink,
+}
+
+pub struct JobStartupAbort {
+    job: OwnedHandle,
+}
+
+impl StartupAbort for JobStartupAbort {
+    fn abort(&self) -> Result<(), RuntimeError> {
+        unsafe { TerminateJobObject(borrowed_handle(&self.job), 1) }
+            .map_err(|error| process_error("TerminateJobObject(startup)", error))
+    }
 }
 
 /// 子进程标准输出/错误输出的有界、脱敏 drain 所有者。
@@ -53,6 +65,30 @@ pub enum StopOutcome {
 }
 
 impl ManagedChild {
+    pub fn startup_abort_handle(&self) -> Result<JobStartupAbort, RuntimeError> {
+        let job = self
+            .job
+            .as_ref()
+            .ok_or(RuntimeError::StartupAbortUnavailable)?;
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicate = HANDLE::default();
+        unsafe {
+            DuplicateHandle(
+                process,
+                borrowed_handle(job),
+                process,
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(|error| process_error("DuplicateHandle(startup job)", error))?;
+        Ok(JobStartupAbort {
+            job: unsafe { OwnedHandle::from_raw_handle(duplicate.0) },
+        })
+    }
+
     /// 启动并把运行时进程绑定到启用整树回收的 Windows Job Object。
     ///
     /// 参数和环境变量逐项传给 `Command`，不会经过 shell 解析。

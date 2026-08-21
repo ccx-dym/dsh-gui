@@ -198,6 +198,8 @@ pub enum InstallStateError {
     },
     #[error("deployment 缺少离线启动 descriptor 字段 {field}")]
     MissingDescriptor { field: &'static str },
+    #[error("旧 deployment 需要用户重新选择项目工作目录后才能迁移")]
+    LegacyMigrationRequired,
     #[error("项目工作目录不是可信的本地普通目录")]
     InvalidProjectWorkspace,
     #[error("无效的数据 generation 标识: {id}")]
@@ -471,9 +473,19 @@ impl InstallStateStore {
             .parent()
             .ok_or(InstallStateError::PathEscape { field: "settings" })?
             .join("activation-settings.json");
-        let bytes = fs::read(&settings_path).map_err(|source| {
-            io_error("read_legacy_activation_settings", &settings_path, source)
-        })?;
+        let bytes = match fs::read(&settings_path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(InstallStateError::LegacyMigrationRequired);
+            }
+            Err(source) => {
+                return Err(io_error(
+                    "read_legacy_activation_settings",
+                    &settings_path,
+                    source,
+                ));
+            }
+        };
         let settings: LegacyActivationSettings = serde_json::from_slice(&bytes)
             .map_err(|source| InstallStateError::InvalidJson { source })?;
         if settings.schema != LEGACY_DEPLOYMENT_SCHEMA {
@@ -818,6 +830,36 @@ mod tests {
             loaded.project_workspace.as_deref(),
             Some(workspace.as_path())
         );
+    }
+
+    #[test]
+    fn legacy_schema_one_without_workspace_is_typed_migration_required() {
+        let paths = test_paths("legacy-migration-required");
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        fs::create_dir_all(layout.runtime_root().join("1.2.3/node-v24.15.0-win-x64"))
+            .expect("node dir");
+        fs::write(
+            layout
+                .runtime_root()
+                .join("1.2.3/node-v24.15.0-win-x64/node.exe"),
+            b"node",
+        )
+        .expect("node");
+        fs::create_dir_all(&paths.settings).expect("settings");
+        fs::write(
+            paths.settings.join("deployment.json"),
+            format!(
+                r#"{{"schema":1,"runtime":{{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"{}"}},"data":{{"id":"generation-001","relative_dir":"generations/generation-001"}},"activated_at":"2026-08-21T09:30:00Z"}}"#,
+                "a".repeat(64)
+            ),
+        )
+        .expect("legacy pointer");
+
+        assert!(matches!(
+            store.load(),
+            Err(InstallStateError::LegacyMigrationRequired)
+        ));
     }
 
     #[test]

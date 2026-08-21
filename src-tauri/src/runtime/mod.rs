@@ -59,6 +59,12 @@ pub enum RuntimeError {
     ActivationBusy,
     #[error("激活指针已变化，拒绝启动不匹配的 runtime/data 配对")]
     DeploymentChanged,
+    #[error("当前启动进程没有可用的强制终止句柄")]
+    StartupAbortUnavailable,
+    #[error("强制终止启动进程后状态未在 {timeout_ms} ms 内收敛")]
+    StartupAbortTimeout { timeout_ms: u64 },
+    #[error("运行时启动已被激活事务强制终止")]
+    StartupAborted,
 }
 
 impl RuntimeError {
@@ -86,6 +92,9 @@ impl RuntimeError {
             Self::ProbeOperationInProgress => "probe_operation_in_progress",
             Self::ActivationBusy => "activation_busy",
             Self::DeploymentChanged => "deployment_changed",
+            Self::StartupAbortUnavailable => "startup_abort_unavailable",
+            Self::StartupAbortTimeout { .. } => "startup_abort_timeout",
+            Self::StartupAborted => "startup_aborted",
         }
     }
 }
@@ -110,6 +119,14 @@ pub trait RuntimeProcess: Send {
         port: u16,
         timeout: Duration,
     ) -> Result<ReadinessSignal, RuntimeError>;
+
+    fn startup_abort(&self) -> Option<Arc<dyn StartupAbort>> {
+        None
+    }
+}
+
+pub trait StartupAbort: Send + Sync {
+    fn abort(&self) -> Result<(), RuntimeError>;
 }
 
 /// 创建受生命周期约束的运行时进程。
@@ -149,6 +166,12 @@ impl RuntimeProcess for ManagedChild {
     ) -> Result<ReadinessSignal, RuntimeError> {
         self.wait_for_readiness(port, timeout)
     }
+
+    fn startup_abort(&self) -> Option<Arc<dyn StartupAbort>> {
+        self.startup_abort_handle()
+            .map(|handle| Arc::new(handle) as Arc<dyn StartupAbort>)
+            .ok()
+    }
 }
 
 /// 把类型化运行时事件发送给状态存储和界面边界。
@@ -158,7 +181,10 @@ pub trait RuntimeEventSink: Send + Sync + 'static {
 
 enum SupervisorState {
     Stopped,
-    Starting,
+    Starting {
+        abort: Option<Arc<dyn StartupAbort>>,
+        abort_requested: bool,
+    },
     Running {
         child: Box<dyn RuntimeProcess>,
         url: String,
@@ -215,9 +241,12 @@ impl RuntimeSupervisor {
             let mut state = self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?;
             match &*state {
                 SupervisorState::Stopped | SupervisorState::Failed => {
-                    *state = SupervisorState::Starting;
+                    *state = SupervisorState::Starting {
+                        abort: None,
+                        abort_requested: false,
+                    };
                 }
-                SupervisorState::Starting
+                SupervisorState::Starting { .. }
                 | SupervisorState::Running { .. }
                 | SupervisorState::Stopping => {
                     return Err(RuntimeError::AlreadyRunning);
@@ -261,8 +290,8 @@ impl RuntimeSupervisor {
             let mut state = self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?;
             match std::mem::replace(&mut *state, SupervisorState::Stopping) {
                 SupervisorState::Running { child, url, sink } => Some((child, url, sink)),
-                SupervisorState::Starting => {
-                    *state = SupervisorState::Starting;
+                starting @ SupervisorState::Starting { .. } => {
+                    *state = starting;
                     return Err(RuntimeError::AlreadyRunning);
                 }
                 SupervisorState::Stopping => {
@@ -293,6 +322,57 @@ impl RuntimeSupervisor {
         let mut state = self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?;
         *state = SupervisorState::Stopped;
         Ok(())
+    }
+
+    /// 返回 supervisor 是否权威确认没有 Starting/Running/Stopping 进程。
+    ///
+    /// :return: `Stopped` 或已完成清理的 `Failed` 状态返回 true。
+    /// :raises RuntimeError: 状态锁损坏时返回。
+    pub fn is_inactive(&self) -> Result<bool, RuntimeError> {
+        let state = self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+        Ok(matches!(
+            *state,
+            SupervisorState::Stopped | SupervisorState::Failed
+        ))
+    }
+
+    /// 强制终止仍处于 Starting 的受管进程树，并等待状态机收敛。
+    ///
+    /// :param timeout: 终止句柄执行后等待 worker 收敛的最大时长。
+    /// :return: 进程树已被终止且状态离开 Starting 时返回。
+    /// :raises RuntimeError: 当前不是 Starting、终止句柄不可用或状态未收敛时返回。
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn abort_startup(&self, timeout: Duration) -> Result<(), RuntimeError> {
+        let abort = {
+            let mut state = self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?;
+            match &mut *state {
+                SupervisorState::Starting {
+                    abort,
+                    abort_requested,
+                } => {
+                    *abort_requested = true;
+                    abort.clone().ok_or(RuntimeError::StartupAbortUnavailable)?
+                }
+                _ => return Err(RuntimeError::AlreadyRunning),
+            }
+        };
+        abort.abort()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let starting = matches!(
+                *self.state.lock().map_err(|_| RuntimeError::StatePoisoned)?,
+                SupervisorState::Starting { .. }
+            );
+            if !starting {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::StartupAbortTimeout {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            thread::sleep(Duration::from_millis(10).min(timeout));
+        }
     }
 
     fn set_failed(&self) -> Result<(), RuntimeError> {
@@ -331,6 +411,23 @@ fn run_start(
             return;
         }
     };
+    let abort_requested = match state.lock() {
+        Ok(mut current) => match &mut *current {
+            SupervisorState::Starting {
+                abort,
+                abort_requested,
+            } => {
+                *abort = child.startup_abort();
+                *abort_requested
+            }
+            _ => true,
+        },
+        Err(_) => true,
+    };
+    if abort_requested {
+        fail_start(&state, &sink, Some(child), RuntimeError::StartupAborted);
+        return;
+    }
     match child.try_wait() {
         Ok(Some(_)) => {
             fail_start(&state, &sink, Some(child), RuntimeError::ProcessExitedEarly);
@@ -359,6 +456,20 @@ fn run_start(
             return;
         }
     };
+    let aborted = match state.lock() {
+        Ok(current) => !matches!(
+            &*current,
+            SupervisorState::Starting {
+                abort_requested: false,
+                ..
+            }
+        ),
+        Err(_) => true,
+    };
+    if aborted {
+        fail_start(&state, &sink, Some(child), RuntimeError::StartupAborted);
+        return;
+    }
     let event = RuntimeEvent::Ready {
         url: url.clone(),
         elapsed_ms: started.elapsed().as_millis() as u64,
@@ -369,8 +480,27 @@ fn run_start(
     }
 
     match state.lock() {
-        Ok(mut current) => {
+        Ok(mut current)
+            if matches!(
+                &*current,
+                SupervisorState::Starting {
+                    abort_requested: false,
+                    ..
+                }
+            ) =>
+        {
             *current = SupervisorState::Running { child, url, sink };
+        }
+        Ok(mut current) => {
+            let mut child = child;
+            let error = RuntimeError::StartupAborted;
+            if let Err(stop_error) = child.stop(Duration::ZERO) {
+                *current = SupervisorState::Failed;
+                emit_failure(&sink, &stop_error);
+                return;
+            }
+            *current = SupervisorState::Failed;
+            emit_failure(&sink, &error);
         }
         Err(_) => {
             let mut child = child;
@@ -385,10 +515,12 @@ fn fail_start(
     state: &Arc<Mutex<SupervisorState>>,
     sink: &Arc<dyn RuntimeEventSink>,
     mut child: Option<Box<dyn RuntimeProcess>>,
-    error: RuntimeError,
+    mut error: RuntimeError,
 ) {
-    if let Some(process) = child.as_mut() {
-        let _ = process.stop(Duration::ZERO);
+    if let Some(process) = child.as_mut()
+        && let Err(stop_error) = process.stop(Duration::ZERO)
+    {
+        error = stop_error;
     }
     if let Ok(mut current) = state.lock() {
         *current = SupervisorState::Failed;
@@ -407,7 +539,7 @@ fn emit_failure(sink: &Arc<dyn RuntimeEventSink>, error: &RuntimeError) {
 mod tests {
     use super::{
         ProcessLauncher, ReadinessSignal, RuntimeError, RuntimeEventSink, RuntimeProcess,
-        RuntimeSupervisor, SupervisorState,
+        RuntimeSupervisor, StartupAbort, SupervisorState,
     };
     use crate::domain::RuntimeEvent;
     use crate::runtime::command::{ReadinessPolicy, RuntimeLaunchSpec};
@@ -681,6 +813,70 @@ mod tests {
     struct BlockingProbe {
         entered: ProbeGate,
         release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct GateStartupAbort {
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl StartupAbort for GateStartupAbort {
+        fn abort(&self) -> Result<(), RuntimeError> {
+            let (released, changed) = &*self.release;
+            *released.lock().expect("abort release") = true;
+            changed.notify_all();
+            Ok(())
+        }
+    }
+
+    struct AbortableStartingProcess {
+        release: Arc<(Mutex<bool>, Condvar)>,
+        stop_calls: Arc<Mutex<u32>>,
+    }
+
+    impl RuntimeProcess for AbortableStartingProcess {
+        fn id(&self) -> u32 {
+            91
+        }
+
+        fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError> {
+            Ok(None)
+        }
+
+        fn stop(&mut self, _grace: Duration) -> Result<StopOutcome, RuntimeError> {
+            *self.stop_calls.lock().expect("stop calls") += 1;
+            Ok(StopOutcome::Terminated)
+        }
+
+        fn wait_for_readiness(
+            &mut self,
+            port: u16,
+            _timeout: Duration,
+        ) -> Result<ReadinessSignal, RuntimeError> {
+            Ok(ReadinessSignal::Web { port })
+        }
+
+        fn startup_abort(&self) -> Option<Arc<dyn StartupAbort>> {
+            Some(Arc::new(GateStartupAbort {
+                release: Arc::clone(&self.release),
+            }))
+        }
+    }
+
+    struct AbortableStartingLauncher {
+        release: Arc<(Mutex<bool>, Condvar)>,
+        stop_calls: Arc<Mutex<u32>>,
+    }
+
+    impl ProcessLauncher for AbortableStartingLauncher {
+        fn spawn(
+            &self,
+            _spec: &RuntimeLaunchSpec,
+        ) -> Result<Box<dyn RuntimeProcess>, RuntimeError> {
+            Ok(Box::new(AbortableStartingProcess {
+                release: Arc::clone(&self.release),
+                stop_calls: Arc::clone(&self.stop_calls),
+            }))
+        }
     }
 
     impl ReadyProbe for BlockingProbe {
@@ -1001,5 +1197,41 @@ mod tests {
             .join()
             .expect("停止线程不应 panic")
             .expect("停止应成功");
+    }
+
+    #[test]
+    fn abort_startup_terminates_blocked_starting_process_and_converges_state() {
+        let entered = ProbeGate::default();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_calls = Arc::new(Mutex::new(0_u32));
+        let supervisor = RuntimeSupervisor::for_test(
+            Arc::new(AbortableStartingLauncher {
+                release: Arc::clone(&release),
+                stop_calls: Arc::clone(&stop_calls),
+            }),
+            Arc::new(BlockingProbe {
+                entered: entered.clone(),
+                release,
+            }),
+        );
+        supervisor
+            .start(
+                test_spec(),
+                Duration::from_secs(30),
+                Arc::new(RecordingSink::default()),
+            )
+            .expect("start scheduled");
+        entered.wait_until_entered(Duration::from_secs(1));
+
+        supervisor
+            .abort_startup(Duration::from_secs(1))
+            .expect("abort starting");
+
+        assert!(supervisor.is_inactive().expect("inactive"));
+        assert_eq!(*stop_calls.lock().expect("stop calls"), 1);
+        assert!(matches!(
+            *supervisor.state.lock().expect("state"),
+            SupervisorState::Failed
+        ));
     }
 }

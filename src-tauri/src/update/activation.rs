@@ -865,6 +865,7 @@ fn copy_generation(
                 return Err(ActivationError::UnsafeSnapshot);
             }
             let path = entry.path();
+            validate_no_named_streams(&path)?;
             let relative = path
                 .strip_prefix(source)
                 .map_err(|_| ActivationError::UnsafeSnapshot)?;
@@ -902,6 +903,7 @@ fn measure_generation(
                 return Err(ActivationError::UnsafeSnapshot);
             }
             let path = entry.path();
+            validate_no_named_streams(&path)?;
             let relative = path
                 .strip_prefix(source)
                 .map_err(|_| ActivationError::UnsafeSnapshot)?;
@@ -920,6 +922,54 @@ fn measure_generation(
         }
     }
     Ok((files, bytes))
+}
+
+#[cfg(windows)]
+fn validate_no_named_streams(path: &Path) -> Result<(), ActivationError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::ERROR_HANDLE_EOF;
+    use windows::Win32::Storage::FileSystem::{
+        FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+        WIN32_FIND_STREAM_DATA,
+    };
+    use windows::core::{HRESULT, PCWSTR};
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut data = WIN32_FIND_STREAM_DATA::default();
+    let handle = unsafe {
+        FindFirstStreamW(
+            PCWSTR(wide.as_ptr()),
+            FindStreamInfoStandard,
+            std::ptr::addr_of_mut!(data).cast(),
+            None,
+        )
+    }
+    .map_err(|_| ActivationError::UnsafeSnapshot)?;
+
+    let result = loop {
+        let Some(end) = data.cStreamName.iter().position(|value| *value == 0) else {
+            break Err(ActivationError::UnsafeSnapshot);
+        };
+        if !matches!(
+            String::from_utf16(&data.cStreamName[..end]),
+            Ok(name) if name == "::$DATA"
+        ) {
+            break Err(ActivationError::UnsafeSnapshot);
+        }
+        match unsafe { FindNextStreamW(handle, std::ptr::addr_of_mut!(data).cast()) } {
+            Ok(()) => {}
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) => break Ok(()),
+            Err(_) => break Err(ActivationError::UnsafeSnapshot),
+        }
+    };
+    let close = unsafe { FindClose(handle) }.map_err(|_| ActivationError::UnsafeSnapshot);
+    result.and(close)
+}
+
+#[cfg(not(windows))]
+fn validate_no_named_streams(_path: &Path) -> Result<(), ActivationError> {
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1607,6 +1657,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_fails_closed_when_legacy_pointer_needs_workspace_migration() {
+        let fixture = Fixture::new("legacy-recovery-required", true);
+        let runtime = Arc::new(RecordingRuntime::default());
+        let app = controller(runtime);
+        let activator = RuntimeActivator::new(fixture.layout.clone(), SnapshotPolicy::default())
+            .expect("activator")
+            .with_acl_inspector(Arc::new(PermissiveAcl));
+        let session = app.begin_activation().expect("session");
+        assert!(matches!(
+            activator
+                .activate(
+                    session,
+                    fixture.request(),
+                    &PassedProbe,
+                    &CrashAt(ActivationCheckpoint::JournalPrepared),
+                )
+                .await,
+            Err(super::ActivationError::Interrupted { .. })
+        ));
+        let node_dir = fixture
+            .layout
+            .runtime_dir(&fixture.old.runtime)
+            .join("node-v24.15.0-win-x64");
+        fs::create_dir_all(&node_dir).expect("legacy node dir");
+        fs::write(node_dir.join("node.exe"), b"node").expect("legacy node");
+        fs::write(
+            fixture.layout.deployment_file(),
+            format!(
+                r#"{{"schema":1,"runtime":{{"version":"{}","relative_dir":"dsh/{}","manifest_digest":"{}"}},"data":{{"id":"{}","relative_dir":"generations/{}"}},"activated_at":"{}"}}"#,
+                fixture.old.runtime.version,
+                fixture.old.runtime.version,
+                fixture.old.runtime.manifest_digest,
+                fixture.old.data.id,
+                fixture.old.data.id,
+                fixture.old.activated_at,
+            ),
+        )
+        .expect("legacy pointer");
+
+        let recovery = app.begin_activation().expect("recovery session");
+        assert!(matches!(
+            activator.recover(recovery).await,
+            Err(super::ActivationError::InstallState(
+                InstallStateError::LegacyMigrationRequired
+            ))
+        ));
+    }
+
+    #[tokio::test]
     async fn crash_before_first_start_is_recovered_from_committed_journal() {
         let fixture = Fixture::new("first-start-crash", true);
         let runtime = Arc::new(RecordingRuntime::default());
@@ -1703,6 +1802,26 @@ mod tests {
         let mut names = SnapshotPathRegistry::default();
         assert!(matches!(
             names.register(Path::new("secret.txt:stream")),
+            Err(super::ActivationError::UnsafeSnapshot)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_snapshot_scan_rejects_a_real_ntfs_named_stream() {
+        let fixture = Fixture::new("ntfs-ads", true);
+        let source = fixture.layout.generation_dir(&fixture.old.data);
+        let stream = source.join("memory.db:secret");
+        if let Err(error) = fs::write(&stream, b"hidden") {
+            // FAT/exFAT 与部分网络文件系统没有 ADS；Windows NTFS CI 必须走下面断言。
+            assert!(matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ));
+            return;
+        }
+        assert!(matches!(
+            super::measure_generation(&source, SnapshotPolicy::default()),
             Err(super::ActivationError::UnsafeSnapshot)
         ));
     }

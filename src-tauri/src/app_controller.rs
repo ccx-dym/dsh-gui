@@ -34,6 +34,10 @@ pub(crate) trait RuntimeLifecycle: Send + Sync + 'static {
     fn start(&self) -> Result<(), RuntimeError>;
     fn stop(&self) -> Result<(), RuntimeError>;
     fn start_and_wait_ready(&self, deployment: &ActiveDeployment) -> Result<(), RuntimeError>;
+
+    fn is_definitively_stopped(&self) -> Result<bool, RuntimeError> {
+        Ok(false)
+    }
 }
 
 trait RuntimeUi: Send + Sync + 'static {
@@ -88,6 +92,10 @@ impl RuntimeLifecycle for MockRuntimeLifecycle {
         // 开发 mock 的异步启动不满足激活事务的同步“真实就绪”契约，必须失败关闭。
         Err(RuntimeError::MockRuntimeDisabled)
     }
+
+    fn is_definitively_stopped(&self) -> Result<bool, RuntimeError> {
+        self.supervisor.is_inactive()
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -136,8 +144,13 @@ impl RuntimeLifecycle for OfficialRuntimeLifecycle {
         // 相同截止互相竞态并留下 Starting 子进程。
         let watchdog = OFFICIAL_READY_TIMEOUT + RUNTIME_STOP_GRACE + Duration::from_secs(1);
         wait_for_official_ready(&self.status, port, watchdog, || {
-            self.supervisor.stop(RUNTIME_STOP_GRACE)
+            self.supervisor
+                .abort_startup(RUNTIME_STOP_GRACE + Duration::from_secs(1))
         })
+    }
+
+    fn is_definitively_stopped(&self) -> Result<bool, RuntimeError> {
+        self.supervisor.is_inactive()
     }
 }
 
@@ -167,8 +180,7 @@ where
             AppPhase::Idle | AppPhase::Starting | AppPhase::Stopping => {}
         }
         if Instant::now() >= deadline {
-            // 清理失败不能覆盖原始 readiness 超时，但 supervisor 的 stop 至少被可靠触发。
-            let _ = stop_on_timeout();
+            stop_on_timeout()?;
             return Err(RuntimeError::HealthTimeout {
                 port,
                 timeout_ms: watchdog.as_millis() as u64,
@@ -686,10 +698,15 @@ impl AppController {
     /// :raises RuntimeError: Agent 非空闲、生命周期处于转换态、停止失败或已有操作时返回。
     pub fn begin_activation(&self) -> Result<ActivationSession, RuntimeError> {
         let guard = self.acquire_operation()?;
-        if self.busy_provider.quiesce() != RuntimeBusyState::ConfirmedIdle {
+        let phase = self.status().phase;
+        let inactive = matches!(
+            phase,
+            crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed
+        ) && self.runtime.is_definitively_stopped()?;
+        if !inactive && self.busy_provider.quiesce() != RuntimeBusyState::ConfirmedIdle {
             return Err(RuntimeError::ActivationBusy);
         }
-        match self.status().phase {
+        match phase {
             crate::domain::AppPhase::Ready => self.stop_under_gate()?,
             crate::domain::AppPhase::Idle | crate::domain::AppPhase::Failed => {}
             crate::domain::AppPhase::Starting | crate::domain::AppPhase::Stopping => {
@@ -762,6 +779,26 @@ mod tests {
 
     struct FixedBusyProvider(RuntimeBusyState);
 
+    struct DefinitivelyStoppedRuntime;
+
+    impl RuntimeLifecycle for DefinitivelyStoppedRuntime {
+        fn start(&self) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn start_and_wait_ready(&self, _deployment: &ActiveDeployment) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn is_definitively_stopped(&self) -> Result<bool, RuntimeError> {
+            Ok(true)
+        }
+    }
+
     impl RuntimeBusyProvider for FixedBusyProvider {
         fn quiesce(&self) -> RuntimeBusyState {
             self.0
@@ -832,6 +869,24 @@ mod tests {
             Err(RuntimeError::ActivationBusy)
         ));
         assert!(runtime.calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn trusted_inactive_lifecycle_allows_fresh_activation_but_not_ready() {
+        let controller = AppController::for_test_with_busy(
+            Arc::new(DefinitivelyStoppedRuntime),
+            Arc::new(FixedBusyProvider(RuntimeBusyState::UnknownBusy)),
+        );
+        let session = controller
+            .begin_activation()
+            .expect("fresh inactive session");
+        drop(session);
+
+        controller.status.write().expect("status").phase = AppPhase::Ready;
+        assert!(matches!(
+            controller.begin_activation(),
+            Err(RuntimeError::ActivationBusy)
+        ));
     }
 
     #[test]
