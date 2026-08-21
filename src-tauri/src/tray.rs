@@ -1,3 +1,9 @@
+use crate::app_controller::AppController;
+use crate::runtime::RuntimeError;
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager};
+
 /// 托盘菜单与鼠标事件可触发的类型化动作。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayAction {
@@ -352,8 +358,3 @@ mod tests {
         assert_eq!(calls.values(), vec!["stop"]);
     }
 }
-use crate::app_controller::AppController;
-use crate::runtime::RuntimeError;
-use tauri::menu::MenuBuilder;
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
