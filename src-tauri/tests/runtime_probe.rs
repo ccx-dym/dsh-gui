@@ -413,7 +413,10 @@ async fn runtime_dependency_modified_during_probe_cannot_pass_inventory_recheck(
     let stops = Arc::new(AtomicUsize::new(0));
     let probe = RuntimeProbe::with_inspectors(
         ProbePolicy {
-            timeout: Duration::from_millis(200),
+            // MutatingLauncher::spawn 是明确同步点：启动前 inventory 已校验完成，
+            // 写入后必须为停止后的完整复检预留足够预算，避免 Windows 调度抖动
+            // 把安全断言误归类成 readiness timeout。
+            timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
@@ -458,7 +461,9 @@ async fn runtime_extra_file_created_during_probe_cannot_pass_inventory_recheck()
         .join("extra.bin");
     let probe = RuntimeProbe::with_inspectors(
         ProbePolicy {
-            timeout: Duration::from_millis(200),
+            // 与依赖改写场景相同，额外文件在 spawn 同步写入；这里验证的是
+            // post-check 的闭包检测，不应让极短测试预算主导失败类别。
+            timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(10),
             stop_grace: Duration::ZERO,
             max_files: 64,
