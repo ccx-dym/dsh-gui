@@ -1,5 +1,7 @@
 pub mod command;
 pub mod health;
+#[cfg(windows)]
+pub mod process;
 
 use std::io;
 
@@ -12,8 +14,8 @@ pub enum RuntimeError {
     HealthTimeout { port: u16, timeout_ms: u64 },
     #[error("运行时已经启动")]
     AlreadyRunning,
-    #[error("Windows 进程管理失败: {0}")]
-    Process(String),
+    #[error("Windows 进程管理失败（{operation}，HRESULT {code:#010X}）")]
+    Process { operation: &'static str, code: i32 },
     #[error("缺少 main 窗口")]
     MainWindowMissing,
     #[error("无效的本地运行时 URL: {0}")]
