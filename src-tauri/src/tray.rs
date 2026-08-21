@@ -1,4 +1,7 @@
 use crate::app_controller::AppController;
+use crate::diagnostics::{
+    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, DiagnosticTraceId,
+};
 use crate::runtime::RuntimeError;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -165,7 +168,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), RuntimeError> {
             let controller = app.state::<AppController>();
             let ui = TauriDesktopUi { app: app.clone() };
             if let Err(error) = handle_tray_action(action, controller.inner(), &ui) {
-                eprintln!("托盘动作 {action:?} 失败: {error}");
+                record_tray_failure(app, action, error.diagnostic_kind());
             }
         })
         .on_tray_icon_event(|tray, event| {
@@ -181,13 +184,39 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), RuntimeError> {
                 let controller = app.state::<AppController>();
                 let ui = TauriDesktopUi { app: app.clone() };
                 if let Err(error) = handle_tray_action(TrayAction::Open, controller.inner(), &ui) {
-                    eprintln!("托盘左键恢复主窗口失败: {error}");
+                    record_tray_failure(app, TrayAction::Open, error.diagnostic_kind());
                 }
             }
         })
         .build(app)
         .map_err(|error| RuntimeError::Tauri(error.to_string()))?;
     Ok(())
+}
+
+/// 仅把可信托盘动作与稳定错误码送入结构化日志，不传递底层错误正文。
+fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: DiagnosticErrorKind) {
+    let Some(sink) = app.try_state::<DiagnosticSink>() else {
+        return;
+    };
+    let stage = match action {
+        TrayAction::Open => DiagnosticStage::TrayOpen,
+        TrayAction::Hide => DiagnosticStage::TrayHide,
+        TrayAction::Restart => DiagnosticStage::TrayRestart,
+        TrayAction::Exit => DiagnosticStage::TrayExit,
+    };
+    let trace_id = format!("desktop-{}", std::process::id());
+    let Ok(trace_id) = DiagnosticTraceId::parse(&trace_id) else {
+        return;
+    };
+    let event = DiagnosticEvent::new(
+        trace_id,
+        stage,
+        0,
+        0,
+        Some(std::process::id()),
+        Some(error_kind),
+    );
+    sink.record(event);
 }
 
 #[cfg(test)]

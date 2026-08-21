@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::diagnostics::DiagnosticErrorKind;
 use crate::domain::RuntimeEvent;
 use command::{ReadinessPolicy, RuntimeLaunchSpec};
 use health::{HealthProbe, ReadyProbe};
@@ -95,6 +96,44 @@ impl RuntimeError {
             Self::StartupAbortUnavailable => "startup_abort_unavailable",
             Self::StartupAbortTimeout { .. } => "startup_abort_timeout",
             Self::StartupAborted => "startup_aborted",
+        }
+    }
+
+    /// 返回不包含底层错误正文、路径或 URL 的用户可见消息。
+    ///
+    /// :return: 可安全发送到 WebUI 的固定本地化消息。
+    /// :raises: 此纯映射不产生错误。
+    pub fn safe_user_message(&self) -> &'static str {
+        "DSH 运行时操作失败，请稍后重试"
+    }
+
+    /// 将运行时错误穷尽映射为不携带 source 的诊断类别。
+    ///
+    /// :return: 可进入结构化日志的有限错误枚举。
+    /// :raises: 此纯映射不产生错误。
+    pub fn diagnostic_kind(&self) -> DiagnosticErrorKind {
+        match self {
+            Self::Io(_) => DiagnosticErrorKind::IoError,
+            Self::HealthTimeout { .. } => DiagnosticErrorKind::HealthTimeout,
+            Self::AlreadyRunning => DiagnosticErrorKind::AlreadyRunning,
+            Self::Process { .. } => DiagnosticErrorKind::ProcessError,
+            Self::MainWindowMissing => DiagnosticErrorKind::MainWindowMissing,
+            Self::InvalidUrl(_) => DiagnosticErrorKind::InvalidUrl,
+            Self::Tauri(_) => DiagnosticErrorKind::TauriError,
+            Self::MockRuntimeDisabled => DiagnosticErrorKind::MockRuntimeDisabled,
+            Self::MissingLoopbackPort => DiagnosticErrorKind::MissingLoopbackPort,
+            Self::StatePoisoned => DiagnosticErrorKind::StatePoisoned,
+            Self::ProcessExitedEarly => DiagnosticErrorKind::ProcessExitedEarly,
+            Self::OutputReadinessTimeout { .. } => DiagnosticErrorKind::OutputReadinessTimeout,
+            Self::InvalidLaunchPath { .. } => DiagnosticErrorKind::InvalidLaunchPath,
+            Self::InvalidLoopbackPort { .. } => DiagnosticErrorKind::InvalidLoopbackPort,
+            Self::ProbeRequiresStoppedRuntime => DiagnosticErrorKind::ProbeRequiresStoppedRuntime,
+            Self::ProbeOperationInProgress => DiagnosticErrorKind::ProbeOperationInProgress,
+            Self::ActivationBusy => DiagnosticErrorKind::ActivationBusy,
+            Self::DeploymentChanged => DiagnosticErrorKind::DeploymentChanged,
+            Self::StartupAbortUnavailable => DiagnosticErrorKind::StartupAbortUnavailable,
+            Self::StartupAbortTimeout { .. } => DiagnosticErrorKind::StartupAbortTimeout,
+            Self::StartupAborted => DiagnosticErrorKind::StartupAborted,
         }
     }
 }
@@ -531,7 +570,8 @@ fn fail_start(
 fn emit_failure(sink: &Arc<dyn RuntimeEventSink>, error: &RuntimeError) {
     let _ = sink.emit(RuntimeEvent::Failed {
         code: error.code().to_owned(),
-        message: error.to_string(),
+        // 动态错误正文可能包含路径、URL query 或系统文本，只把固定消息送往 WebUI。
+        message: error.safe_user_message().to_owned(),
     });
 }
 

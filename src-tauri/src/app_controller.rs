@@ -1,3 +1,6 @@
+use crate::diagnostics::{
+    DiagnosticErrorKind, DiagnosticEvent, DiagnosticSink, DiagnosticStage, DiagnosticTraceId,
+};
 use crate::domain::{AppPhase, RuntimeEvent, RuntimeStatus};
 use crate::paths::AppPaths;
 #[cfg(any(not(debug_assertions), test))]
@@ -220,6 +223,7 @@ fn official_launch_spec(
 
 impl RuntimeUi for TauriRuntimeUi {
     fn emit_status(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
+        record_runtime_diagnostic(&self.app, event);
         self.app
             .emit("runtime-status", event)
             .map_err(|error| RuntimeError::Tauri(error.to_string()))
@@ -232,6 +236,36 @@ impl RuntimeUi for TauriRuntimeUi {
             .navigate(url.clone())
             .map_err(|error| RuntimeError::Tauri(error.to_string()))
     }
+}
+
+fn record_runtime_diagnostic(app: &AppHandle, runtime_event: &RuntimeEvent) {
+    let Some(sink) = app.try_state::<DiagnosticSink>() else {
+        return;
+    };
+    let trace_value = format!("desktop-{}", std::process::id());
+    let Ok(trace_id) = DiagnosticTraceId::parse(&trace_value) else {
+        return;
+    };
+    let (stage, elapsed_ms, error_kind) = match runtime_event {
+        RuntimeEvent::Starting { .. } => (DiagnosticStage::RuntimeStart, 0, None),
+        RuntimeEvent::Ready { elapsed_ms, .. } => {
+            (DiagnosticStage::RuntimeReady, *elapsed_ms, None)
+        }
+        RuntimeEvent::Failed { .. } => (
+            DiagnosticStage::RuntimeFailed,
+            0,
+            Some(DiagnosticErrorKind::RuntimeFailure),
+        ),
+        RuntimeEvent::Stopping { .. } => (DiagnosticStage::RuntimeStopping, 0, None),
+    };
+    sink.record(DiagnosticEvent::new(
+        trace_id,
+        stage,
+        elapsed_ms,
+        0,
+        Some(std::process::id()),
+        error_kind,
+    ));
 }
 
 struct ControllerEventSink {
@@ -754,7 +788,9 @@ pub fn get_runtime_status(controller: tauri::State<'_, AppController>) -> Runtim
 /// :return: 后台启动成功调度时返回空结果。
 /// :raises String: 重复启动、目录或正式构建限制等错误的可显示文本。
 pub fn retry_runtime(controller: tauri::State<'_, AppController>) -> Result<(), String> {
-    controller.retry().map_err(|error| error.to_string())
+    controller
+        .retry()
+        .map_err(|error| error.safe_user_message().to_owned())
 }
 
 #[cfg(test)]

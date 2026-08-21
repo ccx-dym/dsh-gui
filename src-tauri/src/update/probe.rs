@@ -1367,6 +1367,9 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
         let sid = PSID((&raw const ace.SidStart).cast_mut().cast::<c_void>());
         let trusted = unsafe {
             EqualSid(sid, current_user).is_ok()
+                // 沙箱化桌面进程的 token SID 可能不同于已验证的真实文件 owner；
+                // owner 已在上方限定为当前用户/SYSTEM/Administrators，可安全授权写入。
+                || EqualSid(sid, owner).is_ok()
                 || IsWellKnownSid(sid, WinLocalSystemSid).as_bool()
                 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).as_bool()
                 || IsWellKnownSid(sid, WinCreatorOwnerSid).as_bool()
@@ -1385,14 +1388,20 @@ pub(crate) fn ensure_private_windows_dacl(path: &Path) -> Result<(), std::io::Er
 fn mask_grants_sensitive_write(mask: u32) -> bool {
     use windows::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
-        DELETE, FILE_DELETE_CHILD, FILE_GENERIC_WRITE, WRITE_DAC, WRITE_OWNER,
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
     };
 
+    // FILE_GENERIC_WRITE 是复合掩码并包含 SYNCHRONIZE；若直接按位相交，只有读取
+    // 权限但带 SYNCHRONIZE 的主体也会被误判为可写。这里只检查真实写入/接管位。
     let dangerous = GENERIC_ALL.0
         | GENERIC_WRITE.0
-        | FILE_GENERIC_WRITE.0
         | DELETE.0
         | FILE_DELETE_CHILD.0
+        | FILE_WRITE_DATA.0
+        | FILE_APPEND_DATA.0
+        | FILE_WRITE_EA.0
+        | FILE_WRITE_ATTRIBUTES.0
         | WRITE_DAC.0
         | WRITE_OWNER.0;
     mask & dangerous != 0
