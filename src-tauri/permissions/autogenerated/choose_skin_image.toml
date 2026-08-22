@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-choose-skin-image"
+description = "Enables the choose_skin_image command without any pre-configured scope."
+commands.allow = ["choose_skin_image"]
+
+[[permission]]
+identifier = "deny-choose-skin-image"
+description = "Denies the choose_skin_image command without any pre-configured scope."
+commands.deny = ["choose_skin_image"]

@@ -80,16 +80,8 @@ type PreviewValidator = dyn Fn(&Path, &SkinImage) -> Result<(), SkinError> + Sen
 
 #[derive(Clone)]
 pub(crate) struct SkinPreviewRegistry {
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 的 controller 将通过此固定根目录登记导入结果"
-    )]
     skins_root: PathBuf,
     authorization: Arc<PreviewAuthorization>,
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 的 controller 启用登记后调用生产图片绑定校验器"
-    )]
     validator: Arc<PreviewValidator>,
 }
 
@@ -105,10 +97,6 @@ impl std::fmt::Debug for SkinPreviewRegistry {
 }
 
 /// 预览登记的稳定完成状态；过期任务不是用户可见错误。
-#[allow(
-    dead_code,
-    reason = "Phase 3 Task 4 的 controller 将区分成功登记与被较新选择取代"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SkinPreviewRegistration {
     Registered,
@@ -116,7 +104,7 @@ pub(crate) enum SkinPreviewRegistration {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PreviewRegistrationTicket(u64);
+pub(crate) struct PreviewRegistrationTicket(u64);
 
 #[derive(Debug, Default)]
 struct PreviewAuthorizationState {
@@ -134,10 +122,6 @@ impl PreviewAuthorization {
         Self::default()
     }
 
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 启用 register_imported 后在验证前领取顺序 ticket"
-    )]
     fn begin(&self) -> Result<PreviewRegistrationTicket, SkinError> {
         let mut state = self.state.lock().map_err(|_| SkinError::FileSystem)?;
         state.epoch = state
@@ -147,10 +131,6 @@ impl PreviewAuthorization {
         Ok(PreviewRegistrationTicket(state.epoch))
     }
 
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 启用 register_imported 后只提交仍为最新的 ticket"
-    )]
     fn commit(
         &self,
         ticket: PreviewRegistrationTicket,
@@ -164,10 +144,6 @@ impl PreviewAuthorization {
         Ok(SkinPreviewRegistration::Registered)
     }
 
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 启用 clear 后同时失效所有在途登记 ticket"
-    )]
     fn clear(&self) -> Result<(), SkinError> {
         let mut state = self.state.lock().map_err(|_| SkinError::FileSystem)?;
         state.epoch = state
@@ -204,21 +180,26 @@ impl SkinPreviewRegistry {
         }
     }
 
-    /// 登记一个已由导入器验证并复制到规范托管路径的预览图片。
+    /// 在任何异步导入工作开始前领取选择顺序 ticket。
     ///
+    /// :return: 严格晚于先前选择或清除操作的顺序 ticket。
+    /// :raises SkinError: 登记锁不可用或顺序号耗尽时返回稳定错误。
+    pub(crate) fn begin_registration(&self) -> Result<PreviewRegistrationTicket, SkinError> {
+        self.authorization.begin()
+    }
+
+    /// 用预先领取的 ticket 登记已验证并复制到规范路径的预览图片。
+    ///
+    /// :param ticket: 在图片导入开始前领取的选择顺序 ticket。
     /// :param image: 导入器返回的类型化托管图片。
     /// :return: 最新任务登记成功返回 `Registered`；已被较新选择或清除取代返回 `Superseded`。
     /// :raises SkinError: 图片不在规范托管路径、内容已变化或登记锁不可用时失败关闭。
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 的 controller 将在导入成功后调用此受控接口"
-    )]
-    pub(crate) fn register_imported(
+    pub(crate) fn commit_imported(
         &self,
+        ticket: PreviewRegistrationTicket,
         image: &SkinImage,
     ) -> Result<SkinPreviewRegistration, SkinError> {
-        // 在任何可能阻塞的文件验证前领取顺序号，确保后启动的选择具有更高优先级。
-        let ticket = self.authorization.begin()?;
+        // 即使 ticket 已过期也完成托管文件绑定验证，避免将不可信元数据带入状态机。
         (self.validator)(&self.skins_root, image)?;
         self.authorization.commit(ticket, image.digest.clone())
     }
@@ -227,10 +208,6 @@ impl SkinPreviewRegistry {
     ///
     /// :return: 预览摘要清空后返回 `()`。
     /// :raises SkinError: 进程内登记锁中毒时返回固定文件系统错误。
-    #[allow(
-        dead_code,
-        reason = "Phase 3 Task 4 的 controller 将在保存、重置或取消时撤销预览"
-    )]
     pub(crate) fn clear(&self) -> Result<(), SkinError> {
         self.authorization.clear()
     }
@@ -302,7 +279,11 @@ impl SkinProtocol {
         self.request_for_audience(uri, SkinProtocolAudience::Main)
     }
 
-    fn request_for_audience(&self, uri: &str, audience: SkinProtocolAudience) -> Response<Vec<u8>> {
+    pub(crate) fn request_for_audience(
+        &self,
+        uri: &str,
+        audience: SkinProtocolAudience,
+    ) -> Response<Vec<u8>> {
         let Some(requested_digest) = parse_canonical_uri(uri) else {
             return fixed_response(StatusCode::NOT_FOUND, NOT_FOUND_BODY);
         };
@@ -520,10 +501,6 @@ fn extension_for_mime(mime: &str) -> &'static str {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Phase 3 Task 4 启用预览登记后用于重新绑定导入格式"
-)]
 fn mime_for_format(format: SkinFormat) -> &'static str {
     match format {
         SkinFormat::Png => "image/png",
@@ -788,8 +765,9 @@ mod tests {
         let store = SkinStore::new(settings_root, skins_root.clone());
         store.save(0, active_draft(&active)).expect("save active");
         let previews = SkinPreviewRegistry::new(skins_root.clone());
+        let preview_ticket = previews.begin_registration().expect("preview ticket");
         previews
-            .register_imported(&preview)
+            .commit_imported(preview_ticket, &preview)
             .expect("register imported preview");
         let protocol = SkinProtocol::with_preview_registry(store, skins_root, previews.clone());
         let preview_url = skin_resource_url(&preview.digest).expect("preview URL");
@@ -850,7 +828,8 @@ mod tests {
         let outside = seed_image(&outside_root, b"outside-image");
         let previews = SkinPreviewRegistry::new(skins_root);
 
-        assert!(previews.register_imported(&outside).is_err());
+        let ticket = previews.begin_registration().expect("preview ticket");
+        assert!(previews.commit_imported(ticket, &outside).is_err());
         assert_eq!(previews.digest().expect("read registry"), None);
     }
 
@@ -876,10 +855,11 @@ mod tests {
             byte_size: 1,
             path: PathBuf::new(),
         };
+        let ticket = registry.begin_registration().expect("old ticket");
         let worker_registry = registry.clone();
         let worker = std::thread::spawn(move || {
             worker_registry
-                .register_imported(&image)
+                .commit_imported(ticket, &image)
                 .expect("stable superseded result")
         });
 
@@ -928,16 +908,20 @@ mod tests {
             byte_size: 1,
             path: PathBuf::new(),
         };
+        let old_ticket = registry.begin_registration().expect("old ticket");
         let old_registry = registry.clone();
         let old = std::thread::spawn(move || {
             old_registry
-                .register_imported(&old_image)
+                .commit_imported(old_ticket, &old_image)
                 .expect("old stable result")
         });
 
         old_validation_started.wait();
+        let new_ticket = registry.begin_registration().expect("new ticket");
         assert_eq!(
-            registry.register_imported(&new_image).expect("new commit"),
+            registry
+                .commit_imported(new_ticket, &new_image)
+                .expect("new commit"),
             SkinPreviewRegistration::Registered
         );
         new_committed.wait();

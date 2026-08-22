@@ -30,11 +30,22 @@
         "minHeight": 520,
         "visible": false,
         "resizable": true
+      },
+      {
+        "label": "appearance",
+        "title": "DSH Desktop · 外观",
+        "url": "index.html?view=appearance",
+        "width": 760,
+        "height": 720,
+        "minWidth": 680,
+        "minHeight": 620,
+        "visible": false,
+        "resizable": true
       }
     ],
     "security": {
-      "capabilities": ["local-main"],
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+      "capabilities": ["local-main", "local-appearance"],
+      "csp": "default-src 'self'; img-src 'self' data: dsh-skin: http://dsh-skin.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {

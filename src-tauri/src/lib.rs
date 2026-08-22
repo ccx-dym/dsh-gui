@@ -14,6 +14,9 @@ use diagnostics::{
     DiagnosticStage, FileDiagnosticSink, OperationTrace, TraceKind,
 };
 use paths::AppPaths;
+use skin::{
+    SkinController, choose_skin_image, get_skin_state, reset_skin_settings, save_skin_settings,
+};
 use tauri::{AppHandle, Manager};
 use tray::{CloseDecision, close_decision, setup_tray};
 use update_ui::{
@@ -89,6 +92,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         // 自定义协议必须在 setup 创建 WebView 前注册；回调只读取固定设置与托管图片目录。
         .register_uri_scheme_protocol("dsh-skin", |context, request| {
             skin::protocol::handle_tauri_skin_request(
@@ -103,7 +107,11 @@ pub fn run() {
             get_update_state,
             check_updates,
             install_compatible_update,
-            confirm_activation
+            confirm_activation,
+            get_skin_state,
+            choose_skin_image,
+            save_skin_settings,
+            reset_skin_settings
         ])
         .setup(|app| {
             let paths = AppPaths::resolve(app.handle())?;
@@ -112,12 +120,18 @@ pub fn run() {
             let diagnostic_sink = FileDiagnosticSink::new(logger, 256)?;
             let update_controller = UpdateUiController::new(paths.clone());
             let skin_previews = skin::protocol::SkinPreviewRegistry::new(paths.skins.clone());
+            let skin_controller = SkinController::new(
+                skin::SkinStore::new(paths.settings.clone(), paths.skins.clone()),
+                paths.skins.clone(),
+                skin_previews.clone(),
+            );
             let controller = AppController::new(app.handle().clone())?;
             #[cfg(debug_assertions)]
             controller.start_mock_runtime()?;
             app.manage(diagnostic_sink);
             app.manage(update_controller);
             app.manage(skin_previews);
+            app.manage(skin_controller);
             app.manage(controller);
             update_ui::spawn_scheduled_update_checks(app.handle().clone());
             #[cfg(not(debug_assertions))]

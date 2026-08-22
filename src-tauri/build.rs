@@ -6,6 +6,10 @@ fn main() {
         "check_updates",
         "install_compatible_update",
         "confirm_activation",
+        "get_skin_state",
+        "choose_skin_image",
+        "save_skin_settings",
+        "reset_skin_settings",
     ];
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));

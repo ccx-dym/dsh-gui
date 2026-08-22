@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-appearance",
+  "description": "本地外观设置窗口的最小权限",
+  "local": true,
+  "windows": ["appearance"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-skin-state",
+    "allow-choose-skin-image",
+    "allow-save-skin-settings",
+    "allow-reset-skin-settings"
+  ]
+}
