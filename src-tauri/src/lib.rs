@@ -3,6 +3,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod paths;
 pub mod runtime;
+pub mod skin;
 pub mod tray;
 pub mod update;
 pub mod update_ui;
