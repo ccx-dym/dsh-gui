@@ -1,4 +1,14 @@
 fn main() {
+    // Cargo 默认不会感知编译期发布通道变量；显式声明可避免切换通道后复用旧二进制。
+    for key in [
+        "DSH_DESKTOP_NPM_REGISTRY_ROOT",
+        "DSH_DESKTOP_COMPAT_MANIFEST_URL",
+        "DSH_DESKTOP_COMPAT_SIGNATURE_URL",
+        "DSH_DESKTOP_COMPAT_PUBLIC_KEY",
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
     const COMMANDS: &[&str] = &[
         "get_runtime_status",
         "retry_runtime",

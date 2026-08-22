@@ -1,4 +1,25 @@
+param(
+    [switch]$RequireReleaseChannel
+)
+
 $ErrorActionPreference = 'Stop'
+
+# 正式安装包必须在编译期获得完整的公开通道配置；固定错误码便于 CI 和发布人员识别，
+# 并且把检查放在耗时门禁之前，避免生成“可安装但无法下载 DSH”的构建。
+if ($RequireReleaseChannel) {
+    $releaseChannelKeys = @(
+        'DSH_DESKTOP_NPM_REGISTRY_ROOT',
+        'DSH_DESKTOP_COMPAT_MANIFEST_URL',
+        'DSH_DESKTOP_COMPAT_SIGNATURE_URL',
+        'DSH_DESKTOP_COMPAT_PUBLIC_KEY'
+    )
+    $missingKeys = @($releaseChannelKeys | Where-Object {
+        [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+    })
+    if ($missingKeys.Count -gt 0) {
+        throw "release_channel_missing: 缺少 $($missingKeys -join ', ')"
+    }
+}
 
 # 这里只检查开发环境和阶段 1 自动化门禁，不修改注册表或用户数据。
 # 先验证命令，避免门禁执行到中途才暴露工具链缺口。

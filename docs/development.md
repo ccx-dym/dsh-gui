@@ -156,13 +156,16 @@ URL 或对外分发：
 
 ```powershell
 $env:DSH_DESKTOP_NPM_REGISTRY_ROOT = 'https://registry.npmjs.org/'
-$env:DSH_DESKTOP_COMPAT_MANIFEST_URL = 'https://updates.example.invalid/stable/manifest.json'
-$env:DSH_DESKTOP_COMPAT_SIGNATURE_URL = 'https://updates.example.invalid/stable/manifest.sig'
+$env:DSH_DESKTOP_COMPAT_MANIFEST_URL = 'https://raw.githubusercontent.com/ccx-dym/dsh-gui/main/releases/runtime/stable/manifest.json'
+$env:DSH_DESKTOP_COMPAT_SIGNATURE_URL = 'https://raw.githubusercontent.com/ccx-dym/dsh-gui/main/releases/runtime/stable/manifest.sig'
 $env:DSH_DESKTOP_COMPAT_PUBLIC_KEY = '<64位小写hex发布公钥>'
+pwsh -NoProfile -File scripts/smoke-desktop.ps1 -RequireReleaseChannel
 pnpm tauri build --bundles nsis
 ```
 
-上例中的 `.invalid` 和公钥占位符不可用于实际发布。实际 CI 必须从已审核的发布配置注入
+GitHub Raw 地址只有在 stable manifest 和签名已经发布后才可用于正式构建；公钥占位符
+不可用于实际发布。`-RequireReleaseChannel` 会在任一编译期配置缺失时以
+`release_channel_missing` 失败，避免产出无法安装 DSH 的 EXE。实际 CI 必须从已审核的发布配置注入
 四个值，可另设 `DSH_DESKTOP_UPDATE_CHANNEL=stable`；这些变量不需要 token，也不得把生产
 私钥、API Key 或鉴权头放入环境或构建日志。
 
