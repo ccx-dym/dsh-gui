@@ -161,6 +161,8 @@ git commit -m "feat: persist bounded skin settings"
 **Files:**
 - Modify: `src-tauri/Cargo.toml`
 - Modify: `src-tauri/Cargo.lock`
+- Modify: `src-tauri/src/skin/mod.rs`
+- Modify: `src-tauri/src/skin/store.rs`（仅扩展导入所需的稳定错误分类）
 - Create: `src-tauri/src/skin/import.rs`
 - Create: `src-tauri/tests/skin_import.rs`
 

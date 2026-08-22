@@ -23,6 +23,11 @@ const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 pub enum SkinErrorKind {
     InvalidSettings,
     ImageNotRegistered,
+    TooLarge,
+    Dimensions,
+    Decode,
+    UnsupportedFormat,
+    Worker,
     RevisionConflict,
     RevisionExhausted,
     CorruptSettings,
@@ -36,6 +41,16 @@ pub enum SkinError {
     InvalidSettings,
     #[error("皮肤图片尚未登记")]
     ImageNotRegistered,
+    #[error("图片文件超过 20 MiB 限制")]
+    TooLarge,
+    #[error("图片尺寸超出允许范围")]
+    Dimensions,
+    #[error("图片数据损坏或无法完整解码")]
+    Decode,
+    #[error("仅支持 PNG、JPEG 和 WebP 图片")]
+    UnsupportedFormat,
+    #[error("图片处理任务意外终止")]
+    Worker,
     #[error("皮肤设置已被其他操作更新")]
     RevisionConflict,
     #[error("皮肤设置 revision 已耗尽")]
@@ -55,6 +70,11 @@ impl SkinError {
         match self {
             Self::InvalidSettings => SkinErrorKind::InvalidSettings,
             Self::ImageNotRegistered => SkinErrorKind::ImageNotRegistered,
+            Self::TooLarge => SkinErrorKind::TooLarge,
+            Self::Dimensions => SkinErrorKind::Dimensions,
+            Self::Decode => SkinErrorKind::Decode,
+            Self::UnsupportedFormat => SkinErrorKind::UnsupportedFormat,
+            Self::Worker => SkinErrorKind::Worker,
             Self::RevisionConflict => SkinErrorKind::RevisionConflict,
             Self::RevisionExhausted => SkinErrorKind::RevisionExhausted,
             Self::CorruptSettings => SkinErrorKind::CorruptSettings,
