@@ -2,14 +2,14 @@ use std::{
     fs::OpenOptions,
     io::Write,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use url::Url;
 
 #[cfg(any(not(debug_assertions), test))]
@@ -32,8 +32,8 @@ use crate::{
             UpdateStateStore,
         },
         download::{
-            ArtifactDownloader, DownloadCancellation, DownloadPolicy, DownloadRequest,
-            HttpsDownloader,
+            ArtifactDownloader, DownloadCancellation, DownloadPolicy, DownloadProgress,
+            DownloadProgressSink, DownloadRequest, HttpsDownloader,
         },
         manifest::{ManifestVerifier, VerifiedManifest},
         version_source::{
@@ -54,6 +54,40 @@ use crate::update::{
 };
 
 const UPDATE_EVENT: &str = "update-state";
+const DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct ProgressPublishThrottle {
+    last_published: Option<Instant>,
+}
+
+impl ProgressPublishThrottle {
+    fn delay_at(&self, now: Instant) -> Duration {
+        self.last_published
+            .map(|last| {
+                DOWNLOAD_PROGRESS_INTERVAL.saturating_sub(now.saturating_duration_since(last))
+            })
+            .unwrap_or_default()
+    }
+
+    fn mark_published(&mut self, now: Instant) {
+        self.last_published = Some(now);
+    }
+}
+
+struct WatchDownloadProgressSink {
+    sender: watch::Sender<DownloadProgress>,
+}
+
+impl DownloadProgressSink for WatchDownloadProgressSink {
+    fn report(&self, downloaded_bytes: u64, total_bytes: Option<u64>) {
+        // watch 只保留最新值，在 WebView 被挂起时也不会无界积压进度事件。
+        self.sender.send_replace(DownloadProgress {
+            downloaded_bytes,
+            total_bytes,
+        });
+    }
+}
 
 #[cfg(any(not(debug_assertions), test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +170,12 @@ pub struct UpdateUiState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skin_compatible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum_desktop_version: Option<String>,
@@ -154,6 +194,9 @@ impl Default for UpdateUiState {
             official_version: None,
             compatible_version: None,
             artifact_size: None,
+            downloaded_bytes: None,
+            download_percent: None,
+            skin_compatible: None,
             compatibility_summary: None,
             minimum_desktop_version: None,
             error_code: None,
@@ -274,6 +317,33 @@ impl UpdateUiController {
         }
     }
 
+    async fn manifest_for_install(&self) -> Result<VerifiedManifest, &'static str> {
+        self.manifest
+            .lock()
+            .await
+            .clone()
+            .ok_or("compatible_update_missing")
+    }
+
+    async fn persist_confirmation_and_consume(
+        &self,
+        pending: &PendingActivation,
+    ) -> Result<(), &'static str> {
+        let manifest = self
+            .manifest
+            .lock()
+            .await
+            .clone()
+            .ok_or("compatible_update_missing")?;
+        persist_confirmation(&self.paths, &manifest, pending).map_err(|_| "update_failed")?;
+        // 只有确认记录已经耐久落盘后才消费本次清单；失败时保留以允许安全重试。
+        let mut stored = self.manifest.lock().await;
+        if stored.as_ref() == Some(&manifest) {
+            *stored = None;
+        }
+        Ok(())
+    }
+
     #[cfg(not(debug_assertions))]
     async fn publish_cold_phase(
         &self,
@@ -326,9 +396,42 @@ fn clear_notice_fields(state: &mut UpdateUiState) {
     state.official_version = None;
     state.compatible_version = None;
     state.artifact_size = None;
+    state.downloaded_bytes = None;
+    state.download_percent = None;
+    state.skin_compatible = None;
     state.compatibility_summary = None;
     state.minimum_desktop_version = None;
     state.error_code = None;
+}
+
+fn bounded_download_percent(downloaded_bytes: u64, total_bytes: Option<u64>) -> Option<u8> {
+    let total_bytes = total_bytes.filter(|total| *total > 0)?;
+    let bounded = downloaded_bytes.min(total_bytes) as u128;
+    Some(((bounded * 100) / total_bytes as u128) as u8)
+}
+
+async fn publish_download_progress(
+    controller: &UpdateUiController,
+    app: &AppHandle,
+    mut receiver: watch::Receiver<DownloadProgress>,
+) {
+    let mut throttle = ProgressPublishThrottle::default();
+    while receiver.changed().await.is_ok() {
+        let delay = throttle.delay_at(Instant::now());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let progress = *receiver.borrow_and_update();
+        let mut state = controller.state.lock().await.clone();
+        if !matches!(state.phase, UpdateUiPhase::Downloading) {
+            return;
+        }
+        state.downloaded_bytes = Some(progress.downloaded_bytes);
+        state.download_percent =
+            bounded_download_percent(progress.downloaded_bytes, progress.total_bytes);
+        controller.publish(app, state).await;
+        throttle.mark_published(Instant::now());
+    }
 }
 
 fn apply_notice(
@@ -356,6 +459,7 @@ fn apply_notice(
             state.phase = UpdateUiPhase::RuntimeAvailable;
             state.official_version = Some(official.clone());
             state.compatible_version = Some(compatible.clone());
+            state.skin_compatible = Some(true);
         }
         UpdateNotice::DesktopRequired {
             official,
@@ -376,6 +480,7 @@ fn apply_notice(
             state.phase = UpdateUiPhase::SkinUnverified;
             state.official_version = Some(official.clone());
             state.compatible_version = Some(compatible.clone());
+            state.skin_compatible = Some(false);
         }
         UpdateNotice::Offline { error_kind, .. } => {
             state.phase = UpdateUiPhase::Offline;
@@ -696,16 +801,13 @@ pub async fn install_compatible_update(
     ) {
         return Err("update_transition_denied");
     }
-    let manifest = controller
-        .manifest
-        .lock()
-        .await
-        .clone()
-        .ok_or("compatible_update_missing")?;
-    // 安装操作持有受信清单快照后立即消费授权，后续失败或重复点击都不能复用旧清单。
-    *controller.manifest.lock().await = None;
+    let manifest = controller.manifest_for_install().await?;
+    // phase、revision 与 operation gate 共同阻止重复下载；清单保留到确认记录落盘成功，
+    // 从而让同一次受信安装事务能完成冷启动授权。
     let mut downloading = controller.state.lock().await.clone();
     downloading.phase = UpdateUiPhase::Downloading;
+    downloading.downloaded_bytes = Some(0);
+    downloading.download_percent = None;
     downloading.should_notify = false;
     controller.publish(&app, downloading).await;
     let diagnostics = DiagnosticContext::begin(TraceKind::Update, Arc::new(sink.inner().clone()));
@@ -713,6 +815,7 @@ pub async fn install_compatible_update(
         match download_and_stage(&controller, &app, &manifest, &diagnostics).await {
             Ok(pending) => pending,
             Err(code) => {
+                *controller.manifest.lock().await = None;
                 let mut failed = controller.state.lock().await.clone();
                 clear_notice_fields(&mut failed);
                 failed.phase = UpdateUiPhase::Failed;
@@ -758,19 +861,30 @@ async fn download_and_stage(
     }
     let downloader =
         HttpsDownloader::new(DownloadPolicy::default()).map_err(|_| "update_failed")?;
-    let downloaded = downloader
-        .download(
-            DownloadRequest {
-                artifact: &manifest.manifest.artifact,
-                updates_dir: &controller.paths.updates,
-                cancellation: DownloadCancellation::default(),
-            },
-            diagnostics,
-        )
-        .await
-        .map_err(|_| "update_failed")?;
+    let (progress_sender, progress_receiver) = watch::channel(DownloadProgress::default());
+    let download_future = async {
+        let progress = WatchDownloadProgressSink {
+            sender: progress_sender,
+        };
+        downloader
+            .download(
+                DownloadRequest {
+                    artifact: &manifest.manifest.artifact,
+                    updates_dir: &controller.paths.updates,
+                    cancellation: DownloadCancellation::default(),
+                    progress: &progress,
+                },
+                diagnostics,
+            )
+            .await
+    };
+    let progress_future = publish_download_progress(controller, app, progress_receiver);
+    let (downloaded, ()) = tokio::join!(download_future, progress_future);
+    let downloaded = downloaded.map_err(|_| "update_failed")?;
     let mut verifying = controller.state.lock().await.clone();
     verifying.phase = UpdateUiPhase::Verifying;
+    verifying.downloaded_bytes = None;
+    verifying.download_percent = None;
     controller.publish(app, verifying).await;
     let request = ArchiveInstallRequest::from_downloaded(
         downloaded,
@@ -825,19 +939,15 @@ pub async fn confirm_activation(
     {
         return Err("update_transition_denied");
     }
-    let manifest = controller
-        .manifest
-        .lock()
-        .await
-        .clone()
-        .ok_or("compatible_update_missing")?;
     let pending = controller
         .pending
         .lock()
         .await
         .clone()
         .ok_or("compatible_update_missing")?;
-    persist_confirmation(&controller.paths, &manifest, &pending).map_err(|_| "update_failed")?;
+    controller
+        .persist_confirmation_and_consume(&pending)
+        .await?;
     let mut confirmed = controller.state.lock().await.clone();
     confirmed.phase = UpdateUiPhase::RestartPending;
     confirmed.error_code = Some("activation_confirmed".to_owned());
@@ -1621,11 +1731,53 @@ fn write_new_or_matching(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 mod tests {
     use super::{
         ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
-        UpdateUiController, UpdateUiPhase, UpdateUiState, activation_receipt, apply_notice,
-        confirmation_path, finish_cold_recovery, inspect_orphan_candidate_with,
-        load_single_confirmed_pending, pending_path, plan_cold_recovery,
-        recover_orphan_candidate_with, write_activation_receipt,
+        ProgressPublishThrottle, UpdateUiController, UpdateUiPhase, UpdateUiState,
+        activation_receipt, apply_notice, bounded_download_percent, confirmation_path,
+        finish_cold_recovery, inspect_orphan_candidate_with, load_single_confirmed_pending,
+        pending_path, persist_pending, plan_cold_recovery, recover_orphan_candidate_with,
+        write_activation_receipt,
     };
+
+    #[test]
+    fn download_percent_is_bounded_and_unknown_totals_stay_indeterminate() {
+        assert_eq!(bounded_download_percent(0, Some(100)), Some(0));
+        assert_eq!(bounded_download_percent(50, Some(100)), Some(50));
+        assert_eq!(bounded_download_percent(150, Some(100)), Some(100));
+        assert_eq!(
+            bounded_download_percent(u64::MAX, Some(u64::MAX)),
+            Some(100)
+        );
+        assert_eq!(bounded_download_percent(50, None), None);
+        assert_eq!(bounded_download_percent(50, Some(0)), None);
+
+        let state = UpdateUiState {
+            downloaded_bytes: Some(50),
+            download_percent: Some(50),
+            skin_compatible: Some(false),
+            ..UpdateUiState::default()
+        };
+        let value = serde_json::to_value(state).expect("下载状态必须可序列化");
+        assert_eq!(value["downloadedBytes"], 50);
+        assert_eq!(value["downloadPercent"], 50);
+        assert_eq!(value["skinCompatible"], false);
+    }
+
+    #[test]
+    fn download_progress_publication_is_limited_to_ten_events_per_second() {
+        let started = std::time::Instant::now();
+        let mut throttle = ProgressPublishThrottle::default();
+        assert_eq!(throttle.delay_at(started), Duration::ZERO);
+        throttle.mark_published(started);
+        assert_eq!(throttle.delay_at(started), Duration::from_millis(100));
+        assert_eq!(
+            throttle.delay_at(started + Duration::from_millis(60)),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            throttle.delay_at(started + Duration::from_millis(100)),
+            Duration::ZERO
+        );
+    }
     use crate::domain::UpdateNotice;
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::install_state::{
@@ -1634,14 +1786,20 @@ mod tests {
     use crate::update::activation::{
         ActivationCheckpoint, ActivationError, ActivationFailure, ActivationFailureStage,
     };
+    use crate::update::manifest::{
+        CompatibilityManifest, CoreCompatibility, RuntimeArtifact, SkinCompatibility,
+        VerifiedManifest,
+    };
     use crate::update::probe::ProbeError;
+    use semver::Version;
     use std::{
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
+    use url::Url;
 
     #[test]
     fn notices_keep_distinct_ui_phases_and_clear_stale_artifact_fields() {
@@ -1652,6 +1810,7 @@ mod tests {
                     official: "0.1.1-rc.2".to_owned(),
                 },
                 UpdateUiPhase::OfficialAvailable,
+                None,
             ),
             (
                 UpdateNotice::RuntimeAvailable {
@@ -1660,6 +1819,7 @@ mod tests {
                     compatible: "0.1.1-rc.2".to_owned(),
                 },
                 UpdateUiPhase::RuntimeAvailable,
+                Some(true),
             ),
             (
                 UpdateNotice::DesktopRequired {
@@ -1669,6 +1829,7 @@ mod tests {
                     minimum_desktop: "0.2.0".to_owned(),
                 },
                 UpdateUiPhase::DesktopRequired,
+                None,
             ),
             (
                 UpdateNotice::SkinUnverified {
@@ -1677,6 +1838,7 @@ mod tests {
                     compatible: "0.1.1-rc.2".to_owned(),
                 },
                 UpdateUiPhase::SkinUnverified,
+                Some(false),
             ),
             (
                 UpdateNotice::Offline {
@@ -1685,13 +1847,17 @@ mod tests {
                     error_kind: "network".to_owned(),
                 },
                 UpdateUiPhase::Offline,
+                None,
             ),
         ];
 
-        for (notice, expected_phase) in cases {
+        for (notice, expected_phase, expected_skin_compatible) in cases {
             let mut state = UpdateUiState {
                 compatible_version: Some("stale".to_owned()),
                 artifact_size: Some(99),
+                downloaded_bytes: Some(50),
+                download_percent: Some(50),
+                skin_compatible: Some(true),
                 compatibility_summary: Some("stale".to_owned()),
                 minimum_desktop_version: Some("9.9.9".to_owned()),
                 error_code: Some("stale_error".to_owned()),
@@ -1704,10 +1870,69 @@ mod tests {
             );
             assert_ne!(state.compatible_version.as_deref(), Some("stale"));
             assert_eq!(state.artifact_size, None);
+            assert_eq!(state.downloaded_bytes, None);
+            assert_eq!(state.download_percent, None);
+            assert_eq!(state.skin_compatible, expected_skin_compatible);
             assert_eq!(state.compatibility_summary, None);
             assert_ne!(state.minimum_desktop_version.as_deref(), Some("9.9.9"));
             assert_ne!(state.error_code.as_deref(), Some("stale_error"));
         }
+    }
+
+    fn test_verified_manifest() -> VerifiedManifest {
+        VerifiedManifest {
+            manifest: CompatibilityManifest {
+                schema: 2,
+                dsh_version: Version::parse("0.1.1-rc.2").unwrap(),
+                node_version: Version::parse("24.15.0").unwrap(),
+                minimum_desktop_version: Version::parse("0.1.0").unwrap(),
+                core_compatibility: CoreCompatibility::Compatible,
+                skin_compatibility: SkinCompatibility::Verified,
+                platform: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                artifact: RuntimeArtifact {
+                    url: Url::parse("https://updates.example.invalid/runtime.zip").unwrap(),
+                    size: 10,
+                    sha256: [3_u8; 32],
+                },
+                verified_at: "2026-08-22T00:00:00Z".to_owned(),
+                compatibility_summary: "verified".to_owned(),
+            },
+            manifest_digest: "a".repeat(64),
+            desktop_version_supported: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn install_retains_manifest_until_confirmation_is_persisted() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("dsh-confirm-manifest-{nonce}"));
+        let paths = AppPaths::from_roots(&root.join("roaming"), &root.join("local"));
+        let controller = UpdateUiController::new(paths.clone());
+        let manifest = test_verified_manifest();
+        *controller.manifest.lock().await = Some(manifest.clone());
+        let pending = persist_pending(&paths, &manifest).expect("pending fixture");
+
+        assert_eq!(controller.manifest_for_install().await.unwrap(), manifest);
+        assert!(controller.manifest.lock().await.is_some());
+        assert_eq!(
+            controller.persist_confirmation_and_consume(&pending).await,
+            Err("update_failed")
+        );
+        assert!(controller.manifest.lock().await.is_some());
+
+        let runtime =
+            InstalledRuntime::with_node_version("0.1.1-rc.2", "a".repeat(64), "24.15.0").unwrap();
+        std::fs::create_dir_all(RuntimeLayout::from_paths(&paths).runtime_dir(&runtime)).unwrap();
+        controller
+            .persist_confirmation_and_consume(&pending)
+            .await
+            .expect("确认持久化应成功");
+        assert!(controller.manifest.lock().await.is_none());
+        assert!(confirmation_path(&paths, &pending).is_file());
     }
 
     #[tokio::test]

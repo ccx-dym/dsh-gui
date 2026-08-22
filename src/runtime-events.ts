@@ -23,6 +23,9 @@ export interface UpdateState {
   officialVersion?: string;
   compatibleVersion?: string;
   artifactSize?: number;
+  downloadedBytes?: number;
+  downloadPercent?: number;
+  skinCompatible?: boolean;
   compatibilitySummary?: string;
   minimumDesktopVersion?: string;
   errorCode?: string;
@@ -75,6 +78,18 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatProgressBytes(bytes: number): string {
+  const bounded = Math.max(0, bytes);
+  if (bounded < 1024) return `${bounded} B`;
+  if (bounded < 1024 * 1024) return `${(bounded / 1024).toFixed(1)} KB`;
+  return `${(bounded / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function safeDownloadPercent(percent: number | undefined): number | undefined {
+  if (percent === undefined || !Number.isFinite(percent)) return undefined;
+  return Math.max(0, Math.min(100, Math.trunc(percent)));
+}
+
 export function updatePresentation(state: UpdateState): UpdatePresentation {
   const retry: UpdateAction = {
     command: "check_updates",
@@ -121,15 +136,17 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
     case "runtime_available": {
       const version = state.compatibleVersion ?? "未知版本";
       const size = state.artifactSize === undefined ? "大小未知" : formatBytes(state.artifactSize);
+      const firstInstall = state.currentVersion === undefined;
+      const actionLabel = firstInstall ? `安装 DSH ${version}` : "查看并安装";
       return {
         eyebrow: "兼容版本",
-        heading: "运行时更新可用",
+        heading: firstInstall ? `安装 DSH ${version}` : "运行时更新可用",
         body: "运行中只下载并暂存；不会中断当前任务。",
         details: `${version} · ${size}`,
         summary: state.compatibilitySummary,
         primaryAction: state.artifactSize === undefined ? undefined : {
           command: "install_compatible_update",
-          label: "查看并安装",
+          label: actionLabel,
           confirmation: `下载并验证 DSH ${version}（${size}）。完成后需重启才能安装/激活。`,
         },
         busy: false,
@@ -145,15 +162,17 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
     case "skin_unverified": {
       const version = state.compatibleVersion ?? "当前版本";
       const size = state.artifactSize === undefined ? "大小未知" : formatBytes(state.artifactSize);
+      const firstInstall = state.currentVersion === undefined;
+      const actionLabel = firstInstall ? `安装 DSH ${version}` : "查看并安装";
       return {
         eyebrow: "皮肤兼容性",
-        heading: "皮肤尚未验证",
+        heading: firstInstall ? `安装 DSH ${version}` : "皮肤尚未验证",
         body: "安装此版本后会关闭自定义皮肤并恢复官方界面；DSH 核心功能仍可使用。",
         details: state.artifactSize === undefined ? version : `${version} · ${size}`,
         summary: state.compatibilitySummary,
         primaryAction: state.artifactSize === undefined ? undefined : {
           command: "install_compatible_update",
-          label: "查看并安装",
+          label: actionLabel,
           confirmation: `下载并验证 DSH ${version}（${size}）。更新后将关闭自定义皮肤。`,
         },
         busy: false,
@@ -167,8 +186,20 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
         primaryAction: retry,
         busy: false,
       };
-    case "downloading":
-      return { eyebrow: "安全暂存", heading: "正在下载", body: "校验大小与 SHA-256 后才会继续。", busy: true };
+    case "downloading": {
+      const downloaded = Math.max(0, state.downloadedBytes ?? 0);
+      const percent = safeDownloadPercent(state.downloadPercent);
+      const knownTotal = percent !== undefined && state.artifactSize !== undefined;
+      return {
+        eyebrow: "安全暂存",
+        heading: "正在下载",
+        body: "校验大小与 SHA-256 后才会继续。",
+        details: knownTotal
+          ? `${percent}% · ${formatProgressBytes(downloaded)} / ${formatProgressBytes(state.artifactSize!)}`
+          : `已下载 ${formatProgressBytes(downloaded)} · 总大小未知`,
+        busy: true,
+      };
+    }
     case "verifying":
       return { eyebrow: "安全暂存", heading: "正在验证", body: "正在复核运行时内容闭包。", busy: true };
     case "probing":

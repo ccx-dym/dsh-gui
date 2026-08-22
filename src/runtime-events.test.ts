@@ -7,6 +7,33 @@ import {
 } from "./runtime-events";
 
 describe("updatePresentation", () => {
+  it("首次安装直接展示已验证版本的安装动作", () => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "runtime_available",
+      compatibleVersion: "0.1.1-rc.2",
+      artifactSize: 108_024_750,
+    });
+    expect(presentation.heading).toBe("安装 DSH 0.1.1-rc.2");
+    expect(presentation.primaryAction?.command).toBe("install_compatible_update");
+    expect(presentation.primaryAction?.label).toBe("安装 DSH 0.1.1-rc.2");
+  });
+
+  it.each([
+    [50, 100, 50, "50% · 50 B / 100 B"],
+    [150, 100, 100, "100% · 150 B / 100 B"],
+    [0, undefined, undefined, "已下载 0 B · 总大小未知"],
+  ] as const)("安全呈现下载进度 %s/%s", (downloadedBytes, artifactSize, downloadPercent, details) => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "downloading",
+      downloadedBytes,
+      downloadPercent,
+      artifactSize,
+    });
+    expect(presentation.details).toBe(details);
+  });
+
   it.each([
     ["official_available", "官方版本已发布", undefined],
     ["runtime_available", "运行时更新可用", "查看并安装"],
@@ -17,6 +44,10 @@ describe("updatePresentation", () => {
     const presentation = updatePresentation({
       ...createInitialUpdateState(),
       phase,
+      currentVersion:
+        phase === "runtime_available" || phase === "skin_unverified"
+          ? "0.1.0"
+          : undefined,
       officialVersion: "0.1.1-rc.2",
       compatibleVersion: "0.1.1-rc.2",
       minimumDesktopVersion: "0.2.0",
@@ -34,6 +65,18 @@ describe("updatePresentation", () => {
       artifactSize: 100,
     });
     expect(presentation.primaryAction?.command).toBe("install_compatible_update");
+    expect(presentation.body).toContain("关闭自定义皮肤");
+  });
+
+  it("首次安装皮肤未验证版本时仍使用安装文案并保留关闭警告", () => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "skin_unverified",
+      compatibleVersion: "0.1.1-rc.2",
+      artifactSize: 100,
+    });
+    expect(presentation.heading).toBe("安装 DSH 0.1.1-rc.2");
+    expect(presentation.primaryAction?.label).toBe("安装 DSH 0.1.1-rc.2");
     expect(presentation.body).toContain("关闭自定义皮肤");
   });
 
@@ -60,7 +103,11 @@ describe("updatePresentation", () => {
     ["rolling_back", "正在回滚", undefined],
     ["recovery_required", "需要人工恢复", undefined],
   ] as const)("为 %s 返回安全操作文案", (phase, heading, action) => {
-    const state = { ...createInitialUpdateState(), phase } as UpdateState;
+    const state = {
+      ...createInitialUpdateState(),
+      phase,
+      currentVersion: phase === "runtime_available" ? "0.1.0" : undefined,
+    } as UpdateState;
     const presentation = updatePresentation(state);
     expect(presentation.heading).toContain(heading);
     expect(presentation.primaryAction?.label).toBe(action);

@@ -32,6 +32,35 @@ beforeEach(() => {
 });
 
 describe("更新控制台", () => {
+  it("下载状态呈现真实进度并限制可访问百分比", async () => {
+    tauriMocks.invoke.mockImplementation(async (command: string) =>
+      command === "get_update_state"
+        ? {
+            revision: 2,
+            state: {
+              revision: 2,
+              phase: "downloading",
+              downloadedBytes: 150,
+              downloadPercent: 100,
+              artifactSize: 100,
+              notificationsEnabled: true,
+              shouldNotify: false,
+            },
+          }
+        : { phase: "idle", message: "等待" },
+    );
+
+    await import("./main");
+    const progress = await vi.waitFor(() =>
+      document.querySelector<HTMLElement>("[role='progressbar']"),
+    );
+    expect(progress?.getAttribute("aria-valuenow")).toBe("100");
+    expect(progress?.getAttribute("aria-valuemax")).toBe("100");
+    expect(document.querySelector(".update-console__details")?.textContent).toBe(
+      "100% · 150 B / 100 B",
+    );
+  });
+
   it("不由可能被节流的 WebView 定时器承担后台检查", async () => {
     const interval = vi.spyOn(window, "setInterval");
     await import("./main");
@@ -76,6 +105,7 @@ describe("更新控制台", () => {
           state: {
             revision: 1,
             phase: "runtime_available",
+            currentVersion: "0.1.0",
             compatibleVersion: "0.1.2",
             artifactSize: 108_024_750,
             compatibilitySummary: "Windows 10/11 x64 验证通过",

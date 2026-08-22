@@ -94,6 +94,24 @@ pub struct DownloadRequest<'a> {
     pub artifact: &'a RuntimeArtifact,
     pub updates_dir: &'a Path,
     pub cancellation: DownloadCancellation,
+    pub progress: &'a dyn DownloadProgressSink,
+}
+
+/// 下载器向上层报告的实际流式字节进度。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DownloadProgress {
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+/// 下载进度的只写边界；实现方不得影响下载结果或接触响应内容。
+pub trait DownloadProgressSink: Send + Sync {
+    /// 报告当前尝试已经成功写入暂存文件的字节数。
+    ///
+    /// :param downloaded_bytes: 当前尝试已经写入的实际字节数。
+    /// :param total_bytes: HTTP 响应声明的总长度；未声明时为 `None`。
+    /// :return: `()`；进度只用于展示，不参与完整性判断。
+    fn report(&self, downloaded_bytes: u64, total_bytes: Option<u64>);
 }
 
 /// 已完成大小与摘要双校验、可交给解压器的暂存文件。
@@ -373,7 +391,8 @@ impl HttpsDownloader {
             }));
         }
 
-        if let Some(declared) = response.content_length() {
+        let total_bytes = response.content_length();
+        if let Some(declared) = total_bytes {
             if declared > self.policy.max_artifact_bytes {
                 return Err(AttemptFailure::Final(DownloadError::SizeLimitExceeded));
             }
@@ -381,6 +400,9 @@ impl HttpsDownloader {
                 return Err(AttemptFailure::Final(DownloadError::SizeMismatch));
             }
         }
+
+        // 每次重试从零重新报告，避免 UI 把失败尝试的字节误加到新响应。
+        request.progress.report(0, total_bytes);
 
         let mut stream = response.bytes_stream();
         let mut hasher = Sha256::new();
@@ -415,6 +437,7 @@ impl HttpsDownloader {
             file.write_all(&chunk)
                 .await
                 .map_err(|_| AttemptFailure::Final(DownloadError::FileSystem))?;
+            request.progress.report(size, total_bytes);
         }
 
         if size != request.artifact.size {
@@ -639,9 +662,29 @@ mod tests {
     use url::Url;
 
     use super::{
-        ArtifactDownloader, DownloadCancellation, DownloadError, DownloadPolicy, DownloadRequest,
-        HttpsDownloader, select_retry_delay,
+        ArtifactDownloader, DownloadCancellation, DownloadError, DownloadPolicy, DownloadProgress,
+        DownloadProgressSink, DownloadRequest, HttpsDownloader, select_retry_delay,
     };
+
+    #[derive(Default)]
+    struct RecordingProgress(std::sync::Mutex<Vec<DownloadProgress>>);
+
+    impl DownloadProgressSink for RecordingProgress {
+        fn report(&self, downloaded_bytes: u64, total_bytes: Option<u64>) {
+            self.0.lock().unwrap().push(DownloadProgress {
+                downloaded_bytes,
+                total_bytes,
+            });
+        }
+    }
+
+    struct IgnoreProgress;
+
+    impl DownloadProgressSink for IgnoreProgress {
+        fn report(&self, _downloaded_bytes: u64, _total_bytes: Option<u64>) {}
+    }
+
+    static IGNORE_PROGRESS: IgnoreProgress = IgnoreProgress;
     use crate::diagnostics::{DiagnosticContext, TraceKind};
     use crate::update::manifest::RuntimeArtifact;
 
@@ -751,6 +794,7 @@ mod tests {
                     artifact,
                     updates_dir: root,
                     cancellation,
+                    progress: &IGNORE_PROGRESS,
                 },
                 &diagnostics,
             )
@@ -816,6 +860,78 @@ mod tests {
         assert_eq!(downloaded.size, 16);
         assert_eq!(downloaded.sha256, artifact.sha256);
         assert!(!root.join("trace_01/artifact.part").exists());
+    }
+
+    #[tokio::test]
+    async fn reports_real_streamed_bytes_with_known_and_unknown_totals() {
+        for (label, content_length, expected_total) in [
+            ("known-progress", Some(16), Some(16)),
+            ("unknown-progress", None, None),
+        ] {
+            let body = b"verified-runtime";
+            let (url, _) = spawn_server(vec![response("200 OK", body, content_length)]);
+            let artifact = artifact(url, body, None);
+            let root = test_root(label);
+            let downloader = HttpsDownloader::new_for_test(policy()).expect("test client");
+            let diagnostics = DiagnosticContext::noop(TraceKind::Update);
+            let progress = RecordingProgress::default();
+
+            downloader
+                .download(
+                    DownloadRequest {
+                        artifact: &artifact,
+                        updates_dir: &root,
+                        cancellation: Default::default(),
+                        progress: &progress,
+                    },
+                    &diagnostics,
+                )
+                .await
+                .expect("下载应完成");
+
+            let reports = progress.0.lock().unwrap();
+            assert_eq!(reports.first().unwrap().downloaded_bytes, 0);
+            assert_eq!(reports.first().unwrap().total_bytes, expected_total);
+            assert_eq!(reports.last().unwrap().downloaded_bytes, body.len() as u64);
+            assert_eq!(reports.last().unwrap().total_bytes, expected_total);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_resets_progress_before_reporting_the_new_attempt() {
+        let body = b"verified-runtime";
+        let (url, attempts) = spawn_server(vec![
+            response("200 OK", b"part", Some(body.len() as u64)),
+            response("200 OK", body, Some(body.len() as u64)),
+        ]);
+        let artifact = artifact(url, body, None);
+        let root = test_root("retry-progress-reset");
+        let downloader = HttpsDownloader::new_for_test(policy()).expect("test client");
+        let diagnostics = DiagnosticContext::noop(TraceKind::Update);
+        let progress = RecordingProgress::default();
+
+        downloader
+            .download(
+                DownloadRequest {
+                    artifact: &artifact,
+                    updates_dir: &root,
+                    cancellation: Default::default(),
+                    progress: &progress,
+                },
+                &diagnostics,
+            )
+            .await
+            .expect("第二次尝试应完成");
+
+        let reports = progress.0.lock().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.downloaded_bytes)
+                .collect::<Vec<_>>(),
+            vec![0, 4, 0, body.len() as u64]
+        );
     }
 
     #[tokio::test]
@@ -1068,6 +1184,7 @@ mod tests {
                     artifact: &artifact,
                     updates_dir: &root,
                     cancellation: Default::default(),
+                    progress: &IGNORE_PROGRESS,
                 },
                 &diagnostics,
             )
@@ -1092,6 +1209,7 @@ mod tests {
                     artifact: &artifact,
                     updates_dir: &root,
                     cancellation: Default::default(),
+                    progress: &IGNORE_PROGRESS,
                 },
                 &diagnostics,
             )

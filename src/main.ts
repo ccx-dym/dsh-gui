@@ -179,6 +179,11 @@ function renderUpdateState(target: HTMLElement, state: UpdateState): void {
     progress.className = "update-console__progress";
     progress.setAttribute("role", "progressbar");
     progress.setAttribute("aria-label", presentation.heading);
+    progress.setAttribute("aria-valuemax", "100");
+    if (state.downloadPercent !== undefined && Number.isFinite(state.downloadPercent)) {
+      const percent = Math.max(0, Math.min(100, Math.trunc(state.downloadPercent)));
+      progress.setAttribute("aria-valuenow", String(percent));
+    }
     rail.append(progress);
   }
   target.append(rail);
