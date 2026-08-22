@@ -52,6 +52,7 @@ trait RuntimeUi: Send + Sync + 'static {
 struct TauriRuntimeUi {
     app: AppHandle,
     trace: OperationTrace,
+    dsh_version: Option<semver::Version>,
 }
 
 #[cfg(debug_assertions)]
@@ -81,6 +82,7 @@ impl RuntimeLifecycle for MockRuntimeLifecycle {
         let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
             app: self.app.clone(),
             trace: OperationTrace::begin(TraceKind::Runtime),
+            dsh_version: None,
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -121,6 +123,7 @@ impl OfficialRuntimeLifecycle {
         let ui: Arc<dyn RuntimeUi> = Arc::new(TauriRuntimeUi {
             app: self.app.clone(),
             trace: OperationTrace::begin(TraceKind::Runtime),
+            dsh_version: Some(deployment.runtime.version.clone()),
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -240,11 +243,28 @@ impl RuntimeUi for TauriRuntimeUi {
     }
 
     fn navigate_main(&self, url: &tauri::Url) -> Result<(), RuntimeError> {
-        self.app
-            .get_webview_window("main")
-            .ok_or(RuntimeError::MainWindowMissing)?
+        if let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>() {
+            if let Some(version) = self.dsh_version.as_ref() {
+                adapter.bind_navigation(version, url);
+            } else {
+                adapter.clear();
+            }
+        }
+        let Some(main) = self.app.get_webview_window("main") else {
+            if let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>() {
+                adapter.clear();
+            }
+            return Err(RuntimeError::MainWindowMissing);
+        };
+        let result = main
             .navigate(url.clone())
-            .map_err(|error| RuntimeError::Tauri(error.to_string()))
+            .map_err(|error| RuntimeError::Tauri(error.to_string()));
+        if result.is_err()
+            && let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>()
+        {
+            adapter.clear();
+        }
+        result
     }
 }
 

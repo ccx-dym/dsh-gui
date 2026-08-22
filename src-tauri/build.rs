@@ -10,6 +10,7 @@ fn main() {
         "choose_skin_image",
         "save_skin_settings",
         "reset_skin_settings",
+        "report_skin_adapter",
     ];
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));

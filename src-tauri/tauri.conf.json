@@ -44,7 +44,7 @@
       }
     ],
     "security": {
-      "capabilities": ["local-main", "local-appearance"],
+      "capabilities": ["local-main", "local-appearance", "official-skin-report"],
       "csp": "default-src 'self'; img-src 'self' data: dsh-skin: http://dsh-skin.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     }
   },

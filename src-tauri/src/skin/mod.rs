@@ -1,11 +1,16 @@
 //! 沉浸式皮肤的类型化设置与持久化边界。
 
+pub(crate) mod adapter;
 mod controller;
 mod import;
 mod model;
 pub(crate) mod protocol;
 mod store;
 
+pub use adapter::{
+    DSH_ADAPTER_V1, DshAdapter, SkinAdapterController, SkinAdapterReport, adapter_for,
+    adapter_script, cleanup_script, page_script, report_skin_adapter,
+};
 pub use controller::{
     SkinCommandError, SkinController, SkinImageView, choose_skin_image, get_skin_state,
     reset_skin_settings, save_skin_settings,

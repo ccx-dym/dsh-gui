@@ -101,6 +101,7 @@ pub enum DiagnosticStage {
     SingleInstanceFocus,
     SingleInstanceShow,
     SingleInstanceWindow,
+    SkinApply,
     TrayExit,
     TrayHide,
     TrayOpen,
@@ -418,6 +419,7 @@ fn is_persisted_stage(value: &str) -> bool {
             | "single_instance_focus"
             | "single_instance_show"
             | "single_instance_window"
+            | "skin_apply"
             | "tray_exit"
             | "tray_hide"
             | "tray_open"

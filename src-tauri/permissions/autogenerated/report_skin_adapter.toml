@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-report-skin-adapter"
+description = "Enables the report_skin_adapter command without any pre-configured scope."
+commands.allow = ["report_skin_adapter"]
+
+[[permission]]
+identifier = "deny-report-skin-adapter"
+description = "Denies the report_skin_adapter command without any pre-configured scope."
+commands.deny = ["report_skin_adapter"]

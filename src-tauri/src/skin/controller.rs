@@ -1,3 +1,4 @@
+use super::adapter::refresh_main_skin;
 use super::protocol::{
     PreviewRegistrationTicket, SkinPreviewRegistration, SkinPreviewRegistry, skin_resource_url,
 };
@@ -270,12 +271,16 @@ pub fn save_skin_settings(
     expected_revision: u64,
     draft: SkinDraft,
 ) -> Result<SkinStateEnvelope, SkinCommandError> {
-    controller
+    let state = controller
         .save_with_publisher(expected_revision, draft, |state| {
             // 事件仅是同一窗口内的同步提示；发送失败不能反向改写已持久化设置。
             let _ = app.emit_to("appearance", SKIN_STATE_EVENT, state);
         })
-        .map_err(Into::into)
+        .map_err(SkinCommandError::from)?;
+    if refresh_main_skin(&app, &state.settings).is_err() {
+        crate::record_skin_apply_diagnostic(&app);
+    }
+    Ok(state)
 }
 
 /// 恢复默认皮肤设置，不删除已导入图片。
@@ -291,11 +296,15 @@ pub fn reset_skin_settings(
     controller: State<'_, SkinController>,
     expected_revision: u64,
 ) -> Result<SkinStateEnvelope, SkinCommandError> {
-    controller
+    let state = controller
         .reset_with_publisher(expected_revision, |state| {
             let _ = app.emit_to("appearance", SKIN_STATE_EVENT, state);
         })
-        .map_err(Into::into)
+        .map_err(SkinCommandError::from)?;
+    if refresh_main_skin(&app, &state.settings).is_err() {
+        crate::record_skin_apply_diagnostic(&app);
+    }
+    Ok(state)
 }
 
 #[cfg(test)]

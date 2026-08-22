@@ -15,7 +15,8 @@ use diagnostics::{
 };
 use paths::AppPaths;
 use skin::{
-    SkinController, choose_skin_image, get_skin_state, reset_skin_settings, save_skin_settings,
+    SkinAdapterController, SkinController, choose_skin_image, get_skin_state, report_skin_adapter,
+    reset_skin_settings, save_skin_settings,
 };
 use tauri::{AppHandle, Manager};
 use tray::{CloseDecision, close_decision, setup_tray};
@@ -111,8 +112,32 @@ pub fn run() {
             get_skin_state,
             choose_skin_image,
             save_skin_settings,
-            reset_skin_settings
+            reset_skin_settings,
+            report_skin_adapter
         ])
+        .on_page_load(|webview, payload| {
+            if webview.label() != "main" {
+                return;
+            }
+            let app = webview.app_handle();
+            let Some(adapter) = app.try_state::<SkinAdapterController>() else {
+                return;
+            };
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                adapter.navigation_started(payload.url());
+                return;
+            }
+            let Some(skins) = app.try_state::<SkinController>() else {
+                return;
+            };
+            if skin::adapter::apply_to_main(webview, payload.url(), &adapter, &skins).is_err() {
+                record_app_diagnostic(
+                    app,
+                    DiagnosticStage::SkinApply,
+                    DiagnosticErrorKind::TauriError,
+                );
+            }
+        })
         .setup(|app| {
             let paths = AppPaths::resolve(app.handle())?;
             paths.ensure_exists()?;
@@ -132,6 +157,7 @@ pub fn run() {
             app.manage(update_controller);
             app.manage(skin_previews);
             app.manage(skin_controller);
+            app.manage(SkinAdapterController::default());
             app.manage(controller);
             update_ui::spawn_scheduled_update_checks(app.handle().clone());
             #[cfg(not(debug_assertions))]
@@ -206,6 +232,19 @@ fn record_app_diagnostic(app: &AppHandle, stage: DiagnosticStage, error_kind: Di
         Some(error_kind),
     );
     sink.record(event);
+}
+
+/// 记录不含动态错误正文的固定皮肤应用失败事件。
+///
+/// :param app: 当前 Tauri 应用句柄，用于访问受控诊断 sink。
+/// :return: 无返回数据；记录操作不影响运行时和窗口状态。
+/// :raises: sink 缺失或异步写入失败时静默失败，不向调用方传播错误。
+pub(crate) fn record_skin_apply_diagnostic(app: &AppHandle) {
+    record_app_diagnostic(
+        app,
+        DiagnosticStage::SkinApply,
+        DiagnosticErrorKind::TauriError,
+    );
 }
 
 #[cfg(test)]

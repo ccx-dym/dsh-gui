@@ -153,3 +153,67 @@ fn build_manifest_registers_every_exposed_skin_command() {
         assert!(build_script.contains(&format!("\"{command}\"")));
     }
 }
+
+#[test]
+fn official_main_receives_only_the_fail_closed_adapter_report_command() {
+    let config: Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config 必须是 JSON");
+    assert!(
+        config["app"]["security"]["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .any(|value| value == "official-skin-report"),
+        "远程报告 capability 必须显式启用"
+    );
+    let capability: Value = serde_json::from_str(include_str!("../capabilities/skin-report.json"))
+        .expect("skin-report capability 必须是 JSON");
+    assert_eq!(capability["local"], false);
+    assert_eq!(capability["windows"], serde_json::json!(["main"]));
+    assert_eq!(
+        capability["remote"]["urls"],
+        serde_json::json!(["http://127.0.0.1:*"])
+    );
+    assert_eq!(
+        capability["permissions"],
+        serde_json::json!(["allow-report-skin-adapter"])
+    );
+
+    let serialized = capability.to_string();
+    for forbidden in [
+        "runtime",
+        "update",
+        "dialog",
+        "filesystem",
+        "fs:",
+        "shell",
+        "event",
+        "get-skin",
+        "save-skin",
+        "reset-skin",
+        "choose-skin",
+    ] {
+        assert!(!serialized.contains(forbidden), "禁止权限: {forbidden}");
+    }
+}
+
+#[test]
+fn build_manifest_registers_only_the_adapter_report_command_for_official_main() {
+    let build_script = include_str!("../build.rs");
+    assert!(build_script.contains("\"report_skin_adapter\""));
+}
+
+#[test]
+fn successful_skin_mutations_refresh_main_without_exposing_more_commands() {
+    let controller = include_str!("../src/skin/controller.rs");
+    assert!(controller.contains("refresh_main_skin(&app, &state.settings)"));
+    assert!(
+        controller
+            .matches("refresh_main_skin(&app, &state.settings)")
+            .count()
+            >= 2
+    );
+    assert!(controller.contains("record_skin_apply_diagnostic(&app)"));
+    let adapter = include_str!("../src/skin/adapter.rs");
+    assert!(adapter.contains("crate::record_skin_apply_diagnostic(&app)"));
+}
