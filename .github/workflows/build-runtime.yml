@@ -1,0 +1,267 @@
+name: Build compatible DSH runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: Exact reviewed DSH semver
+        required: true
+        default: 0.1.1-rc.2
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    outputs:
+      source_sha: ${{ steps.validate.outputs.source_sha }}
+    permissions:
+      contents: read
+    env:
+      DSH_VERSION: ${{ inputs.dsh_version }}
+      NODE_VERSION: 24.15.0
+      NODE_SHA256: cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62
+      NODE_DIST_BASE: https://nodejs.org/dist
+    steps:
+      - name: Checkout reviewed source
+        id: checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate exact committed runtime lock
+        id: validate
+        shell: pwsh
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $expectedRef = "refs/heads/$env:DEFAULT_BRANCH"
+          if ($env:DISPATCH_REF -cne $expectedRef) {
+            throw 'runtime workflow must be dispatched from the default branch'
+          }
+          if ((git rev-parse HEAD).Trim() -cne $env:SOURCE_SHA) {
+            throw 'checkout does not match the dispatched source SHA'
+          }
+          if ($env:DSH_VERSION -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$') {
+            throw 'dsh_version must be exact semver'
+          }
+          $lockRoot = "runtime/locks/dsh-$env:DSH_VERSION"
+          foreach ($name in @('package.json', 'package-lock.json', 'install-scripts.json')) {
+            $trackedPath = "$lockRoot/$name"
+            git ls-files --error-unmatch -- $trackedPath | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "runtime lock input is not committed: $trackedPath"
+            }
+          }
+          "source_sha=$env:SOURCE_SHA" >> $env:GITHUB_OUTPUT
+      - name: Download and verify official Node archive
+        id: node
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $downloadRoot = Join-Path $env:RUNNER_TEMP 'node-download'
+          New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+          $archiveName = "node-v$env:NODE_VERSION-win-x64.zip"
+          $archivePath = Join-Path $downloadRoot $archiveName
+          $sumsPath = Join-Path $downloadRoot 'SHASUMS256.txt'
+          $releaseBase = "$env:NODE_DIST_BASE/v$env:NODE_VERSION"
+          Invoke-WebRequest -Uri "$releaseBase/$archiveName" -OutFile $archivePath
+          Invoke-WebRequest -Uri "$releaseBase/SHASUMS256.txt" -OutFile $sumsPath
+
+          $escapedName = [regex]::Escape($archiveName)
+          $sumLines = @(Get-Content -LiteralPath $sumsPath | Where-Object {
+            $_ -match "^(?<digest>[0-9a-f]{64})  $escapedName$"
+          })
+          if ($sumLines.Count -ne 1) {
+            throw 'official SHASUMS256.txt does not contain exactly one archive digest'
+          }
+          $expected = [regex]::Match(
+            $sumLines[0],
+            '^(?<digest>[0-9a-f]{64})  '
+          ).Groups['digest'].Value
+          $actual = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -cne $env:NODE_SHA256 -or $actual -cne $env:NODE_SHA256) {
+            throw 'Node archive SHA-256 does not match official SHASUMS256.txt'
+          }
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          "archive_sha256=$env:NODE_SHA256" >> $env:GITHUB_OUTPUT
+      - name: Build, smoke and create unsigned manifest
+        id: runtime
+        shell: pwsh
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $outputRoot = Join-Path $PWD 'runtime-out/github-runtime'
+          New-Item -ItemType Directory -Path $outputRoot | Out-Null
+          $buildOutput = & scripts/build-runtime.ps1 `
+            -DshVersion $env:DSH_VERSION `
+            -NodeArchive '${{ steps.node.outputs.archive_path }}' `
+            -NodeSha256 '${{ steps.node.outputs.archive_sha256 }}' `
+            -OutputDirectory $outputRoot
+          if ($LASTEXITCODE -ne 0) { throw 'runtime builder failed' }
+
+          $zipName = "dsh-runtime-$env:DSH_VERSION-node-$env:NODE_VERSION-win-x64.zip"
+          $zipPath = Join-Path $outputRoot $zipName
+          $stageRoot = Join-Path $outputRoot "stage/dsh-$env:DSH_VERSION-node-$env:NODE_VERSION-win-x64"
+          pwsh -NoProfile -File scripts/smoke-runtime.ps1 `
+            -Fixture $zipPath `
+            -RuntimeDirectory $stageRoot
+          if ($LASTEXITCODE -ne 0) { throw 'runtime smoke failed' }
+
+          $candidateRoot = Join-Path $PWD 'runtime-release-candidate'
+          New-Item -ItemType Directory -Path $candidateRoot | Out-Null
+          Copy-Item -LiteralPath $zipPath -Destination $candidateRoot
+          Copy-Item -LiteralPath (Join-Path $stageRoot 'inventory.json') -Destination $candidateRoot
+          Copy-Item -LiteralPath (Join-Path $stageRoot 'THIRD_PARTY_NOTICES.json') -Destination $candidateRoot
+
+          $tag = "dsh-v$env:DSH_VERSION-windows"
+          $artifactUrl = "https://github.com/$env:REPOSITORY/releases/download/$tag/$zipName"
+          $commitTimestamp = (git show -s --format=%cI $env:SOURCE_SHA).Trim()
+          $verifiedAt = [DateTimeOffset]::Parse(
+            $commitTimestamp,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+          ).ToUniversalTime().ToString(
+            'yyyy-MM-ddTHH:mm:ssZ',
+            [Globalization.CultureInfo]::InvariantCulture
+          )
+          node scripts/create-runtime-manifest.mjs `
+            --zip $zipPath `
+            --dsh-version $env:DSH_VERSION `
+            --node-version $env:NODE_VERSION `
+            --minimum-desktop-version 0.1.0 `
+            --artifact-url $artifactUrl `
+            --verified-at $verifiedAt `
+            --compatibility-summary 'Windows 10/11 x64 核心兼容验证通过；皮肤未验证时自动关闭。' `
+            --output (Join-Path $candidateRoot 'manifest.json')
+          if ($LASTEXITCODE -ne 0) { throw 'runtime manifest generation failed' }
+      - name: Upload verified candidate
+        id: upload
+        # actions/upload-artifact v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: runtime-release-candidate
+          path: |
+            runtime-release-candidate/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment: runtime-release
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      DSH_VERSION: ${{ inputs.dsh_version }}
+      NODE_VERSION: 24.15.0
+      SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout publishing base
+        id: checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.build.outputs.source_sha }}
+          fetch-depth: 0
+      - name: Download verified candidate
+        id: download
+        # actions/download-artifact v4.3.0
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: runtime-release-candidate
+          path: runtime-release-candidate
+      - name: Sign exact manifest bytes
+        id: sign
+        shell: pwsh
+        env:
+          DSH_RUNTIME_SIGNING_KEY: ${{ secrets.DSH_RUNTIME_SIGNING_KEY }}
+          DSH_RUNTIME_SIGNING_KEY_PASSWORD: ${{ secrets.DSH_RUNTIME_SIGNING_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ([string]::IsNullOrWhiteSpace($env:DSH_RUNTIME_SIGNING_KEY)) {
+            throw 'runtime signing key is not configured'
+          }
+          $encryptedKeyPath = Join-Path $env:RUNNER_TEMP 'runtime-signing-source.pem'
+          $signingKeyPath = Join-Path $env:RUNNER_TEMP 'runtime-signing-plain.pem'
+          [System.IO.File]::WriteAllText(
+            $encryptedKeyPath,
+            $env:DSH_RUNTIME_SIGNING_KEY,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $env:DSH_RUNTIME_ENCRYPTED_KEY_FILE = $encryptedKeyPath
+          $env:DSH_RUNTIME_PLAIN_KEY_FILE = $signingKeyPath
+          node -e "const {readFileSync,writeFileSync}=require('node:fs');const {createPrivateKey}=require('node:crypto');const key=createPrivateKey({key:readFileSync(process.env.DSH_RUNTIME_ENCRYPTED_KEY_FILE),passphrase:process.env.DSH_RUNTIME_SIGNING_KEY_PASSWORD||undefined});writeFileSync(process.env.DSH_RUNTIME_PLAIN_KEY_FILE,key.export({type:'pkcs8',format:'pem'}),{mode:0o600});"
+          if ($LASTEXITCODE -ne 0) { throw 'runtime signing key preparation failed' }
+          $env:DSH_RUNTIME_SIGNING_KEY_FILE = $signingKeyPath
+          node scripts/sign-runtime.mjs `
+            runtime-release-candidate/manifest.json `
+            runtime-release-candidate/manifest.sig
+          if ($LASTEXITCODE -ne 0) { throw 'runtime manifest signing failed' }
+      - name: Prepare or reuse stable channel pull request
+        id: channel
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -NoProfile -File scripts/publish-runtime-channel.ps1 `
+            -SourceSha $env:SOURCE_SHA `
+            -DefaultBranch $env:DEFAULT_BRANCH `
+            -Branch "automation/runtime-$env:DSH_VERSION-stable" `
+            -CandidateManifest runtime-release-candidate/manifest.json `
+            -CandidateSignature runtime-release-candidate/manifest.sig `
+            -StableDirectory releases/runtime/stable
+      - name: Create immutable runtime release
+        id: release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = "dsh-v$env:DSH_VERSION-windows"
+          $tagUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          try {
+            Invoke-WebRequest -Uri $tagUri -Headers $headers | Out-Null
+            throw "runtime tag 已存在: $tag"
+          }
+          catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode -ne [System.Net.HttpStatusCode]::NotFound) {
+              throw 'unable to prove runtime tag is absent'
+            }
+          }
+          $zipName = "dsh-runtime-$env:DSH_VERSION-node-$env:NODE_VERSION-win-x64.zip"
+          $assets = @(
+            "runtime-release-candidate/$zipName",
+            'runtime-release-candidate/inventory.json',
+            'runtime-release-candidate/THIRD_PARTY_NOTICES.json',
+            'runtime-release-candidate/manifest.json',
+            'runtime-release-candidate/manifest.sig'
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw 'runtime release candidate is incomplete'
+            }
+          }
+          gh release create $tag @assets `
+            --target $env:SOURCE_SHA `
+            --title "DSH $env:DSH_VERSION Windows runtime" `
+            --notes "Reviewed DSH $env:DSH_VERSION runtime for Windows 10/11 x64."
+          if ($LASTEXITCODE -ne 0) { throw 'immutable runtime release creation failed' }
