@@ -103,8 +103,31 @@ Invoke-CargoTest -Description '全新安装首启失败保持 uninstalled' -Argu
         '--', '--exact'
     ))
 
+# 皮肤安全门禁只复用仓库内的小型生成夹具，不读取用户选择的图片，也不依赖大 runtime
+# ZIP。逐条精确调用可让 -SecurityFixturesOnly 在完整 Rust 套件之外快速暴露关键边界回归。
+Invoke-CargoTest -Description '皮肤图片格式错误拒绝' -Arguments ($common + @(
+        '--test', 'skin_import',
+        'rejects_corruption_and_unsupported_gif_with_distinct_kinds', '--', '--exact'
+    ))
+Invoke-CargoTest -Description '皮肤图片尺寸上限拒绝' -Arguments ($common + @(
+        '--test', 'skin_import',
+        'rejects_over_edge_and_total_pixel_limits_before_decode', '--', '--exact'
+    ))
+Invoke-CargoTest -Description '皮肤协议遍历与非规范 URI 拒绝' -Arguments ($common + @(
+        '--test', 'skin_protocol',
+        'rejects_every_noncanonical_uri_without_reflecting_request_text', '--', '--exact'
+    ))
+Invoke-CargoTest -Description '不支持的 DSH 适配器仅执行清理回退' -Arguments ($common + @(
+        '--test', 'skin_adapter',
+        'page_plan_requires_exact_version_and_numeric_loopback_origin', '--', '--exact'
+    ))
+Invoke-CargoTest -Description '官方页面仅获得失败关闭的皮肤报告命令' -Arguments ($common + @(
+        '--test', 'command_permissions',
+        'official_main_receives_only_the_fail_closed_adapter_report_command', '--', '--exact'
+    ))
+
 if ($SecurityFixturesOnly) {
-    Write-Host "小型 runtime 安全夹具通过；独立审计目录: $smokeFullPath"
+    Write-Host "小型 runtime/皮肤安全夹具通过；独立审计目录: $smokeFullPath"
     exit 0
 }
 
