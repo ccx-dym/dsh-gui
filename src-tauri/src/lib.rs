@@ -19,7 +19,7 @@ use skin::{
     reset_skin_settings, save_skin_settings,
 };
 use tauri::{AppHandle, Manager};
-use tray::{CloseDecision, close_decision, setup_tray};
+use tray::{CloseDecision, close_decision_for, close_hide_failure_stage, setup_tray};
 use update_ui::{
     UpdateUiController, check_updates, confirm_activation, get_update_state,
     install_compatible_update,
@@ -182,25 +182,25 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if !matches!(window.label(), "main" | "updates") {
+            if !matches!(window.label(), "main" | "updates" | "appearance") {
                 return;
             }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
-            if window.label() == "updates" {
-                api.prevent_close();
-                let _ = window.hide();
-                return;
-            }
             let controller = window.state::<AppController>();
-            if close_decision(controller.exit_requested()) == CloseDecision::HideToTray {
-                // 即使隐藏失败也阻止默认关闭，避免 DSH 在没有显式 Exit 的情况下被回收。
+            let decision = close_decision_for(window.label(), controller.exit_requested());
+            if matches!(
+                decision,
+                CloseDecision::HideWindow | CloseDecision::HideToTray
+            ) {
+                // 辅助窗口与 main 都必须阻止默认关闭；隐藏失败只记录固定阶段和
+                // 固定错误类别，避免把底层窗口错误正文写入诊断。
                 api.prevent_close();
-                if window.hide().is_err() {
+                if let Some(stage) = close_hide_failure_stage(decision, window.hide().is_err()) {
                     record_app_diagnostic(
                         window.app_handle(),
-                        DiagnosticStage::CloseToTray,
+                        stage,
                         DiagnosticErrorKind::TauriError,
                     );
                 }

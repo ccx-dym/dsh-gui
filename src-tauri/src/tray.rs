@@ -14,6 +14,7 @@ pub enum TrayAction {
     Open,
     Updates,
     Hide,
+    Appearance,
     Restart,
     Exit,
 }
@@ -22,6 +23,7 @@ pub enum TrayAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloseDecision {
     HideToTray,
+    HideWindow,
     AllowExit,
 }
 
@@ -48,6 +50,8 @@ pub trait DesktopUi {
     fn hide_main(&self) -> Result<(), RuntimeError>;
     fn show_updates(&self) -> Result<(), RuntimeError>;
     fn focus_updates(&self) -> Result<(), RuntimeError>;
+    fn show_appearance(&self) -> Result<(), RuntimeError>;
+    fn focus_appearance(&self) -> Result<(), RuntimeError>;
     fn exit(&self, code: i32);
 }
 
@@ -65,6 +69,12 @@ impl TauriDesktopUi {
     fn updates_window(&self) -> Result<tauri::WebviewWindow, RuntimeError> {
         self.app
             .get_webview_window("updates")
+            .ok_or(RuntimeError::MainWindowMissing)
+    }
+
+    fn appearance_window(&self) -> Result<tauri::WebviewWindow, RuntimeError> {
+        self.app
+            .get_webview_window("appearance")
             .ok_or(RuntimeError::MainWindowMissing)
     }
 }
@@ -110,6 +120,18 @@ impl DesktopUi for TauriDesktopUi {
             .map_err(|error| RuntimeError::Tauri(error.to_string()))
     }
 
+    fn show_appearance(&self) -> Result<(), RuntimeError> {
+        self.appearance_window()?
+            .show()
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))
+    }
+
+    fn focus_appearance(&self) -> Result<(), RuntimeError> {
+        self.appearance_window()?
+            .set_focus()
+            .map_err(|error| RuntimeError::Tauri(error.to_string()))
+    }
+
     fn exit(&self, code: i32) {
         self.app.exit(code);
     }
@@ -128,6 +150,39 @@ pub fn close_decision(exit_requested: bool) -> CloseDecision {
     }
 }
 
+/// 根据窗口标签决定关闭请求的局部行为。
+///
+/// :param window_label: Tauri 配置中的稳定窗口标签。
+/// :param exit_requested: 主窗口是否处于显式退出流程。
+/// :return: 辅助窗口只隐藏；主窗口沿用 close-to-tray/显式退出策略。
+/// :raises: 此纯函数不产生错误。
+pub fn close_decision_for(window_label: &str, exit_requested: bool) -> CloseDecision {
+    match window_label {
+        "appearance" | "updates" => CloseDecision::HideWindow,
+        _ => close_decision(exit_requested),
+    }
+}
+
+/// 把窗口隐藏结果映射为固定诊断阶段，不携带底层错误正文。
+///
+/// :param decision: 当前关闭请求已选定的策略。
+/// :param hide_failed: Tauri 隐藏窗口调用是否失败。
+/// :return: 隐藏失败时返回对应固定阶段；成功或无需隐藏时返回 None。
+/// :raises: 此纯函数不产生错误。
+pub fn close_hide_failure_stage(
+    decision: CloseDecision,
+    hide_failed: bool,
+) -> Option<DiagnosticStage> {
+    if !hide_failed {
+        return None;
+    }
+    match decision {
+        CloseDecision::HideWindow => Some(DiagnosticStage::TrayHide),
+        CloseDecision::HideToTray => Some(DiagnosticStage::CloseToTray),
+        CloseDecision::AllowExit => None,
+    }
+}
+
 /// 把稳定菜单 ID 映射为类型化动作，不依赖本地化显示文字。
 ///
 /// :param id: Tauri 菜单事件中的稳定标识符。
@@ -138,6 +193,7 @@ pub fn tray_action_from_id(id: &str) -> Option<TrayAction> {
         "open" => Some(TrayAction::Open),
         "updates" => Some(TrayAction::Updates),
         "hide" => Some(TrayAction::Hide),
+        "appearance" => Some(TrayAction::Appearance),
         "restart" => Some(TrayAction::Restart),
         "exit" => Some(TrayAction::Exit),
         _ => None,
@@ -166,6 +222,10 @@ pub fn handle_tray_action(
             ui.focus_updates()
         }
         TrayAction::Hide => ui.hide_main(),
+        TrayAction::Appearance => {
+            ui.show_appearance()?;
+            ui.focus_appearance()
+        }
         TrayAction::Restart => controller.restart(),
         TrayAction::Exit => {
             // app.exit 必须位于停止成功与退出标志提交之后。
@@ -186,6 +246,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), RuntimeError> {
         .text("open", "打开 DSH Desktop")
         .text("updates", "检查更新")
         .text("hide", "隐藏")
+        .text("appearance", "选择或设置皮肤")
         .text("restart", "重启 DSH")
         .text("exit", "退出")
         .build()
@@ -237,7 +298,9 @@ fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: Diagnost
         return;
     };
     let stage = match action {
-        TrayAction::Open | TrayAction::Updates => DiagnosticStage::TrayOpen,
+        TrayAction::Open | TrayAction::Updates | TrayAction::Appearance => {
+            DiagnosticStage::TrayOpen
+        }
         TrayAction::Hide => DiagnosticStage::TrayHide,
         TrayAction::Restart => DiagnosticStage::TrayRestart,
         TrayAction::Exit => DiagnosticStage::TrayExit,
@@ -257,9 +320,10 @@ fn record_tray_failure(app: &AppHandle, action: TrayAction, error_kind: Diagnost
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseDecision, DesktopUi, TrayAction, TrayController, close_decision, handle_tray_action,
-        tray_action_from_id,
+        CloseDecision, DesktopUi, TrayAction, TrayController, close_decision, close_decision_for,
+        close_hide_failure_stage, handle_tray_action, tray_action_from_id,
     };
+    use crate::diagnostics::DiagnosticStage;
     use crate::runtime::RuntimeError;
     use std::sync::{Arc, Mutex};
 
@@ -328,6 +392,16 @@ mod tests {
             Ok(())
         }
 
+        fn show_appearance(&self) -> Result<(), RuntimeError> {
+            self.calls.push("show_appearance");
+            Ok(())
+        }
+
+        fn focus_appearance(&self) -> Result<(), RuntimeError> {
+            self.calls.push("focus_appearance");
+            Ok(())
+        }
+
         fn exit(&self, _code: i32) {
             self.calls.push("exit");
         }
@@ -344,11 +418,43 @@ mod tests {
     }
 
     #[test]
+    fn closing_appearance_hides_only_that_window_even_during_explicit_exit() {
+        assert_eq!(
+            close_decision_for("appearance", false),
+            CloseDecision::HideWindow
+        );
+        assert_eq!(
+            close_decision_for("appearance", true),
+            CloseDecision::HideWindow
+        );
+    }
+
+    #[test]
+    fn hide_failures_map_to_fixed_diagnostics_without_affecting_successes() {
+        assert_eq!(
+            close_hide_failure_stage(CloseDecision::HideWindow, true),
+            Some(DiagnosticStage::TrayHide)
+        );
+        assert_eq!(
+            close_hide_failure_stage(CloseDecision::HideToTray, true),
+            Some(DiagnosticStage::CloseToTray)
+        );
+        assert_eq!(
+            close_hide_failure_stage(CloseDecision::HideWindow, false),
+            None
+        );
+    }
+
+    #[test]
     fn fixed_menu_ids_map_to_typed_actions_independent_of_labels() {
         assert_eq!(tray_action_from_id("open"), Some(TrayAction::Open));
         assert_eq!(tray_action_from_id("hide"), Some(TrayAction::Hide));
         assert_eq!(tray_action_from_id("restart"), Some(TrayAction::Restart));
         assert_eq!(tray_action_from_id("updates"), Some(TrayAction::Updates));
+        assert_eq!(
+            tray_action_from_id("appearance"),
+            Some(TrayAction::Appearance)
+        );
         assert_eq!(tray_action_from_id("exit"), Some(TrayAction::Exit));
         assert_eq!(tray_action_from_id("退出"), None);
     }
@@ -367,6 +473,22 @@ mod tests {
         handle_tray_action(TrayAction::Updates, &controller, &ui).expect("更新窗口应恢复");
 
         assert_eq!(calls.values(), vec!["show_updates", "focus_updates"]);
+    }
+
+    #[test]
+    fn appearance_action_opens_only_the_local_settings_window() {
+        let calls = CallLog::default();
+        let controller = RecordingController {
+            calls: calls.clone(),
+            fail_exit: false,
+        };
+        let ui = RecordingUi {
+            calls: calls.clone(),
+        };
+
+        handle_tray_action(TrayAction::Appearance, &controller, &ui).expect("外观设置窗口应恢复");
+
+        assert_eq!(calls.values(), vec!["show_appearance", "focus_appearance"]);
     }
 
     #[test]

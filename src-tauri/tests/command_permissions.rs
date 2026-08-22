@@ -204,6 +204,19 @@ fn build_manifest_registers_only_the_adapter_report_command_for_official_main() 
 }
 
 #[test]
+fn tray_places_the_stable_appearance_action_between_hide_and_restart() {
+    let tray = include_str!("../src/tray.rs");
+    let hide = tray.find(".text(\"hide\", \"隐藏\")").expect("隐藏菜单项");
+    let appearance = tray
+        .find(".text(\"appearance\", \"选择或设置皮肤\")")
+        .expect("外观菜单项");
+    let restart = tray
+        .find(".text(\"restart\", \"重启 DSH\")")
+        .expect("重启菜单项");
+    assert!(hide < appearance && appearance < restart);
+}
+
+#[test]
 fn successful_skin_mutations_refresh_main_without_exposing_more_commands() {
     let controller = include_str!("../src/skin/controller.rs");
     assert!(controller.contains("refresh_main_skin(&app, &state.settings)"));
