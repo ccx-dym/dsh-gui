@@ -103,6 +103,7 @@ if (root === null) {
   throw new Error("缺少 #app 根节点");
 }
 
+export function initializeDesktop(root: HTMLElement): void {
 const runtimeRoot = document.createElement("div");
 runtimeRoot.className = "desktop__runtime";
 const updateRoot = document.createElement("aside");
@@ -282,3 +283,14 @@ async function initializeUpdateState(): Promise<void> {
 
 void initializeRuntimeStatus(runtimeRoot);
 void initializeUpdateState();
+}
+
+// appearance 是预定义的本地窗口入口；分派发生在任何运行时命令之前，避免设置 UI 混入主启动页。
+const view = new URLSearchParams(window.location.search).get("view");
+if (view === "appearance") {
+  void import("./appearance").then(({ initializeAppearance }) =>
+    initializeAppearance(root),
+  );
+} else {
+  initializeDesktop(root);
+}

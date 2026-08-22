@@ -10,6 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: tauriMocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: tauriMocks.listen }));
 
 beforeEach(() => {
+  window.history.replaceState({}, "", "/");
   document.body.innerHTML = '<div id="app"></div>';
   vi.resetModules();
   tauriMocks.invoke.mockReset();
@@ -189,6 +190,37 @@ describe("renderRuntimeStatus", () => {
 });
 
 describe("启动页", () => {
+  it("appearance 视图只装配本地外观编辑器", async () => {
+    window.history.replaceState({}, "", "/?view=appearance");
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_skin_state") {
+        return {
+          revision: 0,
+          settings: {
+            immersive: false,
+            image_digest: null,
+            fit: "cover",
+            position: "center",
+            blur_px: 0,
+            mask_tone: "light",
+            mask_opacity_percent: 22,
+            panel_opacity_percent: 88,
+          },
+        };
+      }
+      throw new Error(`不应调用 ${command}`);
+    });
+
+    await import("./main");
+
+    await vi.waitFor(() => {
+      expect(document.querySelector(".appearance h1")?.textContent).toContain("工作台");
+    });
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("get_skin_state", undefined);
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith("get_runtime_status");
+    expect(document.querySelector(".desktop__runtime")).toBeNull();
+  });
+
   it("在 DSH 启动期间向用户显示启动状态", async () => {
     await import("./main");
 
