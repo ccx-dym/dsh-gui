@@ -4,8 +4,14 @@ use dsh_desktop_lib::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
+use std::{
+    fs,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const TEST_SIGNING_KEY: [u8; 32] = [7; 32];
+const TEST_SIGNING_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcH\n-----END PRIVATE KEY-----\n";
 const VALID_MANIFEST: &[u8] = include_bytes!("fixtures/runtime-manifest/valid.json");
 
 fn canonical_hex(bytes: &[u8]) -> String {
@@ -96,6 +102,92 @@ fn valid_signed_manifest_returns_typed_fields_and_raw_digest() {
     assert_eq!(
         verified.manifest_digest,
         "0986f8c636d4224f01e80b0bdb7437f4d6d31dd253531858db9c35d01b67196b"
+    );
+}
+
+#[test]
+fn node_generator_and_signer_output_is_accepted_by_rust_verifier() {
+    let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("src-tauri 必须位于仓库根目录下");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("系统时间不得早于 Unix epoch")
+        .as_nanos();
+    let temporary_root = std::env::temp_dir().join(format!(
+        "dsh-runtime-manifest-contract-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temporary_root).expect("应能创建跨语言契约测试目录");
+    let zip_path = temporary_root.join("runtime.zip");
+    let manifest_path = temporary_root.join("manifest.json");
+    let signature_path = temporary_root.join("manifest.sig");
+    let key_path = temporary_root.join("test-ed25519-private.pem");
+    fs::write(&zip_path, b"fixture").expect("应能写入 ZIP bytes 夹具");
+    fs::write(&key_path, TEST_SIGNING_KEY_PEM).expect("应能写入测试私钥夹具");
+
+    // 通过真实 CLI 边界生成并签名，覆盖 Node JSON bytes 与 Rust 严格验证器之间的契约。
+    let generated = Command::new("node")
+        .current_dir(repository_root)
+        .args([
+            "scripts/create-runtime-manifest.mjs",
+            "--zip",
+            zip_path.to_str().expect("测试路径必须是 UTF-8"),
+            "--dsh-version",
+            "0.1.1-rc.2",
+            "--node-version",
+            "24.15.0",
+            "--minimum-desktop-version",
+            "0.1.0",
+            "--artifact-url",
+            "https://github.com/ccx-dym/dsh-gui/releases/download/dsh-v0.1.1-rc.2-windows/dsh-runtime-0.1.1-rc.2-node-24.15.0-win-x64.zip",
+            "--verified-at",
+            "2026-08-22T00:00:00Z",
+            "--compatibility-summary",
+            "Windows 10/11 x64 核心兼容验证通过 🐋",
+            "--output",
+            manifest_path.to_str().expect("测试路径必须是 UTF-8"),
+        ])
+        .output()
+        .expect("应能执行 Node manifest 生成器");
+    assert!(
+        generated.status.success(),
+        "manifest 生成失败: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let signed = Command::new("node")
+        .current_dir(repository_root)
+        .env("DSH_RUNTIME_SIGNING_KEY_FILE", &key_path)
+        .args([
+            "scripts/sign-runtime.mjs",
+            manifest_path.to_str().expect("测试路径必须是 UTF-8"),
+            signature_path.to_str().expect("测试路径必须是 UTF-8"),
+        ])
+        .output()
+        .expect("应能执行 Node manifest 签名器");
+    assert!(
+        signed.status.success(),
+        "manifest 签名失败: {}{}",
+        String::from_utf8_lossy(&signed.stdout),
+        String::from_utf8_lossy(&signed.stderr)
+    );
+
+    let manifest_bytes = fs::read(manifest_path).expect("应能读取生成的 manifest");
+    let signature = fs::read_to_string(signature_path).expect("应能读取 detached signature");
+    let verified = verifier()
+        .verify(&manifest_bytes, &signature, &diagnostics())
+        .expect("Node 生成并签名的清单必须通过 Rust verifier");
+
+    assert_eq!(
+        verified.manifest.dsh_version,
+        Version::parse("0.1.1-rc.2").unwrap()
+    );
+    assert_eq!(verified.manifest.artifact.size, 7);
+    assert_eq!(
+        verified.manifest.compatibility_summary,
+        "Windows 10/11 x64 核心兼容验证通过 🐋"
     );
 }
 

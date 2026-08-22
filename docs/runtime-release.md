@@ -52,8 +52,26 @@ CLI help 与短时回环 Web smoke，最后生成 `inventory.json`、
 `THIRD_PARTY_NOTICES.json` 和 ZIP。输出目录必须为空，避免静默覆盖历史制品。
 
 发布前必须人工复核清单、notices、压缩包内容，并确认其中没有 npm cache、用户目录、
-环境文件或密钥。将 ZIP 上传到受控 HTTPS 下载地址后，以实际 URL、大小和 SHA-256
-填写与 `runtime/manifest.schema.json` 一致的兼容清单。
+环境文件或密钥。ZIP 的公开地址确定后，必须用生成器从实际 ZIP bytes 计算 size 和
+SHA-256；禁止手填或从远程元数据复制这两个字段：
+
+```powershell
+node scripts/create-runtime-manifest.mjs `
+  --zip runtime-out\dsh-runtime-0.1.1-rc.2-node-24.15.0-win-x64.zip `
+  --dsh-version 0.1.1-rc.2 `
+  --node-version 24.15.0 `
+  --minimum-desktop-version 0.1.0 `
+  --artifact-url https://github.com/ccx-dym/dsh-gui/releases/download/dsh-v0.1.1-rc.2-windows/dsh-runtime-0.1.1-rc.2-node-24.15.0-win-x64.zip `
+  --verified-at 2026-08-22T00:00:00Z `
+  --compatibility-summary 'Windows 10/11 x64 核心兼容验证通过；皮肤未验证时自动关闭。' `
+  --output runtime-out\manifest.json
+```
+
+所有版本参数必须是 exact semver；`artifact-url` 必须是无凭据、查询参数和片段的 HTTPS
+地址；`verified-at` 必须是有效的 `YYYY-MM-DDTHH:mm:ssZ` UTC 时间；兼容性摘要去除首尾
+空白后不得为空、不得包含控制字符，并且最多 512 个 Unicode 字符。输出文件必须尚不存在，
+生成器会以固定属性顺序写入紧凑 UTF-8 JSON，并只添加一个 LF。随后再人工核对生成结果与
+`runtime/manifest.schema.json`，不可在签名前格式化或改写文件。
 
 ## 独立签名
 
