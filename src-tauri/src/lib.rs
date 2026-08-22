@@ -89,6 +89,14 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        // 自定义协议必须在 setup 创建 WebView 前注册；回调只读取固定设置与托管图片目录。
+        .register_uri_scheme_protocol("dsh-skin", |context, request| {
+            skin::protocol::handle_tauri_skin_request(
+                context.app_handle(),
+                context.webview_label(),
+                &request.uri().to_string(),
+            )
+        })
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
             retry_runtime,
@@ -103,11 +111,13 @@ pub fn run() {
             let logger = DiagnosticLogger::new(paths.logs.clone(), DiagnosticPolicy::default())?;
             let diagnostic_sink = FileDiagnosticSink::new(logger, 256)?;
             let update_controller = UpdateUiController::new(paths.clone());
+            let skin_previews = skin::protocol::SkinPreviewRegistry::new(paths.skins.clone());
             let controller = AppController::new(app.handle().clone())?;
             #[cfg(debug_assertions)]
             controller.start_mock_runtime()?;
             app.manage(diagnostic_sink);
             app.manage(update_controller);
+            app.manage(skin_previews);
             app.manage(controller);
             update_ui::spawn_scheduled_update_checks(app.handle().clone());
             #[cfg(not(debug_assertions))]
