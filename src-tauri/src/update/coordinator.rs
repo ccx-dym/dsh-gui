@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::{fs, io::AsyncWriteExt, sync::Mutex, task::JoinHandle};
 
 use super::{
-    manifest::VerifiedManifest,
+    manifest::{CoreCompatibility, SkinCompatibility, VerifiedManifest},
     version_source::{CompatibilitySource, OfficialVersionSource, SourceError},
 };
 use crate::diagnostics::{DiagnosticContext, DiagnosticErrorKind, DiagnosticStage};
@@ -281,7 +281,8 @@ impl UpdateCoordinator {
         })
     }
 
-    /// 检查官方与兼容源，失败始终产生 `CheckFailed`，不会伪装为无更新。
+    /// 检查官方与兼容源；网络、超时、限流和服务不可用产生 `Offline`，
+    /// 签名验证、响应格式或配置错误产生 `CheckFailed`，两者都不会伪装为无更新。
     ///
     /// :param current: 当前已安装 DSH 版本；首次安装为 `None`。
     /// :return: 通知、可选受信清单、去重结论和下次检查时间。
@@ -372,13 +373,10 @@ impl UpdateCoordinator {
                         failed_notice(current, Some(&official.version), &error),
                         None,
                     ),
-                    Ok(manifest) => {
-                        let compatible = manifest.as_ref().map(|item| &item.manifest.dsh_version);
-                        (
-                            decide_notice(current, &official.version, compatible),
-                            manifest,
-                        )
-                    }
+                    Ok(manifest) => (
+                        decide_notice(current, &official.version, manifest.as_ref()),
+                        manifest,
+                    ),
                 }
             }
         };
@@ -386,7 +384,14 @@ impl UpdateCoordinator {
         let should_notify = insert_bounded_notification_key(&mut state.notification_keys, key);
         // 只有明确的可用状态才把受信 artifact 交给后续安装流程；等待、失败或已是
         // 最新时即使 endpoint 返回了旧/不相关清单，也不能形成旁路安装授权。
-        let installable_manifest = if matches!(notice, UpdateNotice::CompatibleAvailable { .. }) {
+        let is_newer_candidate = manifest.as_ref().is_some_and(|verified| {
+            current.is_none_or(|installed| verified.manifest.dsh_version > *installed)
+        });
+        let installable_manifest = if matches!(
+            notice,
+            UpdateNotice::RuntimeAvailable { .. } | UpdateNotice::SkinUnverified { .. }
+        ) && is_newer_candidate
+        {
             manifest
         } else {
             None
@@ -508,75 +513,143 @@ fn failed_notice(
     discovered: Option<&Version>,
     error: &SourceError,
 ) -> UpdateNotice {
-    let error_kind = match error {
-        SourceError::Network => "network",
-        SourceError::Timeout => "timeout",
-        SourceError::ResponseTooLarge => "response_too_large",
-        SourceError::RateLimited => "rate_limited",
-        SourceError::ServerUnavailable => "server_unavailable",
-        SourceError::CompatibilityVerification => "compatibility_verification",
-        SourceError::CompatibilityUnavailable => "compatibility_unavailable",
-        SourceError::InvalidConfiguration => "configuration",
+    let (error_kind, is_offline) = match error {
+        SourceError::Network => ("network", true),
+        SourceError::Timeout => ("timeout", true),
+        SourceError::ResponseTooLarge => ("response_too_large", false),
+        SourceError::RateLimited => ("rate_limited", true),
+        SourceError::ServerUnavailable => ("server_unavailable", true),
+        SourceError::CompatibilityVerification => ("compatibility_verification", false),
+        SourceError::CompatibilityUnavailable => ("compatibility_unavailable", false),
+        SourceError::InvalidConfiguration => ("configuration", false),
         SourceError::HttpStatus { .. }
         | SourceError::InvalidResponse
         | SourceError::InvalidVersion
-        | SourceError::InvalidIntegrity => "invalid_response",
+        | SourceError::InvalidIntegrity => ("invalid_response", false),
     };
-    UpdateNotice::CheckFailed {
-        current: current.map(ToString::to_string),
-        version: discovered.map(ToString::to_string),
-        error_kind: error_kind.to_owned(),
+    let fields = (
+        current.map(ToString::to_string),
+        discovered.map(ToString::to_string),
+        error_kind.to_owned(),
+    );
+    if is_offline {
+        UpdateNotice::Offline {
+            current: fields.0,
+            version: fields.1,
+            error_kind: fields.2,
+        }
+    } else {
+        UpdateNotice::CheckFailed {
+            current: fields.0,
+            version: fields.1,
+            error_kind: fields.2,
+        }
     }
 }
 
 fn decide_notice(
     current: Option<&Version>,
     official: &Version,
-    compatible: Option<&Version>,
+    compatible: Option<&VerifiedManifest>,
 ) -> UpdateNotice {
     let current_text = current.map(ToString::to_string);
-    if compatible.is_some_and(|version| version > official) {
+    if let (Some(installed), Some(compatible)) = (current, compatible)
+        && compatible.manifest.dsh_version == *installed
+        && compatible.manifest.skin_compatibility == SkinCompatibility::Unverified
+        && compatible.manifest.core_compatibility == CoreCompatibility::Compatible
+        && compatible.desktop_version_supported
+        && installed <= official
+    {
+        return UpdateNotice::SkinUnverified {
+            current: current_text,
+            official: official.to_string(),
+            compatible: compatible.manifest.dsh_version.to_string(),
+        };
+    }
+    if current.is_some_and(|installed| installed >= official) {
+        return UpdateNotice::UpToDate {
+            current: current_text,
+            official: official.to_string(),
+        };
+    }
+    let Some(compatible) = compatible else {
+        return UpdateNotice::OfficialAvailable {
+            current: current_text,
+            official: official.to_string(),
+        };
+    };
+    let candidate = &compatible.manifest;
+    if candidate.dsh_version > *official {
         return UpdateNotice::CheckFailed {
             current: current_text,
-            version: compatible.map(ToString::to_string),
+            version: Some(candidate.dsh_version.to_string()),
             error_kind: "compatibility_not_official".to_owned(),
         };
     }
-    if let Some(compatible) = compatible
-        && current.is_none_or(|installed| compatible > installed)
+    if current.is_some_and(|installed| candidate.dsh_version <= *installed) {
+        return UpdateNotice::OfficialAvailable {
+            current: current_text,
+            official: official.to_string(),
+        };
+    }
+    if candidate.core_compatibility == CoreCompatibility::DesktopRequired
+        || !compatible.desktop_version_supported
     {
-        return UpdateNotice::CompatibleAvailable {
+        return UpdateNotice::DesktopRequired {
             current: current_text,
             official: official.to_string(),
-            compatible: compatible.to_string(),
+            compatible: candidate.dsh_version.to_string(),
+            minimum_desktop: candidate.minimum_desktop_version.to_string(),
         };
     }
-    if current.is_none_or(|installed| official > installed) {
-        return UpdateNotice::OfficialAwaitingCompatibility {
+    match candidate.skin_compatibility {
+        SkinCompatibility::Verified => UpdateNotice::RuntimeAvailable {
             current: current_text,
             official: official.to_string(),
-        };
-    }
-    UpdateNotice::UpToDate {
-        current: current_text,
-        official: official.to_string(),
+            compatible: candidate.dsh_version.to_string(),
+        },
+        SkinCompatibility::Unverified => UpdateNotice::SkinUnverified {
+            current: current_text,
+            official: official.to_string(),
+            compatible: candidate.dsh_version.to_string(),
+        },
     }
 }
 
 fn notification_key(channel: &str, notice: &UpdateNotice) -> String {
-    let (status, version) = match notice {
-        UpdateNotice::UpToDate { official, .. } => ("up_to_date", official.as_str()),
-        UpdateNotice::OfficialAwaitingCompatibility { official, .. } => {
-            ("official_awaiting_compatibility", official.as_str())
+    match notice {
+        UpdateNotice::UpToDate { official, .. } => format!("{channel}:{official}:up_to_date"),
+        UpdateNotice::OfficialAvailable { official, .. } => {
+            format!("{channel}:{official}:official_available")
         }
-        UpdateNotice::CompatibleAvailable { compatible, .. } => {
-            ("compatible_available", compatible.as_str())
+        UpdateNotice::RuntimeAvailable { compatible, .. } => {
+            format!("{channel}:{compatible}:runtime_available")
         }
-        UpdateNotice::CheckFailed { version, .. } => {
-            ("check_failed", version.as_deref().unwrap_or("unknown"))
+        UpdateNotice::DesktopRequired {
+            compatible,
+            minimum_desktop,
+            ..
+        } => format!("{channel}:{compatible}:{minimum_desktop}:desktop_required"),
+        UpdateNotice::SkinUnverified { compatible, .. } => {
+            format!("{channel}:{compatible}:skin_unverified")
         }
-    };
-    format!("{channel}:{version}:{status}")
+        UpdateNotice::Offline {
+            version,
+            error_kind,
+            ..
+        } => format!(
+            "{channel}:{}:{error_kind}:offline",
+            version.as_deref().unwrap_or("unknown")
+        ),
+        UpdateNotice::CheckFailed {
+            version,
+            error_kind,
+            ..
+        } => format!(
+            "{channel}:{}:{error_kind}:check_failed",
+            version.as_deref().unwrap_or("unknown")
+        ),
+    }
 }
 
 fn insert_bounded_notification_key(keys: &mut BTreeSet<String>, key: String) -> bool {
@@ -645,12 +718,16 @@ mod tests {
 
     use super::{
         PersistedUpdateState, ScheduledCheckResult, UpdateCoordinator, UpdateSchedule,
-        UpdateStateError, UpdateStateStore, UpdateTimeSource, decide_notice, notification_key,
+        UpdateStateError, UpdateStateStore, UpdateTimeSource, decide_notice, failed_notice,
+        notification_key,
     };
     use crate::diagnostics::{DiagnosticContext, DiagnosticEvent, DiagnosticSink, TraceKind};
     use crate::domain::UpdateNotice;
     use crate::update::{
-        manifest::{CompatibilityManifestV1, RuntimeArtifact, VerifiedManifest},
+        manifest::{
+            CompatibilityManifest, CoreCompatibility, RuntimeArtifact, SkinCompatibility,
+            VerifiedManifest,
+        },
         version_source::{
             CompatibilitySource, OfficialRelease, OfficialVersionSource, SourceError,
         },
@@ -719,11 +796,13 @@ mod tests {
 
     fn compatible(version: &str) -> Arc<dyn CompatibilitySource> {
         Arc::new(FixedCompatibility(Ok(Some(VerifiedManifest {
-            manifest: CompatibilityManifestV1 {
+            manifest: CompatibilityManifest {
                 schema: 1,
                 dsh_version: Version::parse(version).unwrap(),
                 node_version: Version::parse("24.15.0").unwrap(),
                 minimum_desktop_version: Version::parse("0.1.0").unwrap(),
+                core_compatibility: CoreCompatibility::Compatible,
+                skin_compatibility: SkinCompatibility::Verified,
                 platform: "windows".to_owned(),
                 arch: "x86_64".to_owned(),
                 artifact: RuntimeArtifact {
@@ -735,21 +814,264 @@ mod tests {
                 compatibility_summary: "verified".to_owned(),
             },
             manifest_digest: "a".repeat(64),
+            desktop_version_supported: true,
         }))))
     }
 
+    fn candidate(
+        version: &str,
+        minimum_desktop: &str,
+        core: CoreCompatibility,
+        skin: SkinCompatibility,
+        desktop_version_supported: bool,
+    ) -> VerifiedManifest {
+        VerifiedManifest {
+            manifest: CompatibilityManifest {
+                schema: 2,
+                dsh_version: Version::parse(version).unwrap(),
+                node_version: Version::parse("24.15.0").unwrap(),
+                minimum_desktop_version: Version::parse(minimum_desktop).unwrap(),
+                core_compatibility: core,
+                skin_compatibility: skin,
+                platform: "windows".to_owned(),
+                arch: "x86_64".to_owned(),
+                artifact: RuntimeArtifact {
+                    url: url::Url::parse("https://updates.example.invalid/runtime.zip").unwrap(),
+                    size: 10,
+                    sha256: [3_u8; 32],
+                },
+                verified_at: "2026-08-22T00:00:00Z".to_owned(),
+                compatibility_summary: "verified".to_owned(),
+            },
+            manifest_digest: "a".repeat(64),
+            desktop_version_supported,
+        }
+    }
+
     #[test]
-    fn separates_official_waiting_from_compatible_available() {
+    fn decision_matrix_classifies_all_success_states() {
+        let current = Version::parse("0.1.1-rc.1").unwrap();
+        let official = Version::parse("0.1.1-rc.2").unwrap();
+        assert!(matches!(
+            decide_notice(Some(&current), &official, None),
+            UpdateNotice::OfficialAvailable { .. }
+        ));
+
+        let verified = candidate(
+            "0.1.1-rc.2",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Verified,
+            true,
+        );
+        assert!(matches!(
+            decide_notice(Some(&current), &official, Some(&verified)),
+            UpdateNotice::RuntimeAvailable { ref compatible, .. }
+                if compatible == "0.1.1-rc.2"
+        ));
+
+        let skin_unverified = candidate(
+            "0.1.1-rc.2",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Unverified,
+            true,
+        );
+        assert!(matches!(
+            decide_notice(Some(&current), &official, Some(&skin_unverified)),
+            UpdateNotice::SkinUnverified { ref compatible, .. }
+                if compatible == "0.1.1-rc.2"
+        ));
+
+        assert!(matches!(
+            decide_notice(Some(&official), &official, None),
+            UpdateNotice::UpToDate { .. }
+        ));
+    }
+
+    #[test]
+    fn core_marker_or_minimum_desktop_blocks_runtime_installation() {
+        let official = Version::parse("0.1.1-rc.2").unwrap();
+        for blocked in [
+            candidate(
+                "0.1.1-rc.2",
+                "0.1.0",
+                CoreCompatibility::DesktopRequired,
+                SkinCompatibility::Verified,
+                true,
+            ),
+            candidate(
+                "0.1.1-rc.2",
+                "0.2.0",
+                CoreCompatibility::Compatible,
+                SkinCompatibility::Verified,
+                false,
+            ),
+        ] {
+            assert!(matches!(
+                decide_notice(None, &official, Some(&blocked)),
+                UpdateNotice::DesktopRequired {
+                    ref minimum_desktop,
+                    ..
+                } if minimum_desktop == &blocked.manifest.minimum_desktop_version.to_string()
+            ));
+        }
+    }
+
+    #[test]
+    fn network_failure_with_installed_runtime_is_offline_without_losing_current() {
+        let current = Version::parse("0.1.1-rc.1").unwrap();
+        let notice = failed_notice(Some(&current), None, &SourceError::Network);
+        assert!(matches!(
+            notice,
+            UpdateNotice::Offline {
+                current: Some(ref installed),
+                ref error_kind,
+                ..
+            } if installed == "0.1.1-rc.1" && error_kind == "network"
+        ));
+    }
+
+    #[test]
+    fn security_and_configuration_failures_are_not_reported_as_offline() {
+        let current = Version::parse("0.1.1-rc.1").unwrap();
+        for (error, expected_kind) in [
+            (
+                SourceError::CompatibilityVerification,
+                "compatibility_verification",
+            ),
+            (
+                SourceError::CompatibilityUnavailable,
+                "compatibility_unavailable",
+            ),
+            (SourceError::InvalidConfiguration, "configuration"),
+            (SourceError::ResponseTooLarge, "response_too_large"),
+            (SourceError::HttpStatus { status: 403 }, "invalid_response"),
+            (SourceError::InvalidResponse, "invalid_response"),
+            (SourceError::InvalidVersion, "invalid_response"),
+            (SourceError::InvalidIntegrity, "invalid_response"),
+        ] {
+            assert!(matches!(
+                failed_notice(Some(&current), None, &error),
+                UpdateNotice::CheckFailed {
+                    current: Some(ref installed),
+                    ref error_kind,
+                    ..
+                } if installed == "0.1.1-rc.1" && error_kind == expected_kind
+            ));
+        }
+        for (error, expected_kind) in [
+            (SourceError::Network, "network"),
+            (SourceError::Timeout, "timeout"),
+            (SourceError::RateLimited, "rate_limited"),
+            (SourceError::ServerUnavailable, "server_unavailable"),
+        ] {
+            assert!(matches!(
+                failed_notice(Some(&current), None, &error),
+                UpdateNotice::Offline { ref error_kind, .. }
+                    if error_kind == expected_kind
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn same_version_unverified_skin_is_visible_without_runtime_install_authorization() {
+        let current = Version::parse("0.1.1-rc.2").unwrap();
+        let unverified = candidate(
+            "0.1.1-rc.2",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Unverified,
+            true,
+        );
+        assert!(matches!(
+            decide_notice(Some(&current), &current, Some(&unverified)),
+            UpdateNotice::SkinUnverified { .. }
+        ));
+        let coordinator = UpdateCoordinator::new(
+            official("0.1.1-rc.2"),
+            Arc::new(FixedCompatibility(Ok(Some(unverified.clone())))),
+            UpdateStateStore::new(&unique_settings("same-version-skin")),
+            Arc::new(FixedTime(100)),
+            UpdateSchedule::default(),
+            "stable".to_owned(),
+        )
+        .unwrap();
+        let result = coordinator.check(Some(&current)).await.unwrap();
+        assert!(matches!(result.notice, UpdateNotice::SkinUnverified { .. }));
+        assert!(result.compatible_manifest.is_none());
+
+        let verified = candidate(
+            "0.1.1-rc.2",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Verified,
+            true,
+        );
+        assert!(matches!(
+            decide_notice(Some(&current), &current, Some(&verified)),
+            UpdateNotice::UpToDate { .. }
+        ));
+        let newer = Version::parse("0.1.1-rc.3").unwrap();
+        assert!(matches!(
+            decide_notice(Some(&newer), &current, Some(&unverified)),
+            UpdateNotice::UpToDate { .. }
+        ));
+    }
+
+    #[test]
+    fn notification_keys_include_offline_reason_and_desktop_minimum() {
+        let offline_network = UpdateNotice::Offline {
+            current: Some("0.1.1-rc.1".to_owned()),
+            version: None,
+            error_kind: "network".to_owned(),
+        };
+        let offline_timeout = UpdateNotice::Offline {
+            current: Some("0.1.1-rc.1".to_owned()),
+            version: None,
+            error_kind: "timeout".to_owned(),
+        };
+        assert_ne!(
+            notification_key("stable", &offline_network),
+            notification_key("stable", &offline_timeout)
+        );
+
+        let desktop_020 = UpdateNotice::DesktopRequired {
+            current: None,
+            official: "0.1.1-rc.2".to_owned(),
+            compatible: "0.1.1-rc.2".to_owned(),
+            minimum_desktop: "0.2.0".to_owned(),
+        };
+        let desktop_030 = UpdateNotice::DesktopRequired {
+            current: None,
+            official: "0.1.1-rc.2".to_owned(),
+            compatible: "0.1.1-rc.2".to_owned(),
+            minimum_desktop: "0.3.0".to_owned(),
+        };
+        assert_ne!(
+            notification_key("stable", &desktop_020),
+            notification_key("stable", &desktop_030)
+        );
+    }
+
+    #[test]
+    fn separates_official_available_from_runtime_available() {
         let official = Version::parse("0.2.0").unwrap();
         let current = Version::parse("0.1.1-rc.1").unwrap();
         assert!(matches!(
             decide_notice(Some(&current), &official, None),
-            UpdateNotice::OfficialAwaitingCompatibility { .. }
+            UpdateNotice::OfficialAvailable { .. }
         ));
-        let compatible = Version::parse("0.1.2").unwrap();
+        let compatible = candidate(
+            "0.1.2",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Verified,
+            true,
+        );
         assert!(matches!(
             decide_notice(Some(&current), &official, Some(&compatible)),
-            UpdateNotice::CompatibleAvailable { .. }
+            UpdateNotice::RuntimeAvailable { .. }
         ));
     }
 
@@ -758,7 +1080,7 @@ mod tests {
         let official = Version::parse("0.2.0").unwrap();
         assert!(matches!(
             decide_notice(None, &official, None),
-            UpdateNotice::OfficialAwaitingCompatibility { current: None, .. }
+            UpdateNotice::OfficialAvailable { current: None, .. }
         ));
         assert!(matches!(
             decide_notice(Some(&official), &official, None),
@@ -769,7 +1091,13 @@ mod tests {
     #[test]
     fn rejects_compatible_version_newer_than_official_discovery() {
         let official = Version::parse("0.2.0").unwrap();
-        let impossible = Version::parse("0.3.0").unwrap();
+        let impossible = candidate(
+            "0.3.0",
+            "0.1.0",
+            CoreCompatibility::Compatible,
+            SkinCompatibility::Verified,
+            true,
+        );
         assert!(matches!(
             decide_notice(None, &official, Some(&impossible)),
             UpdateNotice::CheckFailed { .. }
@@ -778,7 +1106,7 @@ mod tests {
 
     #[test]
     fn persisted_keys_deduplicate_across_reload() {
-        let notice = UpdateNotice::OfficialAwaitingCompatibility {
+        let notice = UpdateNotice::OfficialAvailable {
             current: Some("0.1.0".into()),
             official: "0.2.0".into(),
         };
@@ -796,16 +1124,16 @@ mod tests {
     #[test]
     fn notification_keys_remain_bounded_while_new_state_can_notify() {
         let mut keys = (0..128)
-            .map(|index| format!("stable:1.0.{index}:compatible_available"))
+            .map(|index| format!("stable:1.0.{index}:runtime_available"))
             .collect::<BTreeSet<_>>();
         assert!(super::insert_bounded_notification_key(
             &mut keys,
-            "stable:2.0.0:compatible_available".to_owned(),
+            "stable:2.0.0:runtime_available".to_owned(),
         ));
         assert_eq!(keys.len(), 128);
         assert!(!super::insert_bounded_notification_key(
             &mut keys,
-            "stable:2.0.0:compatible_available".to_owned(),
+            "stable:2.0.0:runtime_available".to_owned(),
         ));
     }
 
@@ -874,7 +1202,7 @@ mod tests {
         let result = coordinator.check(None).await.unwrap();
         assert!(matches!(
             result.notice,
-            UpdateNotice::CheckFailed { version: None, ref error_kind, .. }
+            UpdateNotice::Offline { version: None, ref error_kind, .. }
                 if error_kind == "network"
         ));
         assert_eq!(result.next_check_epoch_secs, 43_300);
@@ -964,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatible_available_exposes_only_the_verified_manifest() {
+    async fn runtime_available_exposes_only_the_verified_manifest() {
         let coordinator = UpdateCoordinator::new(
             official("0.2.0"),
             compatible("0.1.2"),
@@ -978,7 +1306,7 @@ mod tests {
         let result = coordinator.check(Some(&current)).await.unwrap();
         assert!(matches!(
             result.notice,
-            UpdateNotice::CompatibleAvailable { .. }
+            UpdateNotice::RuntimeAvailable { .. }
         ));
         assert_eq!(
             result

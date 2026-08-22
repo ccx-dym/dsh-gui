@@ -75,7 +75,7 @@ describe("更新控制台", () => {
           revision: 1,
           state: {
             revision: 1,
-            phase: "compatible_available",
+            phase: "runtime_available",
             compatibleVersion: "0.1.2",
             artifactSize: 108_024_750,
             compatibilitySummary: "Windows 10/11 x64 验证通过",
@@ -108,7 +108,7 @@ describe("更新控制台", () => {
             revision: 1,
             state: {
               revision: 1,
-              phase: "compatible_available",
+              phase: "runtime_available",
               compatibleVersion: "0.1.2",
               artifactSize: 10,
               compatibilitySummary: '<img src=x onerror="alert(1)">',

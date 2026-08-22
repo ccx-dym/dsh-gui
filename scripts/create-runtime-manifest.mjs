@@ -59,6 +59,12 @@ function assertCompatibilitySummary(value) {
   }
 }
 
+function assertEnum(value, field, allowed) {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    throw new Error(`${field} 必须是受支持的兼容枚举`);
+  }
+}
+
 /**
  * 从已生成的 runtime ZIP 创建发布清单，制品大小与摘要始终从本地 bytes 计算。
  *
@@ -67,6 +73,8 @@ function assertCompatibilitySummary(value) {
  * @param {string} input.dshVersion exact DSH semver。
  * @param {string} input.nodeVersion exact Node.js semver。
  * @param {string} input.minimumDesktopVersion 最低桌面端 exact semver。
+ * @param {"compatible"|"desktop_required"} input.coreCompatibility 核心兼容结论。
+ * @param {"verified"|"unverified"} input.skinCompatibility 皮肤兼容结论。
  * @param {string} input.artifactUrl 不含凭据、查询或片段的 HTTPS 制品地址。
  * @param {string} input.verifiedAt 秒精度 UTC 验证时间。
  * @param {string} input.compatibilitySummary 1 到 512 字符的兼容性摘要。
@@ -80,6 +88,11 @@ export async function createRuntimeManifest(input) {
   assertExactSemver(input.dshVersion, "dshVersion");
   assertExactSemver(input.nodeVersion, "nodeVersion");
   assertExactSemver(input.minimumDesktopVersion, "minimumDesktopVersion");
+  assertEnum(input.coreCompatibility, "coreCompatibility", [
+    "compatible",
+    "desktop_required",
+  ]);
+  assertEnum(input.skinCompatibility, "skinCompatibility", ["verified", "unverified"]);
   const artifactUrl = assertArtifactUrl(input.artifactUrl);
   assertVerifiedAt(input.verifiedAt);
   assertCompatibilitySummary(input.compatibilitySummary);
@@ -94,10 +107,12 @@ export async function createRuntimeManifest(input) {
   }
 
   return {
-    schema: 1,
+    schema: 2,
     dsh_version: input.dshVersion,
     node_version: input.nodeVersion,
     minimum_desktop_version: input.minimumDesktopVersion,
+    core_compatibility: input.coreCompatibility,
+    skin_compatibility: input.skinCompatibility,
     platform: "windows",
     arch: "x86_64",
     artifact: {
@@ -116,6 +131,8 @@ function parseCliArguments(arguments_) {
     ["--dsh-version", "dshVersion"],
     ["--node-version", "nodeVersion"],
     ["--minimum-desktop-version", "minimumDesktopVersion"],
+    ["--core-compatibility", "coreCompatibility"],
+    ["--skin-compatibility", "skinCompatibility"],
     ["--artifact-url", "artifactUrl"],
     ["--verified-at", "verifiedAt"],
     ["--compatibility-summary", "compatibilitySummary"],

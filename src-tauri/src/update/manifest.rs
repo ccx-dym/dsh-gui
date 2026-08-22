@@ -7,21 +7,40 @@ use std::time::Instant;
 use thiserror::Error;
 use url::Url;
 
-const MANIFEST_SCHEMA: u32 = 1;
+const LEGACY_MANIFEST_SCHEMA: u32 = 1;
+const CURRENT_MANIFEST_SCHEMA: u32 = 2;
 const MAX_COMPATIBILITY_SUMMARY_CHARS: usize = 512;
 
 /// 已通过签名与语义校验的兼容运行时清单。
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompatibilityManifestV1 {
+pub struct CompatibilityManifest {
     pub schema: u32,
     pub dsh_version: Version,
     pub node_version: Version,
     pub minimum_desktop_version: Version,
+    pub core_compatibility: CoreCompatibility,
+    pub skin_compatibility: SkinCompatibility,
     pub platform: String,
     pub arch: String,
     pub artifact: RuntimeArtifact,
     pub verified_at: String,
     pub compatibility_summary: String,
+}
+
+/// DSH 核心与当前桌面端的兼容结论。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreCompatibility {
+    Compatible,
+    DesktopRequired,
+}
+
+/// 当前桌面皮肤适配器对目标 DSH 版本的验证结论。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkinCompatibility {
+    Verified,
+    Unverified,
 }
 
 /// 兼容运行时压缩包的受信下载约束。
@@ -35,8 +54,9 @@ pub struct RuntimeArtifact {
 /// 同时携带类型化清单与原始清单摘要的验证结果。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedManifest {
-    pub manifest: CompatibilityManifestV1,
+    pub manifest: CompatibilityManifest,
     pub manifest_digest: String,
+    pub desktop_version_supported: bool,
 }
 
 /// 兼容清单拒绝原因；错误正文刻意不携带输入、公钥或签名。
@@ -52,8 +72,6 @@ pub enum ManifestError {
     InvalidJson,
     #[error("不支持的兼容清单 schema: {schema}")]
     UnsupportedSchema { schema: u32 },
-    #[error("当前桌面版本 {current} 低于清单要求的最低版本 {required}")]
-    DesktopVersionTooOld { required: Version, current: Version },
     #[error("兼容清单字段无效: {field}")]
     InvalidField { field: &'static str },
 }
@@ -69,7 +87,7 @@ impl ManifestVerifier {
     /// 从规范的 32-byte 小写 hex 公钥创建验证器。
     ///
     /// :param public_key_hex: 发布公钥的 64 个小写十六进制字符。
-    /// :param current_desktop_version: 当前桌面端的严格 semver，用于强制最低版本门禁。
+    /// :param current_desktop_version: 当前桌面端的严格 semver，用于生成最低版本门禁结论。
     /// :return: 只持有验证公钥的清单验证器。
     /// :raises ManifestError: 编码、长度或 Ed25519 公钥无效时返回
     ///   `InvalidPublicKeyEncoding`。
@@ -149,16 +167,13 @@ impl ManifestVerifier {
 
         let raw: RawManifest =
             serde_json::from_slice(manifest_bytes).map_err(|_| ManifestError::InvalidJson)?;
-        let manifest = CompatibilityManifestV1::try_from(raw)?;
-        if manifest.minimum_desktop_version > self.current_desktop_version {
-            return Err(ManifestError::DesktopVersionTooOld {
-                required: manifest.minimum_desktop_version,
-                current: self.current_desktop_version.clone(),
-            });
-        }
+        let manifest = CompatibilityManifest::try_from(raw)?;
+        let desktop_version_supported =
+            manifest.minimum_desktop_version <= self.current_desktop_version;
         Ok(VerifiedManifest {
             manifest,
             manifest_digest: sha256_hex(manifest_bytes),
+            desktop_version_supported,
         })
     }
 }
@@ -170,6 +185,8 @@ struct RawManifest {
     dsh_version: String,
     node_version: String,
     minimum_desktop_version: String,
+    core_compatibility: Option<CoreCompatibility>,
+    skin_compatibility: Option<SkinCompatibility>,
     platform: String,
     arch: String,
     artifact: RawArtifact,
@@ -185,13 +202,35 @@ struct RawArtifact {
     sha256: String,
 }
 
-impl TryFrom<RawManifest> for CompatibilityManifestV1 {
+impl TryFrom<RawManifest> for CompatibilityManifest {
     type Error = ManifestError;
 
     fn try_from(raw: RawManifest) -> Result<Self, Self::Error> {
-        if raw.schema != MANIFEST_SCHEMA {
-            return Err(ManifestError::UnsupportedSchema { schema: raw.schema });
-        }
+        let (core_compatibility, skin_compatibility) = match raw.schema {
+            // v1 仅在完整兼容验证后发布；读取时恢复它原有的隐含语义。
+            LEGACY_MANIFEST_SCHEMA => {
+                if raw.core_compatibility.is_some() {
+                    return Err(ManifestError::InvalidField {
+                        field: "core_compatibility",
+                    });
+                }
+                if raw.skin_compatibility.is_some() {
+                    return Err(ManifestError::InvalidField {
+                        field: "skin_compatibility",
+                    });
+                }
+                (CoreCompatibility::Compatible, SkinCompatibility::Verified)
+            }
+            CURRENT_MANIFEST_SCHEMA => (
+                raw.core_compatibility.ok_or(ManifestError::InvalidField {
+                    field: "core_compatibility",
+                })?,
+                raw.skin_compatibility.ok_or(ManifestError::InvalidField {
+                    field: "skin_compatibility",
+                })?,
+            ),
+            schema => return Err(ManifestError::UnsupportedSchema { schema }),
+        };
         let dsh_version = parse_version("dsh_version", &raw.dsh_version)?;
         let node_version = parse_version("node_version", &raw.node_version)?;
         let minimum_desktop_version =
@@ -223,6 +262,8 @@ impl TryFrom<RawManifest> for CompatibilityManifestV1 {
             dsh_version,
             node_version,
             minimum_desktop_version,
+            core_compatibility,
+            skin_compatibility,
             platform: raw.platform,
             arch: raw.arch,
             artifact,

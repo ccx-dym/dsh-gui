@@ -8,10 +8,51 @@ import {
 
 describe("updatePresentation", () => {
   it.each([
+    ["official_available", "官方版本已发布", undefined],
+    ["runtime_available", "运行时更新可用", "查看并安装"],
+    ["desktop_required", "请先更新桌面客户端", undefined],
+    ["skin_unverified", "皮肤尚未验证", "查看并安装"],
+    ["offline", "当前处于离线状态", "重新检查"],
+  ] as const)("为 %s 保留独立可见状态", (phase, heading, action) => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase,
+      officialVersion: "0.1.1-rc.2",
+      compatibleVersion: "0.1.1-rc.2",
+      minimumDesktopVersion: "0.2.0",
+      artifactSize: phase === "runtime_available" || phase === "skin_unverified" ? 100 : undefined,
+    });
+    expect(presentation.heading).toContain(heading);
+    expect(presentation.primaryAction?.label).toBe(action);
+  });
+
+  it("皮肤未验证允许安装但明确说明更新后关闭皮肤", () => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "skin_unverified",
+      compatibleVersion: "0.1.1-rc.2",
+      artifactSize: 100,
+    });
+    expect(presentation.primaryAction?.command).toBe("install_compatible_update");
+    expect(presentation.body).toContain("关闭自定义皮肤");
+  });
+
+  it("同版本皮肤未验证只提示关闭皮肤且不开放重复下载", () => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "skin_unverified",
+      currentVersion: "0.1.1-rc.2",
+      compatibleVersion: "0.1.1-rc.2",
+    });
+    expect(presentation.body).toContain("关闭自定义皮肤");
+    expect(presentation.primaryAction).toBeUndefined();
+  });
+
+  it.each([
     ["uninstalled", "尚未安装", "检查兼容版本"],
     ["checking", "正在检查", undefined],
-    ["official_awaiting_compatibility", "正在等待兼容", undefined],
-    ["compatible_available", "兼容版本已就绪", "查看并安装"],
+    ["official_available", "官方版本已发布", undefined],
+    ["runtime_available", "运行时更新可用", undefined],
     ["downloading", "正在下载", undefined],
     ["verifying", "正在验证", undefined],
     ["probing", "正在隔离探活", undefined],
@@ -28,7 +69,7 @@ describe("updatePresentation", () => {
   it("官方新版本待兼容时绝不提供强制安装操作", () => {
     const presentation = updatePresentation({
       ...createInitialUpdateState(),
-      phase: "official_awaiting_compatibility",
+      phase: "official_available",
       officialVersion: "0.2.0",
     });
     expect(presentation.primaryAction).toBeUndefined();
@@ -56,7 +97,7 @@ describe("updatePresentation", () => {
   it("兼容版本确认信息包含版本、大小与兼容摘要", () => {
     const presentation = updatePresentation({
       ...createInitialUpdateState(),
-      phase: "compatible_available",
+      phase: "runtime_available",
       compatibleVersion: "0.1.2",
       artifactSize: 108_024_750,
       compatibilitySummary: '<img src=x onerror="alert(1)">',

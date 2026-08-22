@@ -138,6 +138,8 @@ jobs:
             --dsh-version $env:DSH_VERSION `
             --node-version $env:NODE_VERSION `
             --minimum-desktop-version 0.1.0 `
+            --core-compatibility compatible `
+            --skin-compatibility unverified `
             --artifact-url $artifactUrl `
             --verified-at $verifiedAt `
             --compatibility-summary 'Windows 10/11 x64 核心兼容验证通过；皮肤未验证时自动关闭。' `

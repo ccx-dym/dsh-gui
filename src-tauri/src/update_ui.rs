@@ -108,8 +108,11 @@ pub enum UpdateUiPhase {
     Uninstalled,
     Checking,
     UpToDate,
-    OfficialAwaitingCompatibility,
-    CompatibleAvailable,
+    OfficialAvailable,
+    RuntimeAvailable,
+    DesktopRequired,
+    SkinUnverified,
+    Offline,
     Downloading,
     Verifying,
     Probing,
@@ -135,6 +138,8 @@ pub struct UpdateUiState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_desktop_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     pub notifications_enabled: bool,
     pub should_notify: bool,
@@ -150,6 +155,7 @@ impl Default for UpdateUiState {
             compatible_version: None,
             artifact_size: None,
             compatibility_summary: None,
+            minimum_desktop_version: None,
             error_code: None,
             notifications_enabled: true,
             should_notify: false,
@@ -315,6 +321,81 @@ fn require_local(window: &WebviewWindow) -> Result<(), &'static str> {
     }
 }
 
+fn clear_notice_fields(state: &mut UpdateUiState) {
+    // 每次检查都从空的结果槽开始，避免上一版本的安装授权、摘要或错误混入新结论。
+    state.official_version = None;
+    state.compatible_version = None;
+    state.artifact_size = None;
+    state.compatibility_summary = None;
+    state.minimum_desktop_version = None;
+    state.error_code = None;
+}
+
+fn apply_notice(
+    state: &mut UpdateUiState,
+    notice: &crate::domain::UpdateNotice,
+    manifest: Option<&VerifiedManifest>,
+) {
+    use crate::domain::UpdateNotice;
+
+    clear_notice_fields(state);
+    match notice {
+        UpdateNotice::UpToDate { official, .. } => {
+            state.phase = UpdateUiPhase::UpToDate;
+            state.official_version = Some(official.clone());
+        }
+        UpdateNotice::OfficialAvailable { official, .. } => {
+            state.phase = UpdateUiPhase::OfficialAvailable;
+            state.official_version = Some(official.clone());
+        }
+        UpdateNotice::RuntimeAvailable {
+            official,
+            compatible,
+            ..
+        } => {
+            state.phase = UpdateUiPhase::RuntimeAvailable;
+            state.official_version = Some(official.clone());
+            state.compatible_version = Some(compatible.clone());
+        }
+        UpdateNotice::DesktopRequired {
+            official,
+            compatible,
+            minimum_desktop,
+            ..
+        } => {
+            state.phase = UpdateUiPhase::DesktopRequired;
+            state.official_version = Some(official.clone());
+            state.compatible_version = Some(compatible.clone());
+            state.minimum_desktop_version = Some(minimum_desktop.clone());
+        }
+        UpdateNotice::SkinUnverified {
+            official,
+            compatible,
+            ..
+        } => {
+            state.phase = UpdateUiPhase::SkinUnverified;
+            state.official_version = Some(official.clone());
+            state.compatible_version = Some(compatible.clone());
+        }
+        UpdateNotice::Offline { error_kind, .. } => {
+            state.phase = UpdateUiPhase::Offline;
+            state.error_code = Some(error_kind.clone());
+        }
+        UpdateNotice::CheckFailed { error_kind, .. } => {
+            state.phase = UpdateUiPhase::Failed;
+            state.error_code = Some(error_kind.clone());
+        }
+    }
+    if matches!(
+        state.phase,
+        UpdateUiPhase::RuntimeAvailable | UpdateUiPhase::SkinUnverified
+    ) && let Some(manifest) = manifest
+    {
+        state.artifact_size = Some(manifest.manifest.artifact.size);
+        state.compatibility_summary = Some(manifest.manifest.compatibility_summary.clone());
+    }
+}
+
 #[tauri::command]
 /// 获取更新状态的 revision 快照。
 ///
@@ -355,8 +436,11 @@ pub async fn check_updates(
         UpdateUiPhase::Unavailable
             | UpdateUiPhase::Uninstalled
             | UpdateUiPhase::UpToDate
-            | UpdateUiPhase::OfficialAwaitingCompatibility
-            | UpdateUiPhase::CompatibleAvailable
+            | UpdateUiPhase::OfficialAvailable
+            | UpdateUiPhase::RuntimeAvailable
+            | UpdateUiPhase::DesktopRequired
+            | UpdateUiPhase::SkinUnverified
+            | UpdateUiPhase::Offline
             | UpdateUiPhase::Failed
     ) {
         return Err("update_transition_denied");
@@ -374,6 +458,7 @@ async fn run_update_check(
         let mut next = controller.state.lock().await.clone();
         next.phase = UpdateUiPhase::Checking;
         next.should_notify = false;
+        clear_notice_fields(&mut next);
         *controller.manifest.lock().await = None;
         controller.publish(app, next).await;
     }
@@ -382,6 +467,7 @@ async fn run_update_check(
             return Ok(controller.envelope().await);
         }
         let mut unavailable = controller.state.lock().await.clone();
+        clear_notice_fields(&mut unavailable);
         unavailable.phase = UpdateUiPhase::Unavailable;
         unavailable.error_code = Some("release_configuration_unavailable".to_owned());
         controller.publish(app, unavailable).await;
@@ -456,6 +542,7 @@ async fn run_update_check(
         Err(code) => {
             *controller.manifest.lock().await = None;
             let mut failed = controller.state.lock().await.clone();
+            clear_notice_fields(&mut failed);
             failed.phase = UpdateUiPhase::Failed;
             failed.error_code = Some(code.to_owned());
             controller.publish(app, failed).await;
@@ -469,46 +556,26 @@ async fn run_update_check(
     checked.current_version = current.map(|value| value.to_string());
     checked.should_notify = result.should_notify;
     let notification_notice = result.notice.clone();
-    use crate::domain::UpdateNotice;
-    match result.notice {
-        UpdateNotice::UpToDate { official, .. } => {
-            checked.phase = UpdateUiPhase::UpToDate;
-            checked.official_version = Some(official);
-        }
-        UpdateNotice::OfficialAwaitingCompatibility { official, .. } => {
-            checked.phase = UpdateUiPhase::OfficialAwaitingCompatibility;
-            checked.official_version = Some(official);
-        }
-        UpdateNotice::CompatibleAvailable {
-            official,
-            compatible,
-            ..
-        } => {
-            checked.phase = UpdateUiPhase::CompatibleAvailable;
-            checked.official_version = Some(official);
-            checked.compatible_version = Some(compatible);
-            if let Some(manifest) = &result.compatible_manifest {
-                checked.artifact_size = Some(manifest.manifest.artifact.size);
-                checked.compatibility_summary =
-                    Some(manifest.manifest.compatibility_summary.clone());
-            }
-        }
-        UpdateNotice::CheckFailed { .. } => {
-            checked.phase = UpdateUiPhase::Failed;
-            checked.error_code = Some("update_check_failed".to_owned());
-        }
-    }
+    apply_notice(
+        &mut checked,
+        &result.notice,
+        result.compatible_manifest.as_ref(),
+    );
     *controller.manifest.lock().await = result.compatible_manifest;
     controller.publish(app, checked).await;
     let state = controller.envelope().await;
     if state.state.should_notify {
         let notification = match state.state.phase {
-            UpdateUiPhase::OfficialAwaitingCompatibility => {
+            UpdateUiPhase::OfficialAvailable => {
                 Some(("DSH 新版本正在兼容验证", "验证完成后桌面端会开放安全安装。"))
             }
-            UpdateUiPhase::CompatibleAvailable => Some((
+            UpdateUiPhase::RuntimeAvailable | UpdateUiPhase::SkinUnverified => Some((
                 "DSH 兼容更新已就绪",
                 "打开 DSH Desktop 查看版本并确认下载。",
+            )),
+            UpdateUiPhase::DesktopRequired => Some((
+                "DSH Desktop 需要更新",
+                "请先更新桌面客户端，再安装此 DSH 版本。",
             )),
             _ => None,
         };
@@ -586,8 +653,11 @@ pub fn spawn_scheduled_update_checks(app: AppHandle) {
                     UpdateUiPhase::Unavailable
                         | UpdateUiPhase::Uninstalled
                         | UpdateUiPhase::UpToDate
-                        | UpdateUiPhase::OfficialAwaitingCompatibility
-                        | UpdateUiPhase::CompatibleAvailable
+                        | UpdateUiPhase::OfficialAvailable
+                        | UpdateUiPhase::RuntimeAvailable
+                        | UpdateUiPhase::DesktopRequired
+                        | UpdateUiPhase::SkinUnverified
+                        | UpdateUiPhase::Offline
                         | UpdateUiPhase::Failed
                 ) {
                     // 15 分钟只读取一次本地 next_check；真正联网严格受 12 小时持久化
@@ -622,7 +692,7 @@ pub async fn install_compatible_update(
     controller.require_revision(expected_revision).await?;
     if !matches!(
         controller.state.lock().await.phase,
-        UpdateUiPhase::CompatibleAvailable
+        UpdateUiPhase::RuntimeAvailable | UpdateUiPhase::SkinUnverified
     ) {
         return Err("update_transition_denied");
     }
@@ -632,6 +702,8 @@ pub async fn install_compatible_update(
         .await
         .clone()
         .ok_or("compatible_update_missing")?;
+    // 安装操作持有受信清单快照后立即消费授权，后续失败或重复点击都不能复用旧清单。
+    *controller.manifest.lock().await = None;
     let mut downloading = controller.state.lock().await.clone();
     downloading.phase = UpdateUiPhase::Downloading;
     downloading.should_notify = false;
@@ -642,6 +714,7 @@ pub async fn install_compatible_update(
             Ok(pending) => pending,
             Err(code) => {
                 let mut failed = controller.state.lock().await.clone();
+                clear_notice_fields(&mut failed);
                 failed.phase = UpdateUiPhase::Failed;
                 failed.error_code = Some(code.to_owned());
                 controller.publish(&app, failed).await;
@@ -650,6 +723,7 @@ pub async fn install_compatible_update(
         };
     *controller.pending.lock().await = Some(pending_activation);
     let mut pending = controller.state.lock().await.clone();
+    clear_notice_fields(&mut pending);
     pending.phase = UpdateUiPhase::RestartPending;
     controller.publish(&app, pending).await;
     Ok(controller.envelope().await)
@@ -1547,10 +1621,12 @@ fn write_new_or_matching(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 mod tests {
     use super::{
         ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
-        UpdateUiController, UpdateUiPhase, activation_receipt, confirmation_path,
-        finish_cold_recovery, inspect_orphan_candidate_with, load_single_confirmed_pending,
-        pending_path, plan_cold_recovery, recover_orphan_candidate_with, write_activation_receipt,
+        UpdateUiController, UpdateUiPhase, UpdateUiState, activation_receipt, apply_notice,
+        confirmation_path, finish_cold_recovery, inspect_orphan_candidate_with,
+        load_single_confirmed_pending, pending_path, plan_cold_recovery,
+        recover_orphan_candidate_with, write_activation_receipt,
     };
+    use crate::domain::UpdateNotice;
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::install_state::{
         ActiveDeployment, DataGeneration, InstallStateStore, InstalledRuntime,
@@ -1566,6 +1642,73 @@ mod tests {
         },
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn notices_keep_distinct_ui_phases_and_clear_stale_artifact_fields() {
+        let cases = [
+            (
+                UpdateNotice::OfficialAvailable {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                },
+                UpdateUiPhase::OfficialAvailable,
+            ),
+            (
+                UpdateNotice::RuntimeAvailable {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                },
+                UpdateUiPhase::RuntimeAvailable,
+            ),
+            (
+                UpdateNotice::DesktopRequired {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                    minimum_desktop: "0.2.0".to_owned(),
+                },
+                UpdateUiPhase::DesktopRequired,
+            ),
+            (
+                UpdateNotice::SkinUnverified {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                },
+                UpdateUiPhase::SkinUnverified,
+            ),
+            (
+                UpdateNotice::Offline {
+                    current: Some("0.1.1-rc.1".to_owned()),
+                    version: None,
+                    error_kind: "network".to_owned(),
+                },
+                UpdateUiPhase::Offline,
+            ),
+        ];
+
+        for (notice, expected_phase) in cases {
+            let mut state = UpdateUiState {
+                compatible_version: Some("stale".to_owned()),
+                artifact_size: Some(99),
+                compatibility_summary: Some("stale".to_owned()),
+                minimum_desktop_version: Some("9.9.9".to_owned()),
+                error_code: Some("stale_error".to_owned()),
+                ..UpdateUiState::default()
+            };
+            apply_notice(&mut state, &notice, None);
+
+            assert!(
+                std::mem::discriminant(&state.phase) == std::mem::discriminant(&expected_phase)
+            );
+            assert_ne!(state.compatible_version.as_deref(), Some("stale"));
+            assert_eq!(state.artifact_size, None);
+            assert_eq!(state.compatibility_summary, None);
+            assert_ne!(state.minimum_desktop_version.as_deref(), Some("9.9.9"));
+            assert_ne!(state.error_code.as_deref(), Some("stale_error"));
+        }
+    }
 
     #[tokio::test]
     async fn missing_release_configuration_is_explicitly_unavailable() {

@@ -71,6 +71,14 @@ fn valid_signed_manifest_returns_typed_fields_and_raw_digest() {
 
     assert_eq!(verified.manifest.schema, 1);
     assert_eq!(
+        verified.manifest.core_compatibility,
+        dsh_desktop_lib::update::manifest::CoreCompatibility::Compatible
+    );
+    assert_eq!(
+        verified.manifest.skin_compatibility,
+        dsh_desktop_lib::update::manifest::SkinCompatibility::Verified
+    );
+    assert_eq!(
         verified.manifest.dsh_version,
         Version::parse("0.1.1-rc.1").unwrap()
     );
@@ -103,6 +111,65 @@ fn valid_signed_manifest_returns_typed_fields_and_raw_digest() {
         verified.manifest_digest,
         "0986f8c636d4224f01e80b0bdb7437f4d6d31dd253531858db9c35d01b67196b"
     );
+}
+
+#[test]
+fn schema_v2_requires_and_preserves_explicit_compatibility_levels() {
+    let v2 = valid_json()
+        .replacen("\"schema\":1", "\"schema\":2", 1)
+        .replacen(
+            "\"minimum_desktop_version\":\"0.1.0\"",
+            "\"minimum_desktop_version\":\"0.1.0\",\"core_compatibility\":\"compatible\",\"skin_compatibility\":\"unverified\"",
+            1,
+        );
+    let verified = signed_json(v2).expect("v2 清单应保留显式兼容结论");
+
+    assert_eq!(verified.manifest.schema, 2);
+    assert_eq!(
+        verified.manifest.core_compatibility,
+        dsh_desktop_lib::update::manifest::CoreCompatibility::Compatible
+    );
+    assert_eq!(
+        verified.manifest.skin_compatibility,
+        dsh_desktop_lib::update::manifest::SkinCompatibility::Unverified
+    );
+}
+
+#[test]
+fn schema_v2_rejects_missing_or_unknown_compatibility_levels() {
+    let v2_without_levels = valid_json().replacen("\"schema\":1", "\"schema\":2", 1);
+    assert!(matches!(
+        signed_json(v2_without_levels),
+        Err(ManifestError::InvalidField {
+            field: "core_compatibility"
+        })
+    ));
+
+    let invalid_level = valid_json()
+        .replacen("\"schema\":1", "\"schema\":2", 1)
+        .replacen(
+            "\"minimum_desktop_version\":\"0.1.0\"",
+            "\"minimum_desktop_version\":\"0.1.0\",\"core_compatibility\":\"maybe\",\"skin_compatibility\":\"verified\"",
+            1,
+        );
+    assert!(matches!(
+        signed_json(invalid_level),
+        Err(ManifestError::InvalidJson)
+    ));
+}
+
+#[test]
+fn schema_v1_rejects_each_v2_compatibility_field() {
+    for field in [
+        "\"core_compatibility\":\"compatible\",",
+        "\"skin_compatibility\":\"verified\",",
+    ] {
+        let mixed = valid_json().replacen("\"platform\"", &format!("{field}\"platform\""), 1);
+        assert!(matches!(
+            signed_json(mixed),
+            Err(ManifestError::InvalidField { .. })
+        ));
+    }
 }
 
 #[test]
@@ -139,6 +206,10 @@ fn node_generator_and_signer_output_is_accepted_by_rust_verifier() {
             "24.15.0",
             "--minimum-desktop-version",
             "0.1.0",
+            "--core-compatibility",
+            "compatible",
+            "--skin-compatibility",
+            "unverified",
             "--artifact-url",
             "https://github.com/ccx-dym/dsh-gui/releases/download/dsh-v0.1.1-rc.2-windows/dsh-runtime-0.1.1-rc.2-node-24.15.0-win-x64.zip",
             "--verified-at",
@@ -185,6 +256,11 @@ fn node_generator_and_signer_output_is_accepted_by_rust_verifier() {
         Version::parse("0.1.1-rc.2").unwrap()
     );
     assert_eq!(verified.manifest.artifact.size, 7);
+    assert_eq!(verified.manifest.schema, 2);
+    assert_eq!(
+        verified.manifest.skin_compatibility,
+        dsh_desktop_lib::update::manifest::SkinCompatibility::Unverified
+    );
     assert_eq!(
         verified.manifest.compatibility_summary,
         "Windows 10/11 x64 核心兼容验证通过 🐋"
@@ -290,8 +366,8 @@ fn schema_platform_arch_and_size_are_strict() {
     }
 
     assert!(matches!(
-        signed_json(replace_once("\"schema\":1", "\"schema\":2")),
-        Err(ManifestError::UnsupportedSchema { schema: 2 })
+        signed_json(replace_once("\"schema\":1", "\"schema\":3")),
+        Err(ManifestError::UnsupportedSchema { schema: 3 })
     ));
 }
 
@@ -314,29 +390,27 @@ fn versions_must_be_strict_semver() {
 }
 
 #[test]
-fn minimum_desktop_version_rejects_older_stable_and_prerelease_clients() {
+fn minimum_desktop_version_is_preserved_as_a_coordinator_gate() {
     let future = replace_once(
         "\"minimum_desktop_version\":\"0.1.0\"",
         "\"minimum_desktop_version\":\"99.0.0\"",
     );
-    assert!(matches!(
-        signed_json(future),
-        Err(ManifestError::DesktopVersionTooOld { required, current })
-            if required == Version::parse("99.0.0").unwrap()
-                && current == Version::parse("0.1.0").unwrap()
-    ));
+    let verified = signed_json(future).expect("签名正确的清单应保留最低桌面版本供决策层阻止安装");
+    assert!(!verified.desktop_version_supported);
+    assert_eq!(
+        verified.manifest.minimum_desktop_version,
+        Version::parse("99.0.0").unwrap()
+    );
 
     let stable_minimum = replace_once(
         "\"minimum_desktop_version\":\"0.1.0\"",
         "\"minimum_desktop_version\":\"0.2.0\"",
     );
     let bytes = stable_minimum.as_bytes();
-    assert!(matches!(
-        verifier_for("0.2.0-rc.1").verify(bytes, &sign(bytes), &diagnostics()),
-        Err(ManifestError::DesktopVersionTooOld { required, current })
-            if required == Version::parse("0.2.0").unwrap()
-                && current == Version::parse("0.2.0-rc.1").unwrap()
-    ));
+    let verified = verifier_for("0.2.0-rc.1")
+        .verify(bytes, &sign(bytes), &diagnostics())
+        .expect("预发布桌面仍应解析清单并交给协调器阻止安装");
+    assert!(!verified.desktop_version_supported);
 }
 
 #[test]

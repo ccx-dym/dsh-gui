@@ -49,14 +49,30 @@ pub enum UpdateNotice {
         current: Option<String>,
         official: String,
     },
-    OfficialAwaitingCompatibility {
+    OfficialAvailable {
         current: Option<String>,
         official: String,
     },
-    CompatibleAvailable {
+    RuntimeAvailable {
         current: Option<String>,
         official: String,
         compatible: String,
+    },
+    DesktopRequired {
+        current: Option<String>,
+        official: String,
+        compatible: String,
+        minimum_desktop: String,
+    },
+    SkinUnverified {
+        current: Option<String>,
+        official: String,
+        compatible: String,
+    },
+    Offline {
+        current: Option<String>,
+        version: Option<String>,
+        error_kind: String,
     },
     CheckFailed {
         current: Option<String>,
@@ -67,7 +83,7 @@ pub enum UpdateNotice {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppPhase, RuntimeEvent, RuntimeStatus};
+    use super::{AppPhase, RuntimeEvent, RuntimeStatus, UpdateNotice};
 
     #[test]
     fn ready_event_uses_frontend_field_names() {
@@ -83,5 +99,71 @@ mod tests {
     #[test]
     fn default_status_is_idle() {
         assert_eq!(RuntimeStatus::default().phase, AppPhase::Idle);
+    }
+
+    #[test]
+    fn update_notice_variants_use_stable_snake_case_statuses() {
+        let notices = [
+            (
+                UpdateNotice::OfficialAvailable {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                },
+                "official_available",
+            ),
+            (
+                UpdateNotice::RuntimeAvailable {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                },
+                "runtime_available",
+            ),
+            (
+                UpdateNotice::DesktopRequired {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                    minimum_desktop: "0.2.0".to_owned(),
+                },
+                "desktop_required",
+            ),
+            (
+                UpdateNotice::SkinUnverified {
+                    current: None,
+                    official: "0.1.1-rc.2".to_owned(),
+                    compatible: "0.1.1-rc.2".to_owned(),
+                },
+                "skin_unverified",
+            ),
+            (
+                UpdateNotice::UpToDate {
+                    current: Some("0.1.1-rc.2".to_owned()),
+                    official: "0.1.1-rc.2".to_owned(),
+                },
+                "up_to_date",
+            ),
+            (
+                UpdateNotice::Offline {
+                    current: Some("0.1.1-rc.1".to_owned()),
+                    version: None,
+                    error_kind: "network".to_owned(),
+                },
+                "offline",
+            ),
+            (
+                UpdateNotice::CheckFailed {
+                    current: None,
+                    version: None,
+                    error_kind: "compatibility_verification".to_owned(),
+                },
+                "check_failed",
+            ),
+        ];
+
+        for (notice, expected) in notices {
+            let value = serde_json::to_value(notice).expect("更新结论必须可序列化");
+            assert_eq!(value["status"], expected);
+        }
     }
 }

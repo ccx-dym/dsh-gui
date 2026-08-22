@@ -82,7 +82,7 @@ modify `src-tauri/src/runtime/mod.rs`。
 **Files:** create `src-tauri/src/update/manifest.rs`, `src-tauri/src/update/mod.rs`,
 create `src-tauri/tests/fixtures/runtime-manifest/`（仅小型文本夹具）。
 
-**Interfaces:** `CompatibilityManifestV1`, `RuntimeArtifact`, `ManifestVerifier`。
+**Interfaces:** `CompatibilityManifest`, `RuntimeArtifact`, `ManifestVerifier`。
 
 1. 先写测试覆盖 schema、DSH/Node/桌面最低版本、platform=`windows`、arch=`x86_64`、
    size、SHA-256、HTTPS URL、验证时间、兼容摘要。

@@ -3,8 +3,11 @@ export type UpdatePhase =
   | "uninstalled"
   | "checking"
   | "up_to_date"
-  | "official_awaiting_compatibility"
-  | "compatible_available"
+  | "official_available"
+  | "runtime_available"
+  | "desktop_required"
+  | "skin_unverified"
+  | "offline"
   | "downloading"
   | "verifying"
   | "probing"
@@ -21,6 +24,7 @@ export interface UpdateState {
   compatibleVersion?: string;
   artifactSize?: number;
   compatibilitySummary?: string;
+  minimumDesktopVersion?: string;
   errorCode?: string;
   notificationsEnabled: boolean;
   shouldNotify: boolean;
@@ -107,23 +111,23 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
         primaryAction: { command: "check_updates", label: "再次检查" },
         busy: false,
       };
-    case "official_awaiting_compatibility":
+    case "official_available":
       return {
         eyebrow: "兼容性保护",
-        heading: "官方版本正在等待兼容",
+        heading: "官方版本已发布",
         body: `DSH ${state.officialVersion ?? "新版本"} 已发布；兼容验证完成后才会开放安装。`,
         busy: false,
       };
-    case "compatible_available": {
+    case "runtime_available": {
       const version = state.compatibleVersion ?? "未知版本";
       const size = state.artifactSize === undefined ? "大小未知" : formatBytes(state.artifactSize);
       return {
         eyebrow: "兼容版本",
-        heading: "兼容版本已就绪",
+        heading: "运行时更新可用",
         body: "运行中只下载并暂存；不会中断当前任务。",
         details: `${version} · ${size}`,
         summary: state.compatibilitySummary,
-        primaryAction: {
+        primaryAction: state.artifactSize === undefined ? undefined : {
           command: "install_compatible_update",
           label: "查看并安装",
           confirmation: `下载并验证 DSH ${version}（${size}）。完成后需重启才能安装/激活。`,
@@ -131,6 +135,38 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
         busy: false,
       };
     }
+    case "desktop_required":
+      return {
+        eyebrow: "客户端兼容性",
+        heading: "请先更新桌面客户端",
+        body: `DSH ${state.compatibleVersion ?? state.officialVersion ?? "新版本"} 需要 DSH Desktop ${state.minimumDesktopVersion ?? "更新版本"} 或更高版本。`,
+        busy: false,
+      };
+    case "skin_unverified": {
+      const version = state.compatibleVersion ?? "当前版本";
+      const size = state.artifactSize === undefined ? "大小未知" : formatBytes(state.artifactSize);
+      return {
+        eyebrow: "皮肤兼容性",
+        heading: "皮肤尚未验证",
+        body: "安装此版本后会关闭自定义皮肤并恢复官方界面；DSH 核心功能仍可使用。",
+        details: state.artifactSize === undefined ? version : `${version} · ${size}`,
+        summary: state.compatibilitySummary,
+        primaryAction: state.artifactSize === undefined ? undefined : {
+          command: "install_compatible_update",
+          label: "查看并安装",
+          confirmation: `下载并验证 DSH ${version}（${size}）。更新后将关闭自定义皮肤。`,
+        },
+        busy: false,
+      };
+    }
+    case "offline":
+      return {
+        eyebrow: "网络状态",
+        heading: "当前处于离线状态",
+        body: "无法检查新版本；已安装的 DSH 和用户数据保持不变。",
+        primaryAction: retry,
+        busy: false,
+      };
     case "downloading":
       return { eyebrow: "安全暂存", heading: "正在下载", body: "校验大小与 SHA-256 后才会继续。", busy: true };
     case "verifying":
