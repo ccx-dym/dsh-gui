@@ -679,7 +679,9 @@ impl FileDiagnosticSink {
             return Err(DiagnosticError::InvalidPolicy);
         }
         let (sender, mut receiver) = mpsc::channel(queue_capacity);
-        tokio::spawn(async move {
+        // Tauri 的 setup 回调运行在 GUI 事件线程，并不位于“当前 Tokio reactor”内；
+        // 使用 Tauri 全局异步运行时才能同时覆盖同步 setup 与异步测试调用点。
+        tauri::async_runtime::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 match command {
                     DiagnosticCommand::Event(event) => {

@@ -100,7 +100,8 @@ impl AppPaths {
     /// 根据 Windows 漫游目录与本地目录计算应用的固定目录布局。
     ///
     /// 配置、日志和 DSH 主目录属于用户数据，放入漫游目录；可重新下载或生成的
-    /// 运行时、皮肤、更新和 WebView 数据放入本地目录，避免缓存污染用户数据。
+    /// 运行时、皮肤、更新和 WebView 数据放入独立的本地数据目录，避免缓存污染漫游
+    /// 数据，也避免 current-user NSIS 卸载目录与可保留数据目录重合。
     ///
     /// :param roaming: Windows 漫游应用数据目录。
     /// :param local: Windows 本地应用数据目录。
@@ -108,7 +109,7 @@ impl AppPaths {
     /// :raises: 此函数仅计算路径，不产生错误。
     pub fn from_roots(roaming: &Path, local: &Path) -> Self {
         let roaming_root = roaming.join("DSH Desktop");
-        let local_root = local.join("DSH Desktop");
+        let local_root = local.join("DSH Desktop Data");
         Self {
             dsh_home: roaming_root.join("dsh-home"),
             settings: roaming_root.join("settings"),
@@ -174,8 +175,17 @@ mod tests {
 
         assert!(paths.dsh_home.ends_with(r"DSH Desktop\dsh-home"));
         assert!(paths.settings.ends_with(r"DSH Desktop\settings"));
-        assert!(paths.runtimes.ends_with(r"DSH Desktop\runtimes"));
-        assert!(paths.webview_data.ends_with(r"DSH Desktop\webview-data"));
+        assert!(paths.runtimes.ends_with(r"DSH Desktop Data\runtimes"));
+        assert!(
+            paths
+                .webview_data
+                .ends_with(r"DSH Desktop Data\webview-data")
+        );
+        assert!(
+            !paths
+                .runtimes
+                .starts_with(r"C:\Users\demo\AppData\Local\DSH Desktop")
+        );
         assert!(!paths.dsh_home.starts_with(&paths.runtimes));
     }
 
@@ -190,7 +200,7 @@ mod tests {
         );
         assert_eq!(
             paths.webview_data,
-            unicode_root.join("DSH Desktop").join("webview-data")
+            unicode_root.join("DSH Desktop Data").join("webview-data")
         );
     }
 }

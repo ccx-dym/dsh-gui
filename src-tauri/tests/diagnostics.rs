@@ -379,6 +379,23 @@ async fn no_fail_sink_absorbs_write_failures_and_queue_pressure() {
     sink.flush().await;
 }
 
+#[test]
+fn sink_can_be_created_from_tauri_synchronous_setup() {
+    let directory = isolated_directory("sync-setup");
+    let logger =
+        DiagnosticLogger::new(directory, DiagnosticPolicy::default()).expect("策略本身合法");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        FileDiagnosticSink::new(logger, 4)
+    }));
+
+    assert!(
+        result.is_ok(),
+        "同步 Tauri setup 不得因缺少当前 Tokio reactor 而 panic"
+    );
+    assert!(result.expect("已确认未 panic").is_ok());
+}
+
 #[tokio::test]
 async fn closed_worker_makes_later_records_a_noop_without_panicking() {
     let directory = isolated_directory("worker-close");
