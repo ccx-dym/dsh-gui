@@ -114,7 +114,7 @@ impl RuntimeLaunchSpec {
         }
 
         let args = vec![
-            canonical_cli.to_string_lossy().into_owned(),
+            child_argument_path(&canonical_cli),
             "web".to_owned(),
             "--host".to_owned(),
             Ipv4Addr::LOCALHOST.to_string(),
@@ -139,6 +139,23 @@ impl RuntimeLaunchSpec {
             readiness_policy: ReadinessPolicy::StdoutAndHttp,
         })
     }
+}
+
+fn child_argument_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        // `canonicalize` 会返回 Win32 扩展路径；Node 24 把作为 argv 传入的
+        // `\\?\C:\...` 错误拆成 `C:` 目录。CLI 位于固定用户目录且已完成边界
+        // 校验，传给子进程前恢复标准盘符/UNC 表示即可保留安全性与兼容性。
+        if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = value.strip_prefix(r"\\?\") {
+            return rest.to_owned();
+        }
+    }
+    value.into_owned()
 }
 
 fn validate_directory(field: &'static str, path: &Path) -> Result<(), RuntimeError> {
@@ -179,7 +196,7 @@ pub fn reserve_loopback_port() -> Result<u16, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReadinessPolicy, RuntimeLaunchSpec};
+    use super::{ReadinessPolicy, RuntimeLaunchSpec, child_argument_path};
     use crate::runtime::RuntimeError;
     use std::fs;
     use std::path::PathBuf;
@@ -259,6 +276,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn official_spec_passes_node_a_standard_windows_cli_path() {
+        let layout = TestLayout::create("node-standard-path");
+        let spec = RuntimeLaunchSpec::official(
+            layout.root.clone(),
+            layout.node,
+            layout.cli,
+            layout.cwd,
+            layout.dsh_home,
+            43127,
+        )
+        .expect("official spec");
+
+        assert!(!spec.args[0].starts_with(r"\\?\"));
+        assert!(spec.args[0].ends_with(r"@deepseek-ai\dsh\lib\bin.js"));
+        assert_eq!(
+            child_argument_path(std::path::Path::new(r"\\?\UNC\server\share\bin.js")),
+            r"\\server\share\bin.js"
+        );
+    }
+
+    #[test]
     fn official_spec_preserves_unicode_paths_and_fixed_loopback_arguments() {
         let layout = TestLayout::create("official");
 
@@ -276,12 +315,7 @@ mod tests {
         assert_eq!(
             spec.args,
             vec![
-                layout
-                    .cli
-                    .canonicalize()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
+                child_argument_path(&layout.cli.canonicalize().unwrap()),
                 "web".to_owned(),
                 "--host".to_owned(),
                 "127.0.0.1".to_owned(),
