@@ -7,6 +7,14 @@ import { githubTokenFromEnvironment } from "../scan-dsh-upstream.mjs";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 
+test("signed manifest fixture keeps identical LF bytes on Windows checkout", async () => {
+  const attributes = await readFile(path.join(repositoryRoot, ".gitattributes"), "utf8");
+  assert.match(
+    attributes,
+    /^src-tauri\/tests\/fixtures\/runtime-manifest\/valid\.json text eol=lf$/m,
+  );
+});
+
 function parseScalar(source) {
   const value = source.trim();
   if (value === "") return {};
