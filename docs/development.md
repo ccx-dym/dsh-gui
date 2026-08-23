@@ -170,8 +170,36 @@ GitHub Raw 地址只有在 stable manifest 和签名已经发布后才可用于�
 私钥、API Key 或鉴权头放入环境或构建日志。
 
 NSIS 明确使用 `currentUser` 安装模式，不请求管理员权限；WebView2 使用小体积的官方
-download bootstrapper。个人 RC 可用 `pnpm tauri build --bundles nsis` 构建，但未配置
-代码签名证书时生成的 EXE 会显示未知发布者，只能用于本机/小范围测试，不应公开分发。
+download bootstrapper。未配置 Tauri updater 私钥的个人 RC 必须显式关闭更新制品生成，
+仍会产出可安装的普通 NSIS；该 EXE 会显示未知发布者，只能用于本机/小范围测试：
+
+```powershell
+pnpm tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+## 桌面客户端独立更新发布
+
+正式客户端更新由 `desktop-v<version>` tag 触发，并且要求 `package.json`、
+`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 三处版本完全一致。GitHub
+environment `desktop-release` 必须配置独立于 runtime 的以下值：
+
+- secrets：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；
+- variables：`TAURI_UPDATER_PUBLIC_KEY`、`DSH_DESKTOP_UPDATE_ENDPOINT`；
+- runtime 公开通道 variables：`DSH_DESKTOP_NPM_REGISTRY_ROOT`、
+  `DSH_DESKTOP_COMPAT_MANIFEST_URL`、`DSH_DESKTOP_COMPAT_SIGNATURE_URL`、
+  `DSH_DESKTOP_COMPAT_PUBLIC_KEY`。
+
+推荐把 `DSH_DESKTOP_UPDATE_ENDPOINT` 配置为当前仓库的固定桌面通道：
+
+```text
+https://github.com/ccx-dym/dsh-gui/releases/download/desktop-stable/latest.json
+```
+
+工作流先运行完整门禁，再生成 current-user NSIS、Tauri `.exe.sig` 和只含
+`windows-x86_64` 的 `latest.json`。版本化 `desktop-v<version>` Release 不覆盖；
+`desktop-stable` 只替换签名元数据 `latest.json`，其 URL 稳定。客户端仍会拒绝相同版本、
+降级、无效元数据和签名不匹配的安装包。桌面更新与 runtime 更新使用不同密钥、状态文件
+和命令权限，且安装前只有在下载及签名验证成功后才停止受管 DSH 进程。
 
 脚本最后会打印五项 Windows 手工检查。手工测试日志只记录阶段、错误类型、耗时、
 PID 和必要的 trace ID，不得包含 API Key、完整鉴权头或用户提示正文。

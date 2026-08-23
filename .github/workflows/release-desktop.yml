@@ -1,0 +1,216 @@
+name: Release DSH Desktop
+
+on:
+  push:
+    tags: [desktop-v*]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-stable-channel
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    environment: desktop-release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DSH_DESKTOP_NPM_REGISTRY_ROOT: ${{ vars.DSH_DESKTOP_NPM_REGISTRY_ROOT }}
+      DSH_DESKTOP_COMPAT_MANIFEST_URL: ${{ vars.DSH_DESKTOP_COMPAT_MANIFEST_URL }}
+      DSH_DESKTOP_COMPAT_SIGNATURE_URL: ${{ vars.DSH_DESKTOP_COMPAT_SIGNATURE_URL }}
+      DSH_DESKTOP_COMPAT_PUBLIC_KEY: ${{ vars.DSH_DESKTOP_COMPAT_PUBLIC_KEY }}
+      DSH_DESKTOP_UPDATE_ENDPOINT: ${{ vars.DSH_DESKTOP_UPDATE_ENDPOINT }}
+    steps:
+      - name: Checkout exact tagged source
+        id: checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate exact desktop tag and source versions
+        id: validate
+        shell: pwsh
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ($env:RELEASE_REF -cnotmatch '^refs/tags/desktop-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') {
+            throw 'desktop-v tag must contain exact SemVer'
+          }
+          $version = $Matches[1..3] -join '.'
+          if ($env:RELEASE_REF -match '^refs/tags/desktop-v(.+)$') { $version = $Matches[1] }
+          $package = Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json
+          $tauri = Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $cargo = Get-Content -LiteralPath src-tauri/Cargo.toml -Raw
+          if ($package.version -cne $version -or $tauri.version -cne $version) {
+            throw 'package.json and tauri.conf.json must match desktop tag'
+          }
+          if ($cargo -cnotmatch "(?m)^version = `"$([regex]::Escape($version))`"$") {
+            throw 'Cargo.toml must match desktop tag'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Install locked dependencies
+        id: dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'corepack enable failed' }
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'locked dependency install failed' }
+      - name: Test and build signed current-user NSIS
+        id: build
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          foreach ($name in @(
+            'DSH_DESKTOP_NPM_REGISTRY_ROOT',
+            'DSH_DESKTOP_COMPAT_MANIFEST_URL',
+            'DSH_DESKTOP_COMPAT_SIGNATURE_URL',
+            'DSH_DESKTOP_COMPAT_PUBLIC_KEY',
+            'DSH_DESKTOP_UPDATE_ENDPOINT',
+            'TAURI_SIGNING_PRIVATE_KEY',
+            'TAURI_UPDATER_PUBLIC_KEY'
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "required desktop release configuration is missing: $name"
+            }
+          }
+          $endpoint = [Uri]$env:DSH_DESKTOP_UPDATE_ENDPOINT
+          if ($endpoint.Scheme -cne 'https' -or -not [string]::IsNullOrEmpty($endpoint.UserInfo)) {
+            throw 'desktop updater endpoint must be credential-free HTTPS'
+          }
+          pnpm check
+          if ($LASTEXITCODE -ne 0) { throw 'desktop release checks failed' }
+          $overlay = @{
+            plugins = @{
+              updater = @{
+                endpoints = @($env:DSH_DESKTOP_UPDATE_ENDPOINT)
+                pubkey = $env:TAURI_UPDATER_PUBLIC_KEY
+                windows = @{ installMode = 'passive' }
+              }
+            }
+          } | ConvertTo-Json -Depth 8 -Compress
+          pnpm tauri build --bundles nsis --config $overlay
+          if ($LASTEXITCODE -ne 0) { throw 'signed NSIS build failed' }
+      - name: Generate bounded static updater metadata
+        id: metadata
+        shell: pwsh
+        env:
+          DESKTOP_VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $bundleRoot = Resolve-Path -LiteralPath src-tauri/target/release/bundle/nsis
+          $installers = @(Get-ChildItem -LiteralPath $bundleRoot -File -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'expected exactly one NSIS installer' }
+          $sourceExe = $installers[0]
+          $sourceSig = "$($sourceExe.FullName).sig"
+          if (-not (Test-Path -LiteralPath $sourceSig -PathType Leaf)) {
+            throw 'Tauri detached .exe.sig is missing'
+          }
+          $signature = (Get-Content -LiteralPath $sourceSig -Raw).Trim()
+          if ([string]::IsNullOrWhiteSpace($signature) -or $signature.Length -gt 8192) {
+            throw 'Tauri detached signature is invalid'
+          }
+          $candidate = Join-Path $env:RUNNER_TEMP 'desktop-release-candidate'
+          New-Item -ItemType Directory -Path $candidate | Out-Null
+          $exeName = "DSH-Desktop_$env:DESKTOP_VERSION`_x64-setup.exe"
+          $sigName = "$exeName.sig"
+          Copy-Item -LiteralPath $sourceExe.FullName -Destination (Join-Path $candidate $exeName)
+          Copy-Item -LiteralPath $sourceSig -Destination (Join-Path $candidate $sigName)
+          $tag = "desktop-v$env:DESKTOP_VERSION"
+          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/$exeName"
+          $publishedAt = (git show -s --format=%cI $env:GITHUB_SHA).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'commit timestamp lookup failed' }
+          $latest = [ordered]@{
+            version = $env:DESKTOP_VERSION
+            notes = "DSH Desktop $env:DESKTOP_VERSION"
+            pub_date = $publishedAt
+            platforms = [ordered]@{
+              'windows-x86_64' = [ordered]@{
+                signature = $signature
+                url = $assetUrl
+              }
+            }
+          }
+          $json = $latest | ConvertTo-Json -Depth 6
+          [IO.File]::WriteAllText(
+            (Join-Path $candidate 'latest.json'),
+            "$json`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          "candidate=$candidate" >> $env:GITHUB_OUTPUT
+          "exe_name=$exeName" >> $env:GITHUB_OUTPUT
+          "sig_name=$sigName" >> $env:GITHUB_OUTPUT
+      - name: Publish immutable desktop release
+        id: publish
+        shell: pwsh
+        env:
+          DESKTOP_VERSION: ${{ steps.validate.outputs.version }}
+          CANDIDATE: ${{ steps.metadata.outputs.candidate }}
+          EXE_NAME: ${{ steps.metadata.outputs.exe_name }}
+          SIG_NAME: ${{ steps.metadata.outputs.sig_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = "desktop-v$env:DESKTOP_VERSION"
+          $assets = @(
+            (Join-Path $env:CANDIDATE $env:EXE_NAME),
+            (Join-Path $env:CANDIDATE $env:SIG_NAME),
+            (Join-Path $env:CANDIDATE 'latest.json')
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+              throw 'desktop release candidate is incomplete'
+            }
+          }
+          gh release create $tag @assets `
+            --verify-tag `
+            --title "DSH Desktop $env:DESKTOP_VERSION" `
+            --notes "Signed current-user Windows 10/11 x64 desktop release."
+          if ($LASTEXITCODE -ne 0) { throw 'immutable desktop release creation failed' }
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $channelTag = 'desktop-stable'
+          $channelUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$channelTag"
+          $channelExists = $true
+          try {
+            Invoke-WebRequest -Uri $channelUri -Headers $headers | Out-Null
+          }
+          catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+            if ($_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::NotFound) {
+              $channelExists = $false
+            }
+            else {
+              throw 'unable to inspect desktop stable channel'
+            }
+          }
+          $latest = Join-Path $env:CANDIDATE 'latest.json'
+          if ($channelExists) {
+            gh release upload $channelTag $latest --clobber
+          }
+          else {
+            gh release create $channelTag $latest `
+              --target $env:GITHUB_SHA `
+              --prerelease `
+              --title 'DSH Desktop stable update channel' `
+              --notes 'Mutable signed-metadata channel; versioned installer releases remain immutable.'
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'desktop stable channel update failed' }

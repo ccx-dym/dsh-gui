@@ -314,3 +314,50 @@ test("候选 issue 模板固定结构化 marker 和八项核心兼容门禁", as
     assert.equal(option.required, true);
   }
 });
+
+test("desktop release 使用独立审批环境且不写 runtime stable channel", async () => {
+  const workflow = await loadWorkflow(".github/workflows/release-desktop.yml");
+  assert.equal(workflow.permissions.contents, "read");
+  assert.equal(workflow.jobs.release.environment, "desktop-release");
+  assert.equal(workflow.jobs.release.permissions.contents, "write");
+  assert.equal(workflow.jobs.release["runs-on"], "windows-2025");
+  assert.doesNotMatch(JSON.stringify(workflow), /releases[\\/]runtime[\\/]stable/);
+});
+
+test("desktop release 固定源码、完整门禁和 Tauri 独立签名输入", async () => {
+  const workflow = await loadWorkflow(".github/workflows/release-desktop.yml");
+  const release = stepsById(workflow.jobs.release);
+  assertPinnedAction(release.checkout.uses);
+  assert.equal(release.checkout.with.ref, "${{ github.sha }}");
+  assert.match(release.validate.run, /desktop-v/);
+  assert.match(release.validate.run, /package\.json/);
+  assert.match(release.validate.run, /Cargo\.toml/);
+  assert.match(release.validate.run, /tauri\.conf\.json/);
+  assert.match(release.build.run, /pnpm check/);
+  assert.match(release.build.run, /pnpm tauri build --bundles nsis/);
+  assert.equal(
+    release.build.env.TAURI_SIGNING_PRIVATE_KEY,
+    "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
+  );
+  assert.equal(
+    release.build.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD,
+    "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}",
+  );
+  assert.equal(
+    release.build.env.TAURI_UPDATER_PUBLIC_KEY,
+    "${{ vars.TAURI_UPDATER_PUBLIC_KEY }}",
+  );
+});
+
+test("desktop release 生成 exact latest.json 并发布 EXE 与 detached signature", async () => {
+  const workflow = await loadWorkflow(".github/workflows/release-desktop.yml");
+  const release = stepsById(workflow.jobs.release);
+  assert.match(release.metadata.run, /windows-x86_64/);
+  assert.match(release.metadata.run, /\.exe\.sig/);
+  assert.match(release.metadata.run, /latest\.json/);
+  assert.match(release.metadata.run, /Get-Content.*-Raw/);
+  assert.match(release.publish.run, /gh release create/);
+  assert.match(release.publish.run, /latest\.json/);
+  assert.match(release.publish.run, /SIG_NAME/);
+  assert.doesNotMatch(release.publish.run, /--latest/);
+});
