@@ -1015,10 +1015,13 @@ fn candidate_directory_reparse_point_is_rejected_at_workspace_boundary() {
     )
     .expect_err("candidate reparse point must fail closed");
 
-    assert!(matches!(
-        error,
-        dsh_desktop_lib::update::probe::ProbeError::UnsafeBoundary
-    ));
+    assert!(
+        matches!(
+            error,
+            dsh_desktop_lib::update::probe::ProbeError::UnsafeBoundary
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]
