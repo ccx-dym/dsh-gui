@@ -335,6 +335,9 @@ test("desktop release 固定源码、完整门禁和 Tauri 独立签名输入", 
   assert.match(release.validate.run, /tauri\.conf\.json/);
   assert.match(release.build.run, /pnpm check/);
   assert.match(release.build.run, /pnpm tauri build --bundles nsis/);
+  assert.match(release.build.run, /WriteAllText/);
+  assert.match(release.build.run, /--config \$overlayPath/);
+  assert.doesNotMatch(release.build.run, /--config \$overlay(?:\s|$)/m);
   assert.equal(
     release.build.env.TAURI_SIGNING_PRIVATE_KEY,
     "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
