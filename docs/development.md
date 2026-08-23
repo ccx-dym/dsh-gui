@@ -174,7 +174,7 @@ download bootstrapper。未配置 Tauri updater 私钥的个人 RC 必须显式�
 仍会产出可安装的普通 NSIS；该 EXE 会显示未知发布者，只能用于本机/小范围测试：
 
 ```powershell
-pnpm tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+pnpm tauri build --bundles nsis --config src-tauri/tauri.local-test.conf.json
 ```
 
 ## 桌面客户端独立更新发布
