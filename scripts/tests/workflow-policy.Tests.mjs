@@ -359,6 +359,11 @@ test("desktop release 生成 exact latest.json 并发布 EXE 与 detached signat
   assert.match(release.metadata.run, /\.exe\.sig/);
   assert.match(release.metadata.run, /latest\.json/);
   assert.match(release.metadata.run, /Get-Content.*-Raw/);
+  assert.match(release.metadata.run, /verify-tauri-update\.mjs/);
+  assert.equal(
+    release.metadata.env.TAURI_UPDATER_PUBLIC_KEY,
+    "${{ vars.TAURI_UPDATER_PUBLIC_KEY }}",
+  );
   assert.match(release.publish.run, /gh release create/);
   assert.match(release.publish.run, /latest\.json/);
   assert.match(release.publish.run, /SIG_NAME/);

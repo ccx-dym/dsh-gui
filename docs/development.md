@@ -196,7 +196,8 @@ https://github.com/ccx-dym/dsh-gui/releases/download/desktop-stable/latest.json
 ```
 
 工作流先运行完整门禁，再生成 current-user NSIS、Tauri `.exe.sig` 和只含
-`windows-x86_64` 的 `latest.json`。版本化 `desktop-v<version>` Release 不覆盖；
+`windows-x86_64` 的 `latest.json`。上传前还会用客户端配置的公钥独立验证 EXE 与
+detached signature，避免私钥和 GitHub 公钥变量不匹配。版本化 `desktop-v<version>` Release 不覆盖；
 `desktop-stable` 只替换签名元数据 `latest.json`，其 URL 稳定。客户端仍会拒绝相同版本、
 降级、无效元数据和签名不匹配的安装包。桌面更新与 runtime 更新使用不同密钥、状态文件
 和命令权限，且安装前只有在下载及签名验证成功后才停止受管 DSH 进程。

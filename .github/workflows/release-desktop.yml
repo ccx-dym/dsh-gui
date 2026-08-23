@@ -119,6 +119,7 @@ jobs:
         shell: pwsh
         env:
           DESKTOP_VERSION: ${{ steps.validate.outputs.version }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
@@ -130,6 +131,8 @@ jobs:
           if (-not (Test-Path -LiteralPath $sourceSig -PathType Leaf)) {
             throw 'Tauri detached .exe.sig is missing'
           }
+          node scripts/verify-tauri-update.mjs $sourceExe.FullName $sourceSig
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri updater signature verification failed' }
           $signature = (Get-Content -LiteralPath $sourceSig -Raw).Trim()
           if ([string]::IsNullOrWhiteSpace($signature) -or $signature.Length -gt 8192) {
             throw 'Tauri detached signature is invalid'
