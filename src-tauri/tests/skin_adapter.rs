@@ -31,15 +31,14 @@ fn fixture_settings() -> SkinSettings {
 fn page_plan_requires_exact_version_and_numeric_loopback_origin() {
     let verified = Version::parse("0.1.1-rc.2").expect("version");
     let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
-    assert!(
-        page_script(
-            &verified,
-            RuntimeSkinCompatibility::Verified,
-            &official,
-            &fixture_settings()
-        )
-        .contains("dsh-skin://")
+    let supported = page_script(
+        &verified,
+        RuntimeSkinCompatibility::Verified,
+        &official,
+        &fixture_settings(),
     );
+    assert!(supported.contains("http://dsh-skin.localhost/"));
+    assert!(!supported.contains("dsh-skin://localhost/"));
     assert_eq!(
         page_script(
             &verified,
@@ -234,7 +233,7 @@ console.log(JSON.stringify(removed));"#,
 #[test]
 fn generated_values_are_closed_and_cannot_inject_script_text() {
     let script = adapter_script(&fixture_settings()).expect("script");
-    assert!(script.contains("dsh-skin://localhost/aaaaaaaa"));
+    assert!(script.contains("http://dsh-skin.localhost/aaaaaaaa"));
     assert!(!script.contains("</script>"));
 
     let mut invalid = fixture_settings();
