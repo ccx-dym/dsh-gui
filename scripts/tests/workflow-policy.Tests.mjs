@@ -335,6 +335,7 @@ test("desktop release 固定源码、完整门禁和 Tauri 独立签名输入", 
   assert.match(release.validate.run, /package\.json/);
   assert.match(release.validate.run, /Cargo\.toml/);
   assert.match(release.validate.run, /tauri\.conf\.json/);
+  assert.match(release.validate.run, /\\r\?\$/);
   assert.match(release.build.run, /pnpm check/);
   assert.match(release.build.run, /pnpm tauri build --bundles nsis/);
   assert.match(release.build.run, /WriteAllText/);

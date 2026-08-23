@@ -52,7 +52,7 @@ jobs:
           if ($package.version -cne $version -or $tauri.version -cne $version) {
             throw 'package.json and tauri.conf.json must match desktop tag'
           }
-          if ($cargo -cnotmatch "(?m)^version = `"$([regex]::Escape($version))`"$") {
+          if ($cargo -cnotmatch "(?m)^version = `"$([regex]::Escape($version))`"\r?$") {
             throw 'Cargo.toml must match desktop tag'
           }
           "version=$version" >> $env:GITHUB_OUTPUT
