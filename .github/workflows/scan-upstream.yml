@@ -1,0 +1,84 @@
+name: Scan official DSH releases
+
+on:
+  schedule:
+    - cron: '17 */12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan-official-dsh-releases
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      status: ${{ steps.detect.outputs.status }}
+      version: ${{ steps.detect.outputs.version }}
+      integrity: ${{ steps.detect.outputs.integrity }}
+      tarball: ${{ steps.detect.outputs.tarball }}
+    steps:
+      - name: Checkout scanner and reviewed locks
+        id: checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+      - name: Detect official npm candidate
+        id: detect
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(node scripts/scan-dsh-upstream.mjs \
+            scan --repository "${GITHUB_REPOSITORY}")"
+          SCAN_RESULT="${result}" node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            const result = JSON.parse(process.env.SCAN_RESULT);
+            for (const key of ["status", "version", "integrity", "tarball"]) {
+              const value = result[key] ?? "";
+              if (typeof value !== "string" || value.includes("\n")) process.exit(1);
+              appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+            }
+          '
+
+  create_candidate:
+    needs: scan
+    if: needs.scan.outputs.status == 'candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    env:
+      DSH_VERSION: ${{ needs.scan.outputs.version }}
+      DSH_INTEGRITY: ${{ needs.scan.outputs.integrity }}
+      DSH_TARBALL: ${{ needs.scan.outputs.tarball }}
+    steps:
+      - name: Checkout convergence implementation
+        id: checkout
+        # actions/checkout v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+      - name: Revalidate, create and converge candidate issue
+        id: create
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/scan-dsh-upstream.mjs create \
+            --repository "${GITHUB_REPOSITORY}" \
+            --version "${DSH_VERSION}" \
+            --integrity "${DSH_INTEGRITY}" \
+            --tarball "${DSH_TARBALL}" \
+            > "${RUNNER_TEMP}/candidate-result.json"

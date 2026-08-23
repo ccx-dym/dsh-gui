@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
+import { githubTokenFromEnvironment } from "../scan-dsh-upstream.mjs";
+
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 
 function parseScalar(source) {
@@ -234,5 +236,81 @@ test("每个调用 native git、gh 或 node 的 PowerShell 步骤都失败关闭
         );
       }
     }
+  }
+});
+
+test("scanner 每 12 小时运行且写权限隔离到候选创建 job", async () => {
+  const workflow = await loadWorkflow(".github/workflows/scan-upstream.yml");
+
+  assert.deepEqual(workflow.on.schedule, [{ cron: "17 */12 * * *" }]);
+  assert.deepEqual(workflow.on.workflow_dispatch, {});
+  assert.equal(workflow.permissions.contents, "read");
+  assert.equal(workflow.jobs.scan.permissions.contents, "read");
+  assert.equal(workflow.jobs.scan.permissions.issues, "read");
+  assert.equal(workflow.jobs.create_candidate.permissions.contents, "read");
+  assert.equal(workflow.jobs.create_candidate.permissions.issues, "write");
+  assert.equal(workflow.jobs.create_candidate.env.GH_TOKEN, undefined);
+  assert.equal(
+    stepsById(workflow.jobs.create_candidate).create.env.GITHUB_TOKEN,
+    "${{ github.token }}",
+  );
+  assert.equal(workflow.jobs.create_candidate.needs, "scan");
+  assert.equal(
+    workflow.jobs.create_candidate.if,
+    "needs.scan.outputs.status == 'candidate'",
+  );
+});
+
+test("上游扫描两个权限 job 都只运行固定 SHA 的官方 checkout action", async () => {
+  const workflow = await loadWorkflow(".github/workflows/scan-upstream.yml");
+  const actionSteps = Object.values(workflow.jobs)
+    .flatMap((job) => job.steps)
+    .filter((step) => step.uses);
+
+  assert.equal(actionSteps.length, 2);
+  for (const step of actionSteps) assertPinnedAction(step.uses);
+});
+
+test("扫描工作流查询 Releases/tags 且创建后收敛可信重复 issue", async () => {
+  const workflow = await loadWorkflow(".github/workflows/scan-upstream.yml");
+  const scan = stepsById(workflow.jobs.scan);
+  const create = stepsById(workflow.jobs.create_candidate);
+
+  assert.match(scan.detect.run, /scan --repository/);
+  assert.match(create.create.run, /scan-dsh-upstream\.mjs create/);
+  assert.match(create.create.run, /--repository/);
+  assert.equal(workflow.concurrency.group, "scan-official-dsh-releases");
+  assert.equal(workflow.concurrency["cancel-in-progress"], false);
+  assert.equal(scan.detect.env.GITHUB_TOKEN, "${{ github.token }}");
+  assert.equal(create.create.env.GITHUB_TOKEN, "${{ github.token }}");
+  assert.equal(scan.detect.env.GH_TOKEN, undefined);
+  assert.equal(create.create.env.GH_TOKEN, undefined);
+  const tokenKey = Object.keys(scan.detect.env)
+    .find((key) => scan.detect.env[key] === "${{ github.token }}");
+  assert.equal(
+    githubTokenFromEnvironment({ [tokenKey]: "workflow-token" }),
+    "workflow-token",
+  );
+  assert.throws(
+    () => githubTokenFromEnvironment({ GH_TOKEN: "legacy-token" }),
+    { message: "github_token_missing" },
+  );
+});
+
+test("候选 issue 模板固定结构化 marker 和八项核心兼容门禁", async () => {
+  const template = await loadWorkflow(
+    ".github/ISSUE_TEMPLATE/dsh-runtime-candidate.yml",
+  );
+  const marker = template.body.find(
+    (item) => item.type === "markdown" &&
+      item.attributes.value.includes("dsh-runtime-candidate:"),
+  );
+  const compatibility = template.body.find((item) => item.id === "core_compatibility");
+
+  assert.match(marker.attributes.value, /dsh-runtime-candidate:<exact-version>/);
+  assert.equal(compatibility.type, "checkboxes");
+  assert.equal(compatibility.attributes.options.length, 8);
+  for (const option of compatibility.attributes.options) {
+    assert.equal(option.required, true);
   }
 });

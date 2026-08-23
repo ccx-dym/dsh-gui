@@ -1,0 +1,55 @@
+name: DSH runtime candidate
+description: Track compatibility validation for one exact official DSH release.
+title: 'DSH runtime candidate: '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Automation inserts `<!-- dsh-runtime-candidate:<exact-version> -->` here for deduplication.
+  - type: input
+    id: version
+    attributes:
+      label: Exact DSH version
+      description: Use the exact version reported by the official npm registry.
+      placeholder: 0.1.1-rc.2
+    validations:
+      required: true
+  - type: input
+    id: integrity
+    attributes:
+      label: npm SHA-512 integrity
+      description: Copy the canonical integrity from the official exact version record.
+      placeholder: sha512-...
+    validations:
+      required: true
+  - type: input
+    id: tarball
+    attributes:
+      label: Official npm tarball
+      description: Must use HTTPS on registry.npmjs.org.
+      placeholder: https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.1.1-rc.2.tgz
+    validations:
+      required: true
+  - type: checkboxes
+    id: core_compatibility
+    attributes:
+      label: Core compatibility gates
+      options:
+        - label: Exact package/version, npm integrity and dependency closure verified
+          required: true
+        - label: Node engine and Windows x64 native dependencies verified
+          required: true
+        - label: CLI help/version smoke passed
+          required: true
+        - label: Loopback web startup with no browser opening passed
+          required: true
+        - label: stdout readiness and HTTP root readiness passed
+          required: true
+        - label: Temporary DSH_HOME config, session and workspace load passed
+          required: true
+        - label: Process-tree stop and failure cleanup passed
+          required: true
+        - label: Isolated data-copy verification without real user-data writes passed
+          required: true
+    validations:
+      required: true
