@@ -1,3 +1,4 @@
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -79,6 +80,60 @@ pub enum UpdateNotice {
         version: Option<String>,
         error_kind: String,
     },
+}
+
+/// 经过桌面更新后端验证的客户端发布记录。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopRelease {
+    pub version: Version,
+    pub notes: Option<String>,
+    pub published_at: Option<String>,
+}
+
+/// 桌面更新只向状态文件与前端暴露的固定错误类别。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopUpdateErrorKind {
+    Offline,
+    InvalidMetadata,
+    SignatureInvalid,
+    InstallFailed,
+}
+
+/// 与 DSH runtime 更新完全隔离的桌面客户端更新状态。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "phase",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DesktopUpdateState {
+    #[default]
+    Unavailable,
+    Checking,
+    UpToDate,
+    Available {
+        version: String,
+        notes: Option<String>,
+        published_at: Option<String>,
+    },
+    Downloading {
+        version: String,
+    },
+    Installing {
+        version: String,
+    },
+    Failed {
+        error_kind: DesktopUpdateErrorKind,
+    },
+}
+
+/// 桌面客户端更新状态的独立 revision 快照。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopUpdateEnvelope {
+    pub revision: u64,
+    pub state: DesktopUpdateState,
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 pub mod app_controller;
+pub mod desktop_update;
 pub mod diagnostics;
 pub mod domain;
 pub mod paths;
