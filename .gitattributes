@@ -1,0 +1,2 @@
+# 签名测试夹具必须在所有平台保持完全相同的原始字节，否则固定摘要会因 CRLF 转换失效。
+src-tauri/tests/fixtures/runtime-manifest/valid.json text eol=lf
