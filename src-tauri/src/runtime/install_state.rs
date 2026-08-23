@@ -8,7 +8,17 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 const LEGACY_DEPLOYMENT_SCHEMA: u32 = 1;
-const DEPLOYMENT_SCHEMA: u32 = 2;
+const PREVIOUS_DEPLOYMENT_SCHEMA: u32 = 2;
+const DEPLOYMENT_SCHEMA: u32 = 3;
+
+/// 与已安装 runtime descriptor 绑定的皮肤验证结论。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSkinCompatibility {
+    Verified,
+    #[default]
+    Unverified,
+}
 
 /// 已安装且可被激活的固定 DSH 运行时版本。
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,6 +26,7 @@ pub struct InstalledRuntime {
     pub version: Version,
     pub manifest_digest: String,
     pub node_version: Version,
+    pub skin_compatibility: RuntimeSkinCompatibility,
 }
 
 impl InstalledRuntime {
@@ -53,6 +64,9 @@ impl InstalledRuntime {
             version: parsed,
             manifest_digest,
             node_version,
+            // 没有显式 signed 结论的历史调用者必须失败关闭；新安装路径使用下方
+            // 显式构造器绑定 manifest 结论。
+            skin_compatibility: RuntimeSkinCompatibility::Unverified,
         })
     }
 
@@ -69,6 +83,25 @@ impl InstalledRuntime {
         node_version: &str,
     ) -> Result<Self, InstallStateError> {
         Self::new(version, manifest_digest, node_version)
+    }
+
+    /// 创建并绑定 signed 皮肤验证结论的完整 runtime descriptor。
+    ///
+    /// :param version: DSH 严格 semver。
+    /// :param manifest_digest: 已验证兼容清单摘要。
+    /// :param node_version: 签名清单固定的 Node 严格 semver。
+    /// :param skin_compatibility: 从同一已验证清单显式映射的皮肤结论。
+    /// :return: 可跨 pending、激活与冷启动保存验证结论的 descriptor。
+    /// :raises InstallStateError: 任一版本或摘要无效时返回。
+    pub fn with_skin_compatibility(
+        version: &str,
+        manifest_digest: String,
+        node_version: &str,
+        skin_compatibility: RuntimeSkinCompatibility,
+    ) -> Result<Self, InstallStateError> {
+        let mut runtime = Self::new(version, manifest_digest, node_version)?;
+        runtime.skin_compatibility = skin_compatibility;
+        Ok(runtime)
     }
 }
 
@@ -243,6 +276,8 @@ struct RuntimeDocument {
     relative_dir: String,
     manifest_digest: String,
     node_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skin_compatibility: Option<RuntimeSkinCompatibility>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -320,7 +355,7 @@ impl InstallStateStore {
                 .map_err(|source| InstallStateError::InvalidJson { source })?;
             if !matches!(
                 document.schema,
-                LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
+                LEGACY_DEPLOYMENT_SCHEMA | PREVIOUS_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
             ) {
                 return Err(InstallStateError::UnknownSchema {
                     schema: document.schema,
@@ -336,7 +371,10 @@ impl InstallStateStore {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .ok_or(InstallStateError::UnknownSchema { schema: u32::MAX })?;
-        if !matches!(schema, LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA) {
+        if !matches!(
+            schema,
+            LEGACY_DEPLOYMENT_SCHEMA | PREVIOUS_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
+        ) {
             return Err(InstallStateError::UnknownSchema { schema });
         }
         if let Ok(document) = serde_json::from_value::<DeploymentDocument>(raw.clone()) {
@@ -388,6 +426,7 @@ impl InstallStateStore {
                 relative_dir: format!("dsh/{}", deployment.runtime.version),
                 manifest_digest: deployment.runtime.manifest_digest.clone(),
                 node_version: node_version.to_string(),
+                skin_compatibility: Some(deployment.runtime.skin_compatibility),
             },
             data: DataDocument {
                 id: deployment.data.id.clone(),
@@ -512,16 +551,28 @@ fn deployment_from_document(
 ) -> Result<ActiveDeployment, InstallStateError> {
     if !matches!(
         document.schema,
-        LEGACY_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
+        LEGACY_DEPLOYMENT_SCHEMA | PREVIOUS_DEPLOYMENT_SCHEMA | DEPLOYMENT_SCHEMA
     ) {
         return Err(InstallStateError::UnknownSchema {
             schema: document.schema,
         });
     }
-    let runtime = InstalledRuntime::with_node_version(
+    let skin_compatibility = match (document.schema, document.runtime.skin_compatibility) {
+        (LEGACY_DEPLOYMENT_SCHEMA | PREVIOUS_DEPLOYMENT_SCHEMA, None) => {
+            RuntimeSkinCompatibility::Unverified
+        }
+        (DEPLOYMENT_SCHEMA, Some(status)) => status,
+        _ => {
+            return Err(InstallStateError::MissingDescriptor {
+                field: "skin_compatibility",
+            });
+        }
+    };
+    let runtime = InstalledRuntime::with_skin_compatibility(
         &document.runtime.version,
         document.runtime.manifest_digest,
         &document.runtime.node_version,
+        skin_compatibility,
     )?;
     let data = DataGeneration::new(&document.data.id)?;
     let project_workspace = validate_project_workspace(Path::new(&document.project_workspace))?;
@@ -655,6 +706,7 @@ fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Ins
 mod tests {
     use super::{
         ActiveDeployment, DataGeneration, InstallStateError, InstallStateStore, InstalledRuntime,
+        RuntimeSkinCompatibility,
     };
     use crate::paths::{AppPaths, RuntimeLayout};
     use std::fs;
@@ -709,7 +761,7 @@ mod tests {
         let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
         fs::create_dir_all(&paths.settings).expect("settings");
         for json in [
-            r#"{"schema":3,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z"}"#,
+            r#"{"schema":4,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z"}"#,
             r#"{"schema":1,"status":"uninstalled","changed_at":"2026-08-22T00:00:00Z","extra":true}"#,
         ] {
             fs::write(paths.settings.join("deployment.json"), json).expect("pointer");
@@ -777,12 +829,12 @@ mod tests {
 
         fs::write(
             paths.settings.join("deployment.json"),
-            br#"{"schema":3,"runtime":{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"data":{"id":"generation-001","relative_dir":"generations/generation-001"},"activated_at":"2026-08-21T09:30:00Z"}"#,
+            br#"{"schema":4,"runtime":{"version":"1.2.3","relative_dir":"dsh/1.2.3","manifest_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"data":{"id":"generation-001","relative_dir":"generations/generation-001"},"activated_at":"2026-08-21T09:30:00Z"}"#,
         )
         .expect("应能写入未知 schema JSON");
         assert!(matches!(
             store.load(),
-            Err(InstallStateError::UnknownSchema { schema: 3 })
+            Err(InstallStateError::UnknownSchema { schema: 4 })
         ));
     }
 
@@ -911,6 +963,105 @@ mod tests {
         assert!(layout.runtime_dir(&second.runtime).is_dir());
         assert!(layout.generation_dir(&second.data).is_dir());
         assert!(!paths.settings.join("deployment.json.tmp").exists());
+    }
+
+    #[test]
+    fn signed_skin_compatibility_survives_deployment_restart() {
+        let paths = test_paths("skin-compatibility-roundtrip");
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        let runtime = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "a".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Verified,
+        )
+        .expect("测试 descriptor 应有效");
+        let active = ActiveDeployment::with_project_workspace(
+            runtime,
+            DataGeneration::new("generation-skin").expect("generation"),
+            "2026-08-23T00:00:00Z".to_owned(),
+            std::env::current_dir()
+                .expect("测试 cwd")
+                .canonicalize()
+                .expect("测试 cwd canonical"),
+        );
+        prepare_deployment_dirs(&layout, &active);
+
+        store.save(&active).expect("应能写入 deployment");
+        let loaded = store.load().expect("重启应能读取 deployment");
+
+        assert_eq!(
+            loaded.runtime.skin_compatibility,
+            RuntimeSkinCompatibility::Verified
+        );
+    }
+
+    #[test]
+    fn previous_deployment_schema_defaults_skin_to_unverified() {
+        let paths = test_paths("skin-compatibility-legacy");
+        let layout = RuntimeLayout::from_paths(&paths);
+        let store = InstallStateStore::new(layout.clone());
+        let workspace = std::env::current_dir()
+            .expect("测试 cwd")
+            .canonicalize()
+            .expect("测试 cwd canonical");
+        fs::create_dir_all(layout.runtime_root().join("0.1.1-rc.1")).expect("runtime");
+        fs::create_dir_all(layout.generation_root().join("generation-legacy-skin"))
+            .expect("generation");
+        fs::create_dir_all(&paths.settings).expect("settings");
+        fs::write(
+            paths.settings.join("deployment.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 2,
+                "runtime": {
+                    "version": "0.1.1-rc.1",
+                    "relative_dir": "dsh/0.1.1-rc.1",
+                    "manifest_digest": "a".repeat(64),
+                    "node_version": "24.15.0"
+                },
+                "data": {
+                    "id": "generation-legacy-skin",
+                    "relative_dir": "generations/generation-legacy-skin"
+                },
+                "activated_at": "2026-08-23T00:00:00Z",
+                "project_workspace": workspace
+            }))
+            .expect("fixture json"),
+        )
+        .expect("pointer");
+
+        assert_eq!(
+            store
+                .load()
+                .expect("旧 schema 应离线迁移")
+                .runtime
+                .skin_compatibility,
+            RuntimeSkinCompatibility::Unverified
+        );
+    }
+
+    #[test]
+    fn deployment_schema_rejects_cross_version_skin_fields() {
+        let paths = test_paths("skin-compatibility-schema-boundary");
+        let store = InstallStateStore::new(RuntimeLayout::from_paths(&paths));
+        fs::create_dir_all(&paths.settings).expect("settings");
+        let workspace = serde_json::to_string(
+            &std::env::current_dir()
+                .expect("测试 cwd")
+                .canonicalize()
+                .expect("测试 cwd canonical")
+                .to_string_lossy(),
+        )
+        .expect("workspace json");
+        for (schema, skin_field) in [(2, r#", "skin_compatibility":"verified""#), (3, "")] {
+            let json = format!(
+                r#"{{"schema":{schema},"runtime":{{"version":"0.1.1-rc.1","relative_dir":"dsh/0.1.1-rc.1","manifest_digest":"{}","node_version":"24.15.0"{skin_field}}},"data":{{"id":"generation-schema","relative_dir":"generations/generation-schema"}},"activated_at":"2026-08-23T00:00:00Z","project_workspace":{workspace}}}"#,
+                "a".repeat(64)
+            );
+            fs::write(paths.settings.join("deployment.json"), json).expect("pointer");
+            assert!(store.load().is_err());
+        }
     }
 
     #[test]

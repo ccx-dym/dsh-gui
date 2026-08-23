@@ -119,6 +119,14 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
         busy: true,
       };
     case "up_to_date":
+      if (state.skinCompatible === false) {
+        return {
+          eyebrow: "皮肤兼容性",
+          heading: "已恢复官方界面",
+          body: "当前版本皮肤未验证，已恢复官方界面。",
+          busy: false,
+        };
+      }
       return {
         eyebrow: "版本通道",
         heading: "当前已是兼容版本",

@@ -7,9 +7,9 @@ use crate::paths::AppPaths;
 #[cfg(any(not(debug_assertions), test))]
 use crate::paths::RuntimeLayout;
 use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
-use crate::runtime::install_state::ActiveDeployment;
 #[cfg(not(debug_assertions))]
 use crate::runtime::install_state::InstallStateStore;
+use crate::runtime::install_state::{ActiveDeployment, RuntimeSkinCompatibility};
 use crate::runtime::{RuntimeError, RuntimeEventSink, RuntimeSupervisor};
 use crate::update::activation::{
     RuntimeBusyProvider, RuntimeBusyState, UnknownRuntimeBusyProvider,
@@ -53,6 +53,7 @@ struct TauriRuntimeUi {
     app: AppHandle,
     trace: OperationTrace,
     dsh_version: Option<semver::Version>,
+    skin_compatibility: RuntimeSkinCompatibility,
 }
 
 #[cfg(debug_assertions)]
@@ -83,6 +84,7 @@ impl RuntimeLifecycle for MockRuntimeLifecycle {
             app: self.app.clone(),
             trace: OperationTrace::begin(TraceKind::Runtime),
             dsh_version: None,
+            skin_compatibility: RuntimeSkinCompatibility::Unverified,
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -124,6 +126,7 @@ impl OfficialRuntimeLifecycle {
             app: self.app.clone(),
             trace: OperationTrace::begin(TraceKind::Runtime),
             dsh_version: Some(deployment.runtime.version.clone()),
+            skin_compatibility: deployment.runtime.skin_compatibility,
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),
@@ -245,7 +248,7 @@ impl RuntimeUi for TauriRuntimeUi {
     fn navigate_main(&self, url: &tauri::Url) -> Result<(), RuntimeError> {
         if let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>() {
             if let Some(version) = self.dsh_version.as_ref() {
-                adapter.bind_navigation(version, url);
+                adapter.bind_navigation(version, self.skin_compatibility, url);
             } else {
                 adapter.clear();
             }

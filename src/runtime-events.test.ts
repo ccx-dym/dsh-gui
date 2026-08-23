@@ -91,6 +91,18 @@ describe("updatePresentation", () => {
     expect(presentation.primaryAction).toBeUndefined();
   });
 
+  it("活动版本皮肤未验证时明确提示已恢复官方界面", () => {
+    const presentation = updatePresentation({
+      ...createInitialUpdateState(),
+      phase: "up_to_date",
+      currentVersion: "0.1.1-rc.2",
+      skinCompatible: false,
+    });
+    expect(presentation.heading).toBe("已恢复官方界面");
+    expect(presentation.body).toBe("当前版本皮肤未验证，已恢复官方界面。");
+    expect(presentation.primaryAction).toBeUndefined();
+  });
+
   it.each([
     ["uninstalled", "尚未安装", "检查兼容版本"],
     ["checking", "正在检查", undefined],

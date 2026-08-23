@@ -8,8 +8,9 @@ pub(crate) mod protocol;
 mod store;
 
 pub use adapter::{
-    DSH_ADAPTER_V1, DshAdapter, SkinAdapterController, SkinAdapterReport, adapter_for,
-    adapter_script, cleanup_script, page_script, report_skin_adapter,
+    DSH_ADAPTER_V1, DshAdapter, SkinAdapterController, SkinAdapterReport, SkinDisableReason,
+    SkinRuntimePolicy, adapter_for, adapter_script, cleanup_script, page_script,
+    report_skin_adapter, skin_runtime_policy,
 };
 pub use controller::{
     SkinCommandError, SkinController, SkinImageView, choose_skin_image, get_skin_state,

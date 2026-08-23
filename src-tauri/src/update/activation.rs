@@ -34,7 +34,7 @@ use crate::runtime::RuntimeError;
 use crate::runtime::atomic_file::replace_file;
 use crate::runtime::install_state::{
     ActiveDeployment, DataGeneration, InstallStateError, InstallStateStore, InstalledRuntime,
-    validate_project_workspace,
+    RuntimeSkinCompatibility, validate_project_workspace,
 };
 use crate::update::probe::{
     ProbeCancellation, ProbeError, ProbePhase, ProbeWorkspace, RuntimeProbe,
@@ -51,7 +51,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 const LEGACY_ACTIVATION_SCHEMA: u32 = 1;
-const ACTIVATION_SCHEMA: u32 = 2;
+const PREVIOUS_ACTIVATION_SCHEMA: u32 = 2;
+const ACTIVATION_SCHEMA: u32 = 3;
 const SETTINGS_SCHEMA: u32 = 1;
 const REPARSE_POINT_ATTRIBUTE: u32 = 0x400;
 
@@ -297,6 +298,8 @@ struct JournalDeployment {
     data_id: String,
     activated_at: String,
     project_workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skin_compatibility: Option<RuntimeSkinCompatibility>,
 }
 
 impl JournalDeployment {
@@ -316,14 +319,16 @@ impl JournalDeployment {
             data_id: value.data.id.clone(),
             activated_at: value.activated_at.clone(),
             project_workspace: workspace.to_string_lossy().into_owned(),
+            skin_compatibility: Some(value.runtime.skin_compatibility),
         })
     }
 
     fn into_active(self) -> Result<ActiveDeployment, ActivationError> {
-        let runtime = InstalledRuntime::with_node_version(
+        let runtime = InstalledRuntime::with_skin_compatibility(
             &self.runtime_version,
             self.manifest_digest,
             &self.node_version,
+            self.skin_compatibility.unwrap_or_default(),
         )?;
         let data = DataGeneration::new(&self.data_id)?;
         let workspace = validate_project_workspace(Path::new(&self.project_workspace))?;
@@ -1013,7 +1018,26 @@ impl RuntimeActivator {
             let bytes = fs::read(entry.path()).map_err(ActivationError::io)?;
             let journal: ActivationJournal =
                 serde_json::from_slice(&bytes).map_err(|_| ActivationError::InvalidJournal)?;
-            if !matches!(journal.schema, LEGACY_ACTIVATION_SCHEMA | ACTIVATION_SCHEMA) {
+            if !matches!(
+                journal.schema,
+                LEGACY_ACTIVATION_SCHEMA | PREVIOUS_ACTIVATION_SCHEMA | ACTIVATION_SCHEMA
+            ) {
+                return Err(ActivationError::InvalidJournal);
+            }
+            let statuses_match_schema = if journal.schema == ACTIVATION_SCHEMA {
+                journal.target.skin_compatibility.is_some()
+                    && journal
+                        .prior
+                        .as_ref()
+                        .is_none_or(|prior| prior.skin_compatibility.is_some())
+            } else {
+                journal.target.skin_compatibility.is_none()
+                    && journal
+                        .prior
+                        .as_ref()
+                        .is_none_or(|prior| prior.skin_compatibility.is_none())
+            };
+            if !statuses_match_schema {
                 return Err(ActivationError::InvalidJournal);
             }
             journals.push(journal);
@@ -1300,7 +1324,8 @@ fn available_bytes(_path: &Path) -> Result<u64, ActivationError> {
 mod tests {
     use super::{
         ActivationCheckpoint, ActivationCheckpointSink, ActivationOutcome, ActivationProbe,
-        ActivationRequest, RuntimeActivator, SnapshotPathRegistry, SnapshotPolicy,
+        ActivationRequest, JournalDeployment, RuntimeActivator, SnapshotPathRegistry,
+        SnapshotPolicy,
     };
     use crate::app_controller::{AppController, ProbeLease, RuntimeLifecycle};
     use crate::diagnostics::DiagnosticContext;
@@ -1308,6 +1333,7 @@ mod tests {
     use crate::runtime::RuntimeError;
     use crate::runtime::install_state::{
         ActiveDeployment, DataGeneration, InstallStateError, InstallStateStore, InstalledRuntime,
+        RuntimeSkinCompatibility,
     };
     use futures_util::FutureExt;
     use futures_util::future::BoxFuture;
@@ -1324,6 +1350,53 @@ mod tests {
         candidate: DataGeneration,
     }
 
+    #[test]
+    fn journal_roundtrip_preserves_verified_skin_and_legacy_defaults_unverified() {
+        let runtime = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "a".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Verified,
+        )
+        .expect("runtime");
+        let workspace = std::env::current_dir()
+            .expect("cwd")
+            .canonicalize()
+            .expect("canonical cwd");
+        let active = ActiveDeployment::with_project_workspace(
+            runtime,
+            DataGeneration::new("generation-journal-skin").expect("generation"),
+            "2026-08-23T00:00:00Z".to_owned(),
+            workspace.clone(),
+        );
+        let restarted = JournalDeployment::from_active(&active)
+            .expect("journal")
+            .into_active()
+            .expect("active");
+        assert_eq!(
+            restarted.runtime.skin_compatibility,
+            RuntimeSkinCompatibility::Verified
+        );
+
+        let legacy: JournalDeployment = serde_json::from_value(serde_json::json!({
+            "runtime_version": "0.1.1-rc.1",
+            "manifest_digest": "b".repeat(64),
+            "node_version": "24.15.0",
+            "data_id": "generation-legacy-journal",
+            "activated_at": "2026-08-22T00:00:00Z",
+            "project_workspace": workspace,
+        }))
+        .expect("旧 journal descriptor");
+        assert_eq!(
+            legacy
+                .into_active()
+                .expect("legacy active")
+                .runtime
+                .skin_compatibility,
+            RuntimeSkinCompatibility::Unverified
+        );
+    }
+
     impl Fixture {
         fn new(label: &str, with_prior: bool) -> Self {
             let nonce = SystemTime::now()
@@ -1336,9 +1409,13 @@ mod tests {
             let workspace_input = root.join("workspace");
             fs::create_dir_all(&workspace_input).expect("workspace");
             let workspace = workspace_input.canonicalize().expect("canonical workspace");
-            let old_runtime =
-                InstalledRuntime::with_node_version("0.1.1-rc.1", "a".repeat(64), "24.15.0")
-                    .expect("old runtime");
+            let old_runtime = InstalledRuntime::with_skin_compatibility(
+                "0.1.1-rc.1",
+                "a".repeat(64),
+                "24.15.0",
+                RuntimeSkinCompatibility::Verified,
+            )
+            .expect("old runtime");
             let old_data = DataGeneration::new("generation-old").expect("old generation");
             let old = ActiveDeployment::with_project_workspace(
                 old_runtime,
@@ -1346,9 +1423,13 @@ mod tests {
                 "2026-08-22T00:00:00Z".to_owned(),
                 workspace.clone(),
             );
-            let new_runtime =
-                InstalledRuntime::with_node_version("0.1.2", "b".repeat(64), "24.15.0")
-                    .expect("new runtime");
+            let new_runtime = InstalledRuntime::with_skin_compatibility(
+                "0.1.2",
+                "b".repeat(64),
+                "24.15.0",
+                RuntimeSkinCompatibility::Unverified,
+            )
+            .expect("new runtime");
             fs::create_dir_all(layout.runtime_dir(&new_runtime)).expect("new runtime dir");
             if with_prior {
                 fs::create_dir_all(layout.runtime_dir(&old.runtime)).expect("old runtime dir");
@@ -1648,6 +1729,14 @@ mod tests {
     #[tokio::test]
     async fn failed_first_start_restores_old_pair_and_starts_old_runtime_once() {
         let fixture = Fixture::new("rollback", true);
+        assert_eq!(
+            fixture.old.runtime.skin_compatibility,
+            RuntimeSkinCompatibility::Verified
+        );
+        assert_eq!(
+            fixture.new_runtime.skin_compatibility,
+            RuntimeSkinCompatibility::Unverified
+        );
         let runtime = Arc::new(RecordingRuntime::default());
         *runtime.fail_version.lock().expect("fail version") =
             Some(fixture.new_runtime.version.to_string());
@@ -1684,6 +1773,10 @@ mod tests {
     #[tokio::test]
     async fn crash_after_rolling_back_journal_never_restarts_failed_candidate() {
         let fixture = Fixture::new("rolling-back-recover", true);
+        assert_eq!(
+            fixture.old.runtime.skin_compatibility,
+            RuntimeSkinCompatibility::Verified
+        );
         let runtime = Arc::new(RecordingRuntime::default());
         *runtime.fail_version.lock().expect("fail version") =
             Some(fixture.new_runtime.version.to_string());
@@ -1710,6 +1803,14 @@ mod tests {
                 .expect("rollback recovery"),
             ActivationOutcome::RolledBack { .. }
         ));
+        assert_eq!(
+            InstallStateStore::new(fixture.layout.clone())
+                .load()
+                .expect("recovered prior")
+                .runtime
+                .skin_compatibility,
+            RuntimeSkinCompatibility::Verified
+        );
         assert_eq!(
             runtime.calls.lock().expect("calls").as_slice(),
             [

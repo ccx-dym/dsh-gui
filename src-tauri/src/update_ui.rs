@@ -21,7 +21,10 @@ use crate::update::activation::{ActivationCheckpoint, PrecommitStage};
 use crate::{
     diagnostics::{DiagnosticContext, FileDiagnosticSink, TraceKind},
     paths::{AppPaths, RuntimeLayout},
-    runtime::install_state::{InstallStateError, InstallStateStore, InstalledRuntime},
+    runtime::install_state::{
+        InstallStateError, InstallStateStore, InstalledRuntime, RuntimeSkinCompatibility,
+    },
+    skin::skin_runtime_policy,
     update::{
         archive::{
             ArchiveInstallPolicy, ArchiveInstallRequest, RuntimeArchiveInstaller,
@@ -35,7 +38,7 @@ use crate::{
             ArtifactDownloader, DownloadCancellation, DownloadPolicy, DownloadProgress,
             DownloadProgressSink, DownloadRequest, HttpsDownloader,
         },
-        manifest::{ManifestVerifier, VerifiedManifest},
+        manifest::{ManifestVerifier, SkinCompatibility, VerifiedManifest},
         version_source::{
             NpmOfficialVersionSource, ReqwestSourceTransport, SignedCompatibilitySource,
             SourcePolicy,
@@ -222,6 +225,8 @@ struct PendingActivation {
     node_version: String,
     manifest_digest: String,
     generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skin_compatibility: Option<RuntimeSkinCompatibility>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -233,6 +238,8 @@ struct ActivationConfirmation {
     manifest_digest: String,
     generation: String,
     prior_pointer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skin_compatibility: Option<RuntimeSkinCompatibility>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -266,6 +273,7 @@ impl UpdateUiController {
             Ok(active) => {
                 state.phase = UpdateUiPhase::UpToDate;
                 state.current_version = Some(active.runtime.version.to_string());
+                state.skin_compatible = Some(active_skin_compatible(&active.runtime));
             }
             Err(InstallStateError::NotInstalled) => {
                 state.phase = if release_config().is_some() {
@@ -355,6 +363,10 @@ impl UpdateUiController {
         next.phase = phase;
         next.error_code = error_code.map(str::to_owned);
         next.should_notify = false;
+        let active = InstallStateStore::new(RuntimeLayout::from_paths(&self.paths))
+            .load()
+            .ok();
+        refresh_active_runtime_state(&mut next, active.as_ref().map(|value| &value.runtime));
         self.publish(app, next).await;
     }
 }
@@ -441,11 +453,15 @@ fn apply_notice(
 ) {
     use crate::domain::UpdateNotice;
 
+    let active_skin_compatible = state.skin_compatible;
     clear_notice_fields(state);
     match notice {
-        UpdateNotice::UpToDate { official, .. } => {
+        UpdateNotice::UpToDate {
+            current, official, ..
+        } => {
             state.phase = UpdateUiPhase::UpToDate;
             state.official_version = Some(official.clone());
+            state.skin_compatible = current.as_ref().and(active_skin_compatible);
         }
         UpdateNotice::OfficialAvailable { official, .. } => {
             state.phase = UpdateUiPhase::OfficialAvailable;
@@ -459,7 +475,6 @@ fn apply_notice(
             state.phase = UpdateUiPhase::RuntimeAvailable;
             state.official_version = Some(official.clone());
             state.compatible_version = Some(compatible.clone());
-            state.skin_compatible = Some(true);
         }
         UpdateNotice::DesktopRequired {
             official,
@@ -480,7 +495,6 @@ fn apply_notice(
             state.phase = UpdateUiPhase::SkinUnverified;
             state.official_version = Some(official.clone());
             state.compatible_version = Some(compatible.clone());
-            state.skin_compatible = Some(false);
         }
         UpdateNotice::Offline { error_kind, .. } => {
             state.phase = UpdateUiPhase::Offline;
@@ -499,6 +513,17 @@ fn apply_notice(
         state.artifact_size = Some(manifest.manifest.artifact.size);
         state.compatibility_summary = Some(manifest.manifest.compatibility_summary.clone());
     }
+}
+
+fn active_skin_compatible(runtime: &InstalledRuntime) -> bool {
+    // 活动部署没有精确适配器时即使核心可用也必须恢复官方界面；显式
+    // `Unverified` 候选在安装前已经由同一策略关闭。
+    skin_runtime_policy(&runtime.version, runtime.skin_compatibility).enabled
+}
+
+fn refresh_active_runtime_state(state: &mut UpdateUiState, runtime: Option<&InstalledRuntime>) {
+    state.current_version = runtime.map(|value| value.version.to_string());
+    state.skin_compatible = runtime.map(active_skin_compatible);
 }
 
 #[tauri::command]
@@ -616,33 +641,34 @@ async fn run_update_check(
             config.channel.to_owned(),
         )
         .map_err(|_| "update_unavailable")?;
-        let current = InstallStateStore::new(RuntimeLayout::from_paths(&controller.paths))
+        let active_runtime = InstallStateStore::new(RuntimeLayout::from_paths(&controller.paths))
             .load()
             .ok()
-            .map(|active| active.runtime.version);
+            .map(|active| active.runtime);
+        let current = active_runtime.as_ref().map(|runtime| &runtime.version);
         let result = if scheduled {
             match coordinator
-                .check_if_due(current.as_ref(), &diagnostics)
+                .check_if_due(current, &diagnostics)
                 .await
                 .map_err(|_| "update_unavailable")?
             {
                 ScheduledCheckResult::Skipped { .. } => {
-                    return Ok((None, current, coordinator));
+                    return Ok((None, active_runtime, coordinator));
                 }
                 ScheduledCheckResult::Checked(result) => Some(*result),
             }
         } else {
             Some(
                 coordinator
-                    .check_with_context(current.as_ref(), &diagnostics)
+                    .check_with_context(current, &diagnostics)
                     .await
                     .map_err(|_| "update_unavailable")?,
             )
         };
-        Ok::<_, &'static str>((result, current, coordinator))
+        Ok::<_, &'static str>((result, active_runtime, coordinator))
     }
     .await;
-    let (result, current, coordinator) = match attempt {
+    let (result, active_runtime, coordinator) = match attempt {
         Ok(value) => value,
         Err(code) => {
             *controller.manifest.lock().await = None;
@@ -658,7 +684,9 @@ async fn run_update_check(
         return Ok(controller.envelope().await);
     };
     let mut checked = controller.state.lock().await.clone();
-    checked.current_version = current.map(|value| value.to_string());
+    checked.current_version = active_runtime
+        .as_ref()
+        .map(|runtime| runtime.version.to_string());
     checked.should_notify = result.should_notify;
     let notification_notice = result.notice.clone();
     apply_notice(
@@ -666,6 +694,9 @@ async fn run_update_check(
         &result.notice,
         result.compatible_manifest.as_ref(),
     );
+    if matches!(checked.phase, UpdateUiPhase::UpToDate) {
+        refresh_active_runtime_state(&mut checked, active_runtime.as_ref());
+    }
     *controller.manifest.lock().await = result.compatible_manifest;
     controller.publish(app, checked).await;
     let state = controller.envelope().await;
@@ -838,10 +869,11 @@ async fn download_and_stage(
     manifest: &VerifiedManifest,
     diagnostics: &DiagnosticContext,
 ) -> Result<PendingActivation, &'static str> {
-    let runtime = InstalledRuntime::with_node_version(
+    let runtime = InstalledRuntime::with_skin_compatibility(
         &manifest.manifest.dsh_version.to_string(),
         manifest.manifest_digest.clone(),
         &manifest.manifest.node_version.to_string(),
+        runtime_skin_compatibility(manifest.manifest.skin_compatibility),
     )
     .map_err(|_| "update_failed")?;
     let layout = RuntimeLayout::from_paths(&controller.paths);
@@ -974,7 +1006,7 @@ fn persist_pending(
 
 fn pending_document(manifest: &VerifiedManifest, attempt: u128) -> PendingActivation {
     PendingActivation {
-        schema: 1,
+        schema: 2,
         status: "downloaded".to_owned(),
         version: manifest.manifest.dsh_version.to_string(),
         node_version: manifest.manifest.node_version.to_string(),
@@ -982,7 +1014,56 @@ fn pending_document(manifest: &VerifiedManifest, attempt: u128) -> PendingActiva
         // generation 只使用签名 manifest digest，避免 semver build metadata 中的 `+`
         // 落入 Windows 目录标识并保持同一发布记录的幂等身份。
         generation: format!("generation-{}-{attempt}", &manifest.manifest_digest[..24]),
+        skin_compatibility: Some(runtime_skin_compatibility(
+            manifest.manifest.skin_compatibility,
+        )),
     }
+}
+
+fn runtime_skin_compatibility(status: SkinCompatibility) -> RuntimeSkinCompatibility {
+    match status {
+        SkinCompatibility::Verified => RuntimeSkinCompatibility::Verified,
+        SkinCompatibility::Unverified => RuntimeSkinCompatibility::Unverified,
+    }
+}
+
+fn pending_skin_compatibility(
+    pending: &PendingActivation,
+) -> Result<RuntimeSkinCompatibility, &'static str> {
+    match (pending.schema, pending.skin_compatibility) {
+        (1, None) => Ok(RuntimeSkinCompatibility::Unverified),
+        (2, Some(status)) => Ok(status),
+        _ => Err("activation_recovery_required"),
+    }
+}
+
+fn confirmation_skin_compatibility(
+    confirmation: &ActivationConfirmation,
+) -> Result<RuntimeSkinCompatibility, &'static str> {
+    match (confirmation.schema, confirmation.skin_compatibility) {
+        (2, None) => Ok(RuntimeSkinCompatibility::Unverified),
+        (3, Some(status)) => Ok(status),
+        _ => Err("activation_recovery_required"),
+    }
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn pending_runtime(pending: &PendingActivation) -> Result<InstalledRuntime, &'static str> {
+    InstalledRuntime::with_skin_compatibility(
+        &pending.version,
+        pending.manifest_digest.clone(),
+        &pending.node_version,
+        pending_skin_compatibility(pending)?,
+    )
+    .map_err(|_| "activation_recovery_required")
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn pending_matches_active(
+    pending: &PendingActivation,
+    active: &ActiveDeployment,
+) -> Result<bool, &'static str> {
+    Ok(active.runtime == pending_runtime(pending)? && active.data.id == pending.generation)
 }
 
 fn pending_path(paths: &AppPaths, pending: &PendingActivation) -> std::path::PathBuf {
@@ -1035,7 +1116,9 @@ fn inspect_orphan_candidate_with(
             .map_err(|_| "activation_recovery_required")?,
     )
     .map_err(|_| "activation_recovery_required")?;
-    if confirmation.schema != 2
+    let pending_skin = pending_skin_compatibility(pending)?;
+    let confirmation_skin = confirmation_skin_compatibility(&confirmation)?;
+    if confirmation_skin != pending_skin
         || confirmation.status != "confirmed"
         || confirmation.version != pending.version
         || confirmation.manifest_digest != pending.manifest_digest
@@ -1051,12 +1134,7 @@ fn inspect_orphan_candidate_with(
         .ensure_terminal_journal_history()
         .map_err(|_| "activation_recovery_required")?;
 
-    let runtime = InstalledRuntime::with_node_version(
-        &pending.version,
-        pending.manifest_digest.clone(),
-        &pending.node_version,
-    )
-    .map_err(|_| "activation_recovery_required")?;
+    let runtime = pending_runtime(pending)?;
     let candidate =
         DataGeneration::new(&pending.generation).map_err(|_| "activation_recovery_required")?;
     validate_inventory(&runtime, &candidate).map_err(|_| "activation_recovery_required")?;
@@ -1213,21 +1291,23 @@ async fn cold_bootstrap_inner(
             }
         };
     };
-    if let Ok(active) = InstallStateStore::new(layout.clone()).load()
-        && active.runtime.version.to_string() == pending.version
-        && active.runtime.manifest_digest == pending.manifest_digest
-        && active.data.id == pending.generation
-    {
-        // pointer 已提交但进程可能在 receipt 前崩溃；承认权威精确配对，禁止重复建 candidate。
-        write_activation_receipt(&update_controller.paths, &pending, &UpdateUiPhase::UpToDate)
-            .map_err(|_| "activation_recovery_required")?;
-        app_controller
-            .start_active_runtime()
-            .map_err(|_| "runtime_start_failed")?;
-        update_controller
-            .publish_cold_phase(app, UpdateUiPhase::UpToDate, None)
-            .await;
-        return Ok(());
+    if let Ok(active) = InstallStateStore::new(layout.clone()).load() {
+        if pending_matches_active(&pending, &active)? {
+            // pointer 已提交但进程可能在 receipt 前崩溃；只有完整 runtime descriptor
+            // 与 generation 都一致才承认成功，避免把错误皮肤结论提升为活动授权。
+            write_activation_receipt(&update_controller.paths, &pending, &UpdateUiPhase::UpToDate)
+                .map_err(|_| "activation_recovery_required")?;
+            app_controller
+                .start_active_runtime()
+                .map_err(|_| "runtime_start_failed")?;
+            update_controller
+                .publish_cold_phase(app, UpdateUiPhase::UpToDate, None)
+                .await;
+            return Ok(());
+        }
+        if active.data.id == pending.generation {
+            return Err("activation_recovery_required");
+        }
     }
     if activation_receipt(&update_controller.paths, &pending).is_file() {
         return match InstallStateStore::new(layout).load() {
@@ -1292,10 +1372,11 @@ async fn cold_bootstrap_inner(
     activator
         .save_trusted_workspace(&workspace)
         .map_err(|_| "activation_recovery_required")?;
-    let runtime = InstalledRuntime::with_node_version(
+    let runtime = InstalledRuntime::with_skin_compatibility(
         &pending.version,
         pending.manifest_digest.clone(),
         &pending.node_version,
+        pending_skin_compatibility(&pending)?,
     )
     .map_err(|_| "activation_recovery_required")?;
     let probe = RuntimeProbeAdapter::new(
@@ -1420,13 +1501,14 @@ fn load_single_confirmed_pending(
         let bytes = std::fs::read(entry.path()).map_err(|_| "activation_recovery_required")?;
         let pending: PendingActivation =
             serde_json::from_slice(&bytes).map_err(|_| "activation_recovery_required")?;
-        if pending.schema != 1 || pending.status != "downloaded" {
+        if pending.status != "downloaded" || pending_skin_compatibility(&pending).is_err() {
             return Err("activation_recovery_required");
         }
-        InstalledRuntime::with_node_version(
+        InstalledRuntime::with_skin_compatibility(
             &pending.version,
             pending.manifest_digest.clone(),
             &pending.node_version,
+            pending_skin_compatibility(&pending)?,
         )
         .map_err(|_| "activation_recovery_required")?;
         crate::runtime::install_state::DataGeneration::new(&pending.generation)
@@ -1437,7 +1519,8 @@ fn load_single_confirmed_pending(
                 &std::fs::read(&confirmation).map_err(|_| "activation_recovery_required")?,
             )
             .map_err(|_| "activation_recovery_required")?;
-            if document.schema != 2
+            let confirmation_skin = confirmation_skin_compatibility(&document)?;
+            if confirmation_skin != pending_skin_compatibility(&pending)?
                 || document.status != "confirmed"
                 || document.version != pending.version
                 || document.manifest_digest != pending.manifest_digest
@@ -1543,16 +1626,19 @@ fn persist_confirmation(
         || pending.version != manifest.manifest.dsh_version.to_string()
         || pending.node_version != manifest.manifest.node_version.to_string()
         || pending.manifest_digest != manifest.manifest_digest
+        || pending_skin_compatibility(pending).map_err(std::io::Error::other)?
+            != runtime_skin_compatibility(manifest.manifest.skin_compatibility)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "pending activation does not match verified manifest",
         ));
     }
-    let runtime = InstalledRuntime::with_node_version(
+    let runtime = InstalledRuntime::with_skin_compatibility(
         &manifest.manifest.dsh_version.to_string(),
         manifest.manifest_digest.clone(),
         &manifest.manifest.node_version.to_string(),
+        runtime_skin_compatibility(manifest.manifest.skin_compatibility),
     )
     .map_err(std::io::Error::other)?;
     if !RuntimeLayout::from_paths(paths)
@@ -1572,12 +1658,15 @@ fn persist_confirmation_record(
     pending: &PendingActivation,
 ) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(&ActivationConfirmation {
-        schema: 2,
+        schema: 3,
         status: "confirmed".to_owned(),
         version: pending.version.clone(),
         manifest_digest: pending.manifest_digest.clone(),
         generation: pending.generation.clone(),
         prior_pointer: current_pointer_identity(paths).map_err(std::io::Error::other)?,
+        skin_compatibility: Some(
+            pending_skin_compatibility(pending).map_err(std::io::Error::other)?,
+        ),
     })
     .map_err(std::io::Error::other)?;
     write_new_or_matching(&confirmation_path(paths, pending), &bytes)
@@ -1618,13 +1707,14 @@ fn create_explicit_retry_attempt(paths: &AppPaths) -> Result<PendingActivation, 
             &std::fs::read(entry.path()).map_err(|_| "activation_recovery_required")?,
         )
         .map_err(|_| "activation_recovery_required")?;
-        if pending.schema != 1 || pending.status != "downloaded" {
+        if pending.status != "downloaded" || pending_skin_compatibility(&pending).is_err() {
             return Err("activation_recovery_required");
         }
-        InstalledRuntime::with_node_version(
+        InstalledRuntime::with_skin_compatibility(
             &pending.version,
             pending.manifest_digest.clone(),
             &pending.node_version,
+            pending_skin_compatibility(&pending)?,
         )
         .map_err(|_| "activation_recovery_required")?;
         crate::runtime::install_state::DataGeneration::new(&pending.generation)
@@ -1638,7 +1728,8 @@ fn create_explicit_retry_attempt(paths: &AppPaths) -> Result<PendingActivation, 
             &std::fs::read(confirmation_path).map_err(|_| "activation_recovery_required")?,
         )
         .map_err(|_| "activation_recovery_required")?;
-        if confirmation.schema != 2
+        let confirmation_skin = confirmation_skin_compatibility(&confirmation)?;
+        if confirmation_skin != pending_skin_compatibility(&pending)?
             || confirmation.status != "confirmed"
             || confirmation.version != pending.version
             || confirmation.manifest_digest != pending.manifest_digest
@@ -1672,10 +1763,11 @@ fn create_explicit_retry_attempt(paths: &AppPaths) -> Result<PendingActivation, 
         .into_iter()
         .max_by_key(|(attempt, _)| *attempt)
         .ok_or("activation_recovery_required")?;
-    let runtime = InstalledRuntime::with_node_version(
+    let runtime = InstalledRuntime::with_skin_compatibility(
         &pending.version,
         pending.manifest_digest.clone(),
         &pending.node_version,
+        pending_skin_compatibility(&pending)?,
     )
     .map_err(|_| "activation_recovery_required")?;
     verify_installed_runtime_inventory(
@@ -1732,10 +1824,11 @@ mod tests {
     use super::{
         ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
         ProgressPublishThrottle, UpdateUiController, UpdateUiPhase, UpdateUiState,
-        activation_receipt, apply_notice, bounded_download_percent, confirmation_path,
-        finish_cold_recovery, inspect_orphan_candidate_with, load_single_confirmed_pending,
+        activation_receipt, active_skin_compatible, apply_notice, bounded_download_percent,
+        confirmation_path, confirmation_skin_compatibility, finish_cold_recovery,
+        inspect_orphan_candidate_with, load_single_confirmed_pending, pending_matches_active,
         pending_path, persist_pending, plan_cold_recovery, recover_orphan_candidate_with,
-        write_activation_receipt,
+        refresh_active_runtime_state, write_activation_receipt,
     };
 
     #[test]
@@ -1763,6 +1856,98 @@ mod tests {
     }
 
     #[test]
+    fn active_runtime_without_an_exact_adapter_restores_official_ui() {
+        let verified = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "a".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Verified,
+        )
+        .unwrap();
+        let signed_unverified = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "b".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Unverified,
+        )
+        .unwrap();
+
+        assert!(active_skin_compatible(&verified));
+        assert!(!active_skin_compatible(&signed_unverified));
+    }
+
+    #[test]
+    fn up_to_date_notice_preserves_official_ui_fallback_status() {
+        let mut state = UpdateUiState {
+            skin_compatible: Some(false),
+            ..UpdateUiState::default()
+        };
+        apply_notice(
+            &mut state,
+            &UpdateNotice::UpToDate {
+                current: Some("0.1.1-rc.2".to_owned()),
+                official: "0.1.1-rc.2".to_owned(),
+            },
+            None,
+        );
+        assert_eq!(state.skin_compatible, Some(false));
+    }
+
+    #[test]
+    fn authoritative_active_runtime_restores_skin_after_notice_fields_are_cleared() {
+        let runtime = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "a".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Verified,
+        )
+        .unwrap();
+        let mut state = UpdateUiState {
+            phase: UpdateUiPhase::OfficialAvailable,
+            skin_compatible: None,
+            ..UpdateUiState::default()
+        };
+
+        apply_notice(
+            &mut state,
+            &UpdateNotice::SkinUnverified {
+                current: Some("0.1.1-rc.1".to_owned()),
+                official: "0.1.1-rc.2".to_owned(),
+                compatible: "0.1.1-rc.2".to_owned(),
+            },
+            None,
+        );
+        assert_eq!(state.skin_compatible, None);
+        apply_notice(
+            &mut state,
+            &UpdateNotice::UpToDate {
+                current: Some("0.1.1-rc.1".to_owned()),
+                official: "0.1.1-rc.1".to_owned(),
+            },
+            None,
+        );
+
+        refresh_active_runtime_state(&mut state, Some(&runtime));
+
+        assert_eq!(state.current_version.as_deref(), Some("0.1.1-rc.1"));
+        assert_eq!(state.skin_compatible, Some(true));
+
+        let unverified = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "b".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Unverified,
+        )
+        .unwrap();
+        refresh_active_runtime_state(&mut state, Some(&unverified));
+        assert_eq!(state.skin_compatible, Some(false));
+
+        refresh_active_runtime_state(&mut state, None);
+        assert_eq!(state.current_version, None);
+        assert_eq!(state.skin_compatible, None);
+    }
+
+    #[test]
     fn download_progress_publication_is_limited_to_ten_events_per_second() {
         let started = std::time::Instant::now();
         let mut throttle = ProgressPublishThrottle::default();
@@ -1782,6 +1967,7 @@ mod tests {
     use crate::paths::{AppPaths, RuntimeLayout};
     use crate::runtime::install_state::{
         ActiveDeployment, DataGeneration, InstallStateStore, InstalledRuntime,
+        RuntimeSkinCompatibility,
     };
     use crate::update::activation::{
         ActivationCheckpoint, ActivationError, ActivationFailure, ActivationFailureStage,
@@ -1819,7 +2005,7 @@ mod tests {
                     compatible: "0.1.1-rc.2".to_owned(),
                 },
                 UpdateUiPhase::RuntimeAvailable,
-                Some(true),
+                None,
             ),
             (
                 UpdateNotice::DesktopRequired {
@@ -1838,7 +2024,7 @@ mod tests {
                     compatible: "0.1.1-rc.2".to_owned(),
                 },
                 UpdateUiPhase::SkinUnverified,
-                Some(false),
+                None,
             ),
             (
                 UpdateNotice::Offline {
@@ -1900,6 +2086,145 @@ mod tests {
             },
             manifest_digest: "a".repeat(64),
             desktop_version_supported: true,
+        }
+    }
+
+    #[test]
+    fn pending_document_preserves_signed_unverified_status_across_restart() {
+        let mut manifest = test_verified_manifest();
+        manifest.manifest.skin_compatibility = SkinCompatibility::Unverified;
+        let pending = super::pending_document(&manifest, 7);
+
+        let restarted: PendingActivation =
+            serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+
+        assert_eq!(restarted.schema, 2);
+        assert_eq!(
+            super::pending_skin_compatibility(&restarted).unwrap(),
+            RuntimeSkinCompatibility::Unverified
+        );
+    }
+
+    #[test]
+    fn pending_and_confirmation_schema_matrix_is_fail_closed() {
+        let legacy_pending = PendingActivation {
+            schema: 1,
+            status: "downloaded".to_owned(),
+            version: "0.1.1-rc.1".to_owned(),
+            node_version: "24.15.0".to_owned(),
+            manifest_digest: "a".repeat(64),
+            generation: "generation-schema-matrix".to_owned(),
+            skin_compatibility: None,
+        };
+        assert_eq!(
+            super::pending_skin_compatibility(&legacy_pending).unwrap(),
+            RuntimeSkinCompatibility::Unverified
+        );
+        let mut invalid_pending = legacy_pending.clone();
+        invalid_pending.skin_compatibility = Some(RuntimeSkinCompatibility::Verified);
+        assert!(super::pending_skin_compatibility(&invalid_pending).is_err());
+        invalid_pending.schema = 2;
+        invalid_pending.skin_compatibility = None;
+        assert!(super::pending_skin_compatibility(&invalid_pending).is_err());
+        invalid_pending.skin_compatibility = Some(RuntimeSkinCompatibility::Verified);
+        assert_eq!(
+            super::pending_skin_compatibility(&invalid_pending).unwrap(),
+            RuntimeSkinCompatibility::Verified
+        );
+
+        let legacy_confirmation = super::ActivationConfirmation {
+            schema: 2,
+            status: "confirmed".to_owned(),
+            version: legacy_pending.version.clone(),
+            manifest_digest: legacy_pending.manifest_digest.clone(),
+            generation: legacy_pending.generation.clone(),
+            prior_pointer: "uninstalled".to_owned(),
+            skin_compatibility: None,
+        };
+        assert_eq!(
+            confirmation_skin_compatibility(&legacy_confirmation).unwrap(),
+            RuntimeSkinCompatibility::Unverified
+        );
+        let mut invalid_confirmation = legacy_confirmation;
+        invalid_confirmation.skin_compatibility = Some(RuntimeSkinCompatibility::Verified);
+        assert!(confirmation_skin_compatibility(&invalid_confirmation).is_err());
+        invalid_confirmation.schema = 3;
+        invalid_confirmation.skin_compatibility = None;
+        assert!(confirmation_skin_compatibility(&invalid_confirmation).is_err());
+        invalid_confirmation.skin_compatibility = Some(RuntimeSkinCompatibility::Verified);
+        assert_eq!(
+            confirmation_skin_compatibility(&invalid_confirmation).unwrap(),
+            RuntimeSkinCompatibility::Verified
+        );
+
+        let pending_with_extra = serde_json::json!({
+            "schema": 1,
+            "status": "downloaded",
+            "version": "0.1.1-rc.1",
+            "node_version": "24.15.0",
+            "manifest_digest": "a".repeat(64),
+            "generation": "generation-extra",
+            "extra": true
+        });
+        assert!(serde_json::from_value::<PendingActivation>(pending_with_extra).is_err());
+        let confirmation_with_extra = serde_json::json!({
+            "schema": 2,
+            "status": "confirmed",
+            "version": "0.1.1-rc.1",
+            "manifest_digest": "a".repeat(64),
+            "generation": "generation-extra",
+            "prior_pointer": "uninstalled",
+            "extra": true
+        });
+        assert!(
+            serde_json::from_value::<super::ActivationConfirmation>(confirmation_with_extra)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pointer_fast_path_compares_the_complete_runtime_descriptor() {
+        let pending = PendingActivation {
+            schema: 2,
+            status: "downloaded".to_owned(),
+            version: "0.1.1-rc.1".to_owned(),
+            node_version: "24.15.0".to_owned(),
+            manifest_digest: "a".repeat(64),
+            generation: "generation-fast-path".to_owned(),
+            skin_compatibility: Some(RuntimeSkinCompatibility::Unverified),
+        };
+        let expected_runtime = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.1",
+            "a".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Unverified,
+        )
+        .unwrap();
+        let matching = ActiveDeployment::new(
+            expected_runtime.clone(),
+            DataGeneration::new("generation-fast-path").unwrap(),
+            "epoch".to_owned(),
+        );
+        assert!(pending_matches_active(&pending, &matching).unwrap());
+
+        let mut wrong_skin = matching.clone();
+        wrong_skin.runtime.skin_compatibility = RuntimeSkinCompatibility::Verified;
+        let mut wrong_node = matching.clone();
+        wrong_node.runtime.node_version = Version::parse("24.16.0").unwrap();
+        let mut wrong_digest = matching.clone();
+        wrong_digest.runtime.manifest_digest = "b".repeat(64);
+        let mut wrong_version = matching.clone();
+        wrong_version.runtime.version = Version::parse("0.1.1-rc.2").unwrap();
+        let mut wrong_generation = matching;
+        wrong_generation.data = DataGeneration::new("generation-other").unwrap();
+        for active in [
+            wrong_skin,
+            wrong_node,
+            wrong_digest,
+            wrong_version,
+            wrong_generation,
+        ] {
+            assert!(!pending_matches_active(&pending, &active).unwrap());
         }
     }
 
@@ -1987,6 +2312,7 @@ mod tests {
             node_version: "24.15.0".to_owned(),
             manifest_digest: "a".repeat(64),
             generation: "generation-0.1.2-aaaaaaaaaaaa".to_owned(),
+            skin_compatibility: None,
         };
         std::fs::write(
             pending_path(&paths, &pending),
@@ -2032,6 +2358,7 @@ mod tests {
             node_version: "24.15.0".to_owned(),
             manifest_digest: "b".repeat(64),
             generation: "generation-bbbbbbbbbbbbbbbbbbbbbbbb-1".to_owned(),
+            skin_compatibility: None,
         };
 
         write_activation_receipt(&paths, &pending, &UpdateUiPhase::UpToDate).unwrap();
@@ -2060,6 +2387,7 @@ mod tests {
             node_version: "24.15.0".to_owned(),
             manifest_digest: "c".repeat(64),
             generation: "generation-cccccccccccccccccccccccc-1".to_owned(),
+            skin_compatibility: None,
         };
         write_pending_and_confirmation(&paths, &first);
         write_activation_receipt(&paths, &first, &UpdateUiPhase::Failed).unwrap();
@@ -2117,6 +2445,7 @@ mod tests {
             node_version: "24.15.0".to_owned(),
             manifest_digest: "d".repeat(64),
             generation: format!("generation-dddddddddddddddddddddddd-{nonce}"),
+            skin_compatibility: None,
         };
         std::fs::write(
             pending_path(&paths, &pending),
@@ -2156,6 +2485,7 @@ mod tests {
                 manifest_digest: pending.manifest_digest.clone(),
                 generation: pending.generation.clone(),
                 prior_pointer: super::current_pointer_identity(&paths).unwrap(),
+                skin_compatibility: None,
             })
             .unwrap(),
         )

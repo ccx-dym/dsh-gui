@@ -1,4 +1,5 @@
 use super::{MaskTone, SkinController, SkinFit, SkinPosition, SkinSettings};
+use crate::runtime::install_state::RuntimeSkinCompatibility;
 use semver::Version;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,19 @@ const BACKGROUND_ID: &str = "dsh-desktop-skin-background";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DshAdapter {
     version: &'static str,
+}
+
+/// 皮肤因当前 runtime 不满足验证边界而被关闭的稳定原因。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SkinDisableReason {
+    VersionUnverified,
+}
+
+/// 活动 runtime 是否允许注入皮肤的失败关闭策略。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SkinRuntimePolicy {
+    pub enabled: bool,
+    pub reason: Option<SkinDisableReason>,
 }
 
 impl DshAdapter {
@@ -34,6 +48,23 @@ pub fn adapter_for(version: &Version) -> Option<DshAdapter> {
     (version.to_string() == VERIFIED_DSH_VERSION).then_some(DshAdapter {
         version: DSH_ADAPTER_V1,
     })
+}
+
+/// 组合签名清单结论与精确 DOM 适配器，决定是否允许皮肤注入。
+///
+/// :param version: 权威活动部署中的严格 DSH 版本。
+/// :param status: 已签名兼容清单给出的皮肤验证结论。
+/// :return: 仅两道门禁都通过时启用；否则返回稳定关闭原因。
+/// :raises: 只比较类型化值和封闭 allowlist，不产生错误。
+pub fn skin_runtime_policy(
+    version: &Version,
+    status: RuntimeSkinCompatibility,
+) -> SkinRuntimePolicy {
+    let enabled = status == RuntimeSkinCompatibility::Verified && adapter_for(version).is_some();
+    SkinRuntimePolicy {
+        enabled,
+        reason: (!enabled).then_some(SkinDisableReason::VersionUnverified),
+    }
 }
 
 /// 构造不读取网络、存储或业务 DOM 的 v1 注入脚本。
@@ -110,17 +141,23 @@ pub fn cleanup_script() -> &'static str {
 /// 根据可信部署版本和已完成导航 URL 生成应用或清理脚本。
 ///
 /// :param version: 权威激活部署中读取的严格 DSH 版本。
+/// :param skin_compatibility: 与该部署持久绑定的 signed 皮肤验证结论。
 /// :param url: WebView2 已完成加载的页面 URL。
 /// :param settings: 当前已提交皮肤设置。
 /// :return: 只有精确版本、数字回环来源和有效设置同时满足时返回注入脚本。
 /// :raises: URL 或设置不满足合约时返回固定清理脚本，不传播动态正文。
-pub fn page_script(version: &Version, url: &tauri::Url, settings: &SkinSettings) -> String {
+pub fn page_script(
+    version: &Version,
+    skin_compatibility: RuntimeSkinCompatibility,
+    url: &tauri::Url,
+    settings: &SkinSettings,
+) -> String {
     let trusted_origin = url.scheme() == "http"
         && url.host_str() == Some("127.0.0.1")
         && url.port().is_some_and(|port| port != 1420)
         && url.username().is_empty()
         && url.password().is_none();
-    if !trusted_origin || adapter_for(version).is_none() {
+    if !trusted_origin || !skin_runtime_policy(version, skin_compatibility).enabled {
         return cleanup_script().to_owned();
     }
     adapter_script(settings).unwrap_or_else(|| cleanup_script().to_owned())
@@ -187,13 +224,23 @@ impl SkinAdapterController {
     /// 将门禁绑定到权威激活部署的精确 DSH 版本。
     ///
     /// :param version: 已验证激活部署的 DSH 版本。
+    /// :param skin_compatibility: 与该部署共同加载的 signed 皮肤验证结论。
     /// :param url: Ready 事件经过严格解析的数字回环 URL。
     /// :return: 是否存在精确适配器。
     /// :raises: 锁中毒时失败关闭并返回 `false`。
-    pub(crate) fn bind_navigation(&self, version: &Version, url: &tauri::Url) -> bool {
+    pub(crate) fn bind_navigation(
+        &self,
+        version: &Version,
+        skin_compatibility: RuntimeSkinCompatibility,
+        url: &tauri::Url,
+    ) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
+        if !skin_runtime_policy(version, skin_compatibility).enabled {
+            invalidate_state(&mut state);
+            return false;
+        }
         let Some(adapter) = adapter_for(version) else {
             invalidate_state(&mut state);
             return false;
@@ -413,13 +460,18 @@ pub(crate) fn refresh_main_skin(app: &AppHandle, settings: &SkinSettings) -> Res
 #[cfg(test)]
 mod tests {
     use super::{DSH_ADAPTER_V1, SkinAdapterController};
+    use crate::runtime::install_state::RuntimeSkinCompatibility;
     use semver::Version;
 
     #[test]
     fn remote_report_cannot_grant_an_unknown_native_version() {
         let controller = SkinAdapterController::default();
         let url = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
-        assert!(!controller.bind_navigation(&Version::parse("0.1.2").expect("version"), &url));
+        assert!(!controller.bind_navigation(
+            &Version::parse("0.1.2").expect("version"),
+            RuntimeSkinCompatibility::Verified,
+            &url
+        ));
 
         let report = controller.report(DSH_ADAPTER_V1, 1, true);
 
@@ -431,7 +483,11 @@ mod tests {
     fn matching_false_report_disables_the_current_page_without_granting_capabilities() {
         let controller = SkinAdapterController::default();
         let url = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
-        assert!(controller.bind_navigation(&Version::parse("0.1.1-rc.1").expect("version"), &url));
+        assert!(controller.bind_navigation(
+            &Version::parse("0.1.1-rc.1").expect("version"),
+            RuntimeSkinCompatibility::Verified,
+            &url
+        ));
         let page = controller.begin_page(&url).expect("page binding");
         assert!(
             !controller
@@ -450,10 +506,18 @@ mod tests {
         let version = Version::parse("0.1.1-rc.1").expect("version");
         let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
         let other_port = tauri::Url::parse("http://127.0.0.1:43128/chat").expect("url");
-        assert!(controller.bind_navigation(&version, &official));
+        assert!(controller.bind_navigation(
+            &version,
+            RuntimeSkinCompatibility::Verified,
+            &official
+        ));
         assert!(controller.begin_page(&other_port).is_none());
 
-        assert!(controller.bind_navigation(&version, &official));
+        assert!(controller.bind_navigation(
+            &version,
+            RuntimeSkinCompatibility::Verified,
+            &official
+        ));
         let first = controller.begin_page(&official).expect("first page");
         controller.navigation_started(&official);
         let second = controller.begin_page(&official).expect("second page");
@@ -483,7 +547,11 @@ mod tests {
         let controller = SkinAdapterController::default();
         let version = Version::parse("0.1.1-rc.1").expect("version");
         let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
-        assert!(controller.bind_navigation(&version, &official));
+        assert!(controller.bind_navigation(
+            &version,
+            RuntimeSkinCompatibility::Verified,
+            &official
+        ));
         let page = controller.begin_page(&official).expect("page");
 
         assert!(
