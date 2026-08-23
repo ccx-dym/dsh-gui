@@ -2,6 +2,7 @@ pub mod app_controller;
 pub mod desktop_update;
 pub mod diagnostics;
 pub mod domain;
+pub mod network_proxy;
 pub mod paths;
 pub mod runtime;
 pub mod skin;
