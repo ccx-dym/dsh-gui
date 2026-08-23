@@ -9,6 +9,7 @@ function fail(message) {
 
 const [manifestPath, signaturePath] = process.argv.slice(2);
 const keyPath = process.env.DSH_RUNTIME_SIGNING_KEY_FILE;
+const keyPassword = process.env.DSH_RUNTIME_SIGNING_KEY_PASSWORD;
 
 if (!manifestPath || !signaturePath) {
   fail("用法: node scripts/sign-runtime.mjs <manifest.json> <manifest.sig>");
@@ -21,7 +22,9 @@ if (!manifestPath || !signaturePath) {
       readFile(manifestPath),
       readFile(keyPath),
     ]);
-    const privateKey = createPrivateKey(privatePem);
+    const privateKey = createPrivateKey(keyPassword
+      ? { key: privatePem, passphrase: keyPassword }
+      : privatePem);
     if (privateKey.asymmetricKeyType !== "ed25519") {
       throw new Error("签名密钥必须是 Ed25519 私钥");
     }

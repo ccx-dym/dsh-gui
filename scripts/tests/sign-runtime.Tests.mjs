@@ -40,4 +40,30 @@ assert.equal(signed.status, 0, `${signed.stdout}${signed.stderr}`);
 assert.doesNotMatch(`${signed.stdout}${signed.stderr}`, /do-not-print-test-private|BEGIN PRIVATE KEY/);
 assert.match(await readFile(signaturePath, "utf8"), /^[0-9a-f]{128}$/);
 
+const encryptedSignaturePath = path.join(temporaryRoot, "encrypted-manifest.sig");
+const encryptedPath = path.join(temporaryRoot, "do-not-print-encrypted-private.pem");
+const passphrase = "test-only-encrypted-key-password";
+await writeFile(
+  encryptedPath,
+  ed25519.privateKey.export({
+    type: "pkcs8",
+    format: "pem",
+    cipher: "aes-256-cbc",
+    passphrase,
+  }),
+);
+const encrypted = runSigner(
+  {
+    DSH_RUNTIME_SIGNING_KEY_FILE: encryptedPath,
+    DSH_RUNTIME_SIGNING_KEY_PASSWORD: passphrase,
+  },
+  [manifestPath, encryptedSignaturePath],
+);
+assert.equal(encrypted.status, 0, `${encrypted.stdout}${encrypted.stderr}`);
+assert.match(await readFile(encryptedSignaturePath, "utf8"), /^[0-9a-f]{128}$/);
+assert.doesNotMatch(
+  `${encrypted.stdout}${encrypted.stderr}`,
+  /test-only-encrypted-key-password|do-not-print-encrypted-private/,
+);
+
 console.log("sign-runtime contract tests passed");
