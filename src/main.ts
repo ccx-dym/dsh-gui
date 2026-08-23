@@ -14,6 +14,12 @@ import {
   type UpdateState,
   type UpdateStateEnvelope,
 } from "./runtime-events";
+import {
+  createInitialDesktopUpdateState,
+  reduceDesktopUpdateEvent,
+  renderDesktopUpdateState,
+  type DesktopUpdateEnvelope,
+} from "./desktop-update";
 
 export function renderRuntimeStatus(
   root: HTMLElement,
@@ -108,11 +114,20 @@ const runtimeRoot = document.createElement("div");
 runtimeRoot.className = "desktop__runtime";
 const updateRoot = document.createElement("aside");
 updateRoot.className = "update-console";
-updateRoot.setAttribute("aria-label", "DSH 更新");
+updateRoot.setAttribute("aria-label", "更新中心");
+const desktopUpdateRoot = document.createElement("section");
+desktopUpdateRoot.className = "update-console__section update-console__section--desktop";
+desktopUpdateRoot.setAttribute("aria-label", "桌面客户端更新");
+const runtimeUpdateRoot = document.createElement("section");
+runtimeUpdateRoot.className = "update-console__section update-console__section--runtime";
+runtimeUpdateRoot.setAttribute("aria-label", "DSH 运行时更新");
+updateRoot.append(desktopUpdateRoot, runtimeUpdateRoot);
 root.replaceChildren(runtimeRoot, updateRoot);
 
 let updateState = createInitialUpdateState();
 let updateBusy = false;
+let desktopUpdateState = createInitialDesktopUpdateState();
+let desktopUpdateBusy = false;
 
 async function resyncUpdateFailure(): Promise<void> {
   try {
@@ -189,9 +204,60 @@ function renderUpdateState(target: HTMLElement, state: UpdateState): void {
   target.append(rail);
 }
 
+async function resyncDesktopUpdateFailure(): Promise<void> {
+  try {
+    const snapshot = await invoke<DesktopUpdateEnvelope>(
+      "get_desktop_update_state",
+    );
+    desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, snapshot);
+  } catch {
+    // 动态 bridge 错误不得进入 DOM；保留 revision，仅显示固定失败类别。
+    desktopUpdateState = {
+      revision: desktopUpdateState.revision,
+      phase: "failed",
+      errorKind: "install_failed",
+    };
+  }
+}
+
 // 事件只绑定在稳定的根节点上；状态重绘会替换按钮，但不会累积监听器。
 root.addEventListener("click", (event: MouseEvent) => {
   if (!(event.target instanceof Element)) {
+    return;
+  }
+  const desktopAction = event.target.closest<HTMLButtonElement>(
+    "button[data-desktop-update-action]",
+  );
+  if (desktopAction !== null && root.contains(desktopAction)) {
+    if (desktopUpdateBusy) return;
+    const confirmation = desktopAction.dataset.confirmation;
+    if (confirmation && !window.confirm(confirmation)) return;
+    desktopUpdateBusy = true;
+    renderDesktopUpdateState(
+      desktopUpdateRoot,
+      desktopUpdateState,
+      desktopUpdateBusy,
+    );
+    const command = desktopAction.dataset.desktopUpdateAction!;
+    const args = command === "install_desktop_update"
+      ? { expectedRevision: desktopUpdateState.revision }
+      : undefined;
+    void invoke<DesktopUpdateEnvelope>(command, args)
+      .then((envelope) => {
+        desktopUpdateState = reduceDesktopUpdateEvent(
+          desktopUpdateState,
+          envelope,
+        );
+      })
+      .catch(resyncDesktopUpdateFailure)
+      .finally(() => {
+        desktopUpdateBusy = false;
+        renderDesktopUpdateState(
+          desktopUpdateRoot,
+          desktopUpdateState,
+          desktopUpdateBusy,
+        );
+      });
     return;
   }
   const updateAction = event.target.closest<HTMLButtonElement>(
@@ -204,7 +270,7 @@ root.addEventListener("click", (event: MouseEvent) => {
     updateBusy = true;
     updateAction.disabled = true;
     updateAction.setAttribute("aria-busy", "true");
-    renderUpdateState(updateRoot, updateState);
+    renderUpdateState(runtimeUpdateRoot, updateState);
     const command = updateAction.dataset.updateAction!;
     void invoke<UpdateStateEnvelope>(command, {
       expectedRevision: updateState.revision,
@@ -215,7 +281,7 @@ root.addEventListener("click", (event: MouseEvent) => {
       .catch(resyncUpdateFailure)
       .finally(() => {
         updateBusy = false;
-        renderUpdateState(updateRoot, updateState);
+        renderUpdateState(runtimeUpdateRoot, updateState);
       });
     return;
   }
@@ -238,7 +304,8 @@ root.addEventListener("click", (event: MouseEvent) => {
 });
 
 renderRuntimeStatus(runtimeRoot, { phase: "starting", message: "正在启动 DSH…" });
-renderUpdateState(updateRoot, updateState);
+renderDesktopUpdateState(desktopUpdateRoot, desktopUpdateState, false);
+renderUpdateState(runtimeUpdateRoot, updateState);
 
 async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
   let status = initialRuntimeStatus;
@@ -271,23 +338,48 @@ async function initializeUpdateState(): Promise<void> {
     // 与运行时状态一致：先订阅，再取 revision 快照；两者统一择新而非依赖布尔标记。
     await listen<UpdateStateEnvelope>("update-state", ({ payload }) => {
       updateState = reduceUpdateEvent(updateState, payload);
-      renderUpdateState(updateRoot, updateState);
+      renderUpdateState(runtimeUpdateRoot, updateState);
     });
     const snapshot = await invoke<UpdateStateEnvelope>("get_update_state");
     updateState = reduceUpdateEvent(updateState, snapshot);
-    renderUpdateState(updateRoot, updateState);
+    renderUpdateState(runtimeUpdateRoot, updateState);
   } catch {
     updateState = {
       ...createInitialUpdateState(),
       phase: "unavailable",
       errorCode: "update_unavailable",
     };
-    renderUpdateState(updateRoot, updateState);
+    renderUpdateState(runtimeUpdateRoot, updateState);
   }
+}
+
+async function initializeDesktopUpdateState(): Promise<void> {
+  try {
+    await listen<DesktopUpdateEnvelope>("desktop-update-state", ({ payload }) => {
+      desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, payload);
+      renderDesktopUpdateState(
+        desktopUpdateRoot,
+        desktopUpdateState,
+        desktopUpdateBusy,
+      );
+    });
+    const snapshot = await invoke<DesktopUpdateEnvelope>(
+      "get_desktop_update_state",
+    );
+    desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, snapshot);
+  } catch {
+    desktopUpdateState = createInitialDesktopUpdateState();
+  }
+  renderDesktopUpdateState(
+    desktopUpdateRoot,
+    desktopUpdateState,
+    desktopUpdateBusy,
+  );
 }
 
 void initializeRuntimeStatus(runtimeRoot);
 void initializeUpdateState();
+void initializeDesktopUpdateState();
 }
 
 // appearance 是预定义的本地窗口入口；分派发生在任何运行时命令之前，避免设置 UI 混入主启动页。

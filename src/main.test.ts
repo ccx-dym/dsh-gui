@@ -16,7 +16,12 @@ beforeEach(() => {
   tauriMocks.invoke.mockReset();
   tauriMocks.listen.mockReset();
   tauriMocks.invoke.mockImplementation(async (command: string) =>
-    command === "get_update_state"
+    command === "get_desktop_update_state"
+      ? {
+          revision: 0,
+          state: { phase: "unavailable" },
+        }
+      : command === "get_update_state"
       ? {
           revision: 0,
           state: {
@@ -32,6 +37,85 @@ beforeEach(() => {
 });
 
 describe("更新控制台", () => {
+  it("分别显示桌面客户端和 DSH runtime 更新", async () => {
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_update_state") {
+        return {
+          revision: 2,
+          state: {
+            phase: "available",
+            version: "0.1.1",
+            notes: "客户端兼容更新",
+          },
+        };
+      }
+      if (command === "get_update_state") {
+        return {
+          revision: 3,
+          state: {
+            revision: 3,
+            phase: "runtime_available",
+            compatibleVersion: "0.1.1-rc.2",
+            artifactSize: 1024,
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        };
+      }
+      return { phase: "idle", message: "等待" };
+    });
+
+    await import("./main");
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("DSH Desktop 0.1.1 可用");
+      expect(document.body.textContent).toContain("0.1.1-rc.2");
+    });
+    expect(document.querySelectorAll(".update-console__section")).toHaveLength(2);
+  });
+
+  it("桌面安装确认后独立防止重复提交", async () => {
+    const pending = new Promise(() => undefined);
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    tauriMocks.invoke.mockImplementation((command: string) => {
+      if (command === "get_desktop_update_state") {
+        return Promise.resolve({
+          revision: 7,
+          state: { phase: "available", version: "0.1.1" },
+        });
+      }
+      if (command === "install_desktop_update") return pending;
+      if (command === "get_update_state") {
+        return Promise.resolve({
+          revision: 0,
+          state: {
+            revision: 0,
+            phase: "unavailable",
+            notificationsEnabled: true,
+            shouldNotify: false,
+          },
+        });
+      }
+      return Promise.resolve({ phase: "idle", message: "等待" });
+    });
+
+    await import("./main");
+    const button = await vi.waitFor(() =>
+      document.querySelector<HTMLButtonElement>("[data-desktop-update-action]"),
+    );
+    button?.click();
+    button?.click();
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining("不会删除 DSH runtime 和数据"),
+    );
+    expect(
+      tauriMocks.invoke.mock.calls.filter(
+        ([name]) => name === "install_desktop_update",
+      ),
+    ).toEqual([
+      ["install_desktop_update", { expectedRevision: 7 }],
+    ]);
+  });
+
   it("下载状态呈现真实进度并限制可访问百分比", async () => {
     tauriMocks.invoke.mockImplementation(async (command: string) =>
       command === "get_update_state"

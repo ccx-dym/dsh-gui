@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::domain::{
@@ -232,6 +232,7 @@ fn desktop_update_error_code(error: DesktopUpdateError) -> &'static str {
 /// 获取桌面客户端更新状态。
 ///
 /// :param window: 发起调用的本地 WebView。
+/// :param app: 桌面更新状态事件出口。
 /// :param service: 桌面更新服务。
 /// :return: 当前独立 revision 快照。
 /// :raises: 非本地来源返回固定拒绝码。
@@ -247,20 +248,28 @@ pub async fn get_desktop_update_state(
 /// 检查签名桌面发布通道。
 ///
 /// :param window: 发起调用的本地 WebView。
+/// :param app: 桌面更新状态事件出口。
 /// :param service: 桌面更新服务。
 /// :return: 检查后的独立 revision 快照。
 /// :raises: 来源、网络、元数据或状态持久化失败时返回固定错误码。
 #[tauri::command]
 pub async fn check_desktop_update(
     window: WebviewWindow,
+    app: AppHandle,
     service: tauri::State<'_, DesktopUpdateService>,
 ) -> Result<DesktopUpdateEnvelope, &'static str> {
     require_local_desktop_update(&window)?;
-    service
-        .controller
-        .check(&service.backend)
-        .await
-        .map_err(desktop_update_error_code)
+    let result = service.controller.check(&service.backend).await;
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let snapshot = service.controller.snapshot().await;
+            let _ = app.emit("desktop-update-state", &snapshot);
+            return Err(desktop_update_error_code(error));
+        }
+    };
+    let _ = app.emit("desktop-update-state", &snapshot);
+    Ok(snapshot)
 }
 
 /// 安装最后一次检查选定的签名客户端版本。
@@ -273,15 +282,25 @@ pub async fn check_desktop_update(
 #[tauri::command]
 pub async fn install_desktop_update(
     window: WebviewWindow,
+    app: AppHandle,
     service: tauri::State<'_, DesktopUpdateService>,
     expected_revision: u64,
 ) -> Result<DesktopUpdateEnvelope, &'static str> {
     require_local_desktop_update(&window)?;
-    service
+    let result = service
         .controller
         .install(expected_revision, &service.backend)
-        .await
-        .map_err(desktop_update_error_code)
+        .await;
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let snapshot = service.controller.snapshot().await;
+            let _ = app.emit("desktop-update-state", &snapshot);
+            return Err(desktop_update_error_code(error));
+        }
+    };
+    let _ = app.emit("desktop-update-state", &snapshot);
+    Ok(snapshot)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
