@@ -196,17 +196,12 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:DSH_RUNTIME_SIGNING_KEY)) {
             throw 'runtime signing key is not configured'
           }
-          $encryptedKeyPath = Join-Path $env:RUNNER_TEMP 'runtime-signing-source.pem'
-          $signingKeyPath = Join-Path $env:RUNNER_TEMP 'runtime-signing-plain.pem'
+          $signingKeyPath = Join-Path $env:RUNNER_TEMP 'runtime-signing-source.pem'
           [System.IO.File]::WriteAllText(
-            $encryptedKeyPath,
+            $signingKeyPath,
             $env:DSH_RUNTIME_SIGNING_KEY,
             [System.Text.UTF8Encoding]::new($false)
           )
-          $env:DSH_RUNTIME_ENCRYPTED_KEY_FILE = $encryptedKeyPath
-          $env:DSH_RUNTIME_PLAIN_KEY_FILE = $signingKeyPath
-          node -e "const {readFileSync,writeFileSync}=require('node:fs');const {createPrivateKey}=require('node:crypto');const key=createPrivateKey({key:readFileSync(process.env.DSH_RUNTIME_ENCRYPTED_KEY_FILE),passphrase:process.env.DSH_RUNTIME_SIGNING_KEY_PASSWORD||undefined});writeFileSync(process.env.DSH_RUNTIME_PLAIN_KEY_FILE,key.export({type:'pkcs8',format:'pem'}),{mode:0o600});"
-          if ($LASTEXITCODE -ne 0) { throw 'runtime signing key preparation failed' }
           $env:DSH_RUNTIME_SIGNING_KEY_FILE = $signingKeyPath
           node scripts/sign-runtime.mjs `
             runtime-release-candidate/manifest.json `

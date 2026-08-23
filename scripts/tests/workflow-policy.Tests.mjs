@@ -203,6 +203,8 @@ test("publish 不回显私钥、拒绝已有 tag 并用分支 PR 更新稳定通
     "${{ secrets.DSH_RUNTIME_SIGNING_KEY_PASSWORD }}",
   );
   assert.match(publish.sign.run, /scripts\/sign-runtime\.mjs/);
+  assert.match(publish.sign.run, /DSH_RUNTIME_SIGNING_KEY_FILE/);
+  assert.doesNotMatch(publish.sign.run, /runtime-signing-plain\.pem|key\.export/);
   assert.doesNotMatch(allRuns, /Write-(?:Host|Output).*DSH_RUNTIME_SIGNING_KEY/i);
   const stepIds = workflow.jobs.publish.steps.map((step) => step.id);
   assert.ok(stepIds.indexOf("channel") < stepIds.indexOf("release"));
