@@ -186,7 +186,8 @@ impl HttpsDownloader {
     /// :raises DownloadError: 策略越界或 TLS 客户端无法构建时返回。
     pub fn new(policy: DownloadPolicy) -> Result<Self, DownloadError> {
         validate_download_policy(&policy)?;
-        let client = reqwest::Client::builder()
+        let client = crate::network_proxy::reqwest_client_builder()
+            .map_err(|_| DownloadError::ClientConfiguration)?
             .https_only(true)
             .connect_timeout(policy.connect_timeout)
             .build()

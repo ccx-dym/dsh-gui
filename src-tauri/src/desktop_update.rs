@@ -4,6 +4,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
+    time::Duration,
 };
 
 use semver::Version;
@@ -94,7 +95,15 @@ impl DesktopUpdateBackend for TauriDesktopUpdateBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Option<DesktopRelease>, DesktopUpdateError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let updater = self.app.updater().map_err(classify_updater_check_error)?;
+            let mut updater = self.app.updater_builder();
+            if let Some(proxy) = crate::network_proxy::current_user_proxy() {
+                updater = updater.proxy(proxy);
+            }
+            // 插件默认没有总超时；固定上限避免代理或网络异常让 UI 永久停在 checking。
+            let updater = updater
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(classify_updater_check_error)?;
             let candidate = updater
                 .check()
                 .await

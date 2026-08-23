@@ -65,7 +65,8 @@ impl ReqwestSourceTransport {
         if connect_timeout.is_zero() {
             return Err(SourceError::InvalidConfiguration);
         }
-        let client = reqwest::Client::builder()
+        let client = crate::network_proxy::reqwest_client_builder()
+            .map_err(|_| SourceError::InvalidConfiguration)?
             .https_only(true)
             .connect_timeout(connect_timeout)
             .build()
