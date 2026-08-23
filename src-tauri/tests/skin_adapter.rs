@@ -161,7 +161,42 @@ fn script_checks_dom_before_inserting_one_pointer_transparent_layer() {
     assert!(!script.contains("localStorage"));
     assert!(!script.contains("sessionStorage"));
     assert!(!script.contains("setTimeout"));
+    assert!(script.contains("requestAnimationFrame"));
     assert!(!script.contains("addEventListener('click'"));
+}
+
+#[test]
+fn executable_script_waits_for_the_dsh_theme_contract_before_applying() {
+    let script = adapter_script(&fixture_settings()).expect("script");
+    let harness = format!(
+        r#"let frame=null;
+let ready=false;
+let reported=null;
+const inserted=[];
+const root={{}};
+global.requestAnimationFrame=(callback)=>{{frame=callback;return 1;}};
+global.document={{
+  getElementById:()=>null,
+  querySelector:()=>ready?root:null,
+  createElement:(tag)=>({{id:'',style:{{cssText:''}},setAttribute:()=>{{}},textContent:'',tag}}),
+  documentElement:{{prepend:(node)=>inserted.push(node)}},
+  head:{{append:(node)=>inserted.push(node)}}
+}};
+global.getComputedStyle=()=>({{getPropertyValue:()=>ready?'#151517':''}});
+global.location={{protocol:'http:',hostname:'127.0.0.1',port:'43127'}};
+global.__TAURI_INTERNALS__={{invoke:(_name,args)=>{{reported=args.compatible;return Promise.resolve();}}}};
+{script}
+if(reported!==null||typeof frame!=='function'){{throw new Error('reported before DSH was ready')}}
+ready=true;
+frame();
+setImmediate(()=>{{console.log(reported===true&&inserted.length===2?'RETRIED':'BAD')}});"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("前端工具链必须提供 node");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "RETRIED");
 }
 
 #[test]
