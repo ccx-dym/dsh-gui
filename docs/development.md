@@ -55,13 +55,13 @@ stdout 就绪信号与 HTTP 200。runtime 目录本身保持只读，进程树�
 
 | 场景 | 操作与通过条件 | 实测 |
 | --- | --- | --- |
-| 全新安装 | 安装 RC，签名兼容 runtime 探活后进入官方 WebUI | `0.1.5` current-user NSIS 安装通过；`0.1.1-rc.2` 签名 runtime 已发布，完整 GUI 激活链路待 `0.1.6` 复测 |
+| 全新安装 | 安装 RC，签名兼容 runtime 探活后进入官方 WebUI | 通过：`0.1.7` current-user NSIS 覆盖安装；已下载的 `0.1.1-rc.2` runtime 经完整性复检与隔离探活后提交 active pair，并进入官方 WebUI |
 | 离线重启 | 成功安装后断网重启，继续使用已激活 runtime，不要求下载 | 待实测 |
 | 两类通知 | 官方 npm 新版与已签名兼容版分别显示；前者不出现安装确认 | 自动状态机与签名清单通过；真实通知交互待实测 |
 | busy 拒绝 | 活动任务及 unknown busy 状态下确认更新，runtime/data 均不切换 | 待实测 |
-| 冷启动确认 | 在线下载后二次确认；仅下次冷启动执行 probe 与成对切换 | 待实测 |
+| 冷启动确认 | 在线下载后二次确认；仅下次冷启动执行 probe 与成对切换 | 通过：确认后仅写入 pending；退出并冷启动时显示“正在隔离探活”，成功后才写入 `deployment.json` |
 | 托盘重启 | 最小化到托盘后可恢复；托盘重启仍加载同一 active pair | 待实测 |
-| 回滚 | 候选首启失败时恢复旧 runtime/data pair，旧 WebUI 可用 | 待实测 |
+| 回滚 | 候选首启失败时恢复旧 runtime/data pair，旧 WebUI 可用 | 部分通过：`0.1.6` 首次候选启动失败时保持 uninstalled 与原数据不变；安装 `0.1.7` 后由显式新重试成功激活；已有旧 active pair 的真实回滚仍待实测 |
 | 单实例 | 连续启动两次只保留一个桌面实例和一棵 DSH 进程树 | 通过：第二实例退出码 0，桌面进程始终为 1 |
 | 完整退出 | 托盘退出后无该次安装所启动的 Node/DSH 残留 | 待实测 |
 
@@ -75,7 +75,7 @@ WebView2 版本及测量工具。不要通过隐藏额外轮询、放宽或降�
 | 前台空闲 CPU | WebUI 就绪后连续 60 秒平均值 | 0.000%（无 runtime 的本地安全态） |
 | 托盘 CPU | 隐藏到托盘后连续 60 秒平均值 | 0.000% |
 | 桌面内存 | `dsh-desktop.exe` Working Set / Private Bytes | 38.7 MiB / 14.4–14.5 MiB |
-| Node/DSH 内存 | 受管 Node/DSH 进程树 Working Set / Private Bytes 合计 | 待完成 `0.1.6` 首次安装后测量 |
+| Node/DSH 内存 | 受管 Node/DSH 进程树 Working Set / Private Bytes 合计 | `0.1.7` 激活后确认仅有 1 个受管 Node 主进程；稳定内存采样待完成 |
 
 2026-08-22 本机 RC 环境：Windows 11 专业版 build 26200、AMD Ryzen 9 9950X3D、
 32 逻辑处理器、95.6 GiB 内存、WebView2 151.0.4129.93。CPU 百分比按进程 CPU
@@ -93,14 +93,14 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
 
 | 项目 | 实测值 |
 | --- | --- |
-| RC 版本 / commit | `0.1.5` / 远端发布 commit `ee846eec1092a3722e7d94e364a714a8d01c29df`；`0.1.6` 待本轮发布 |
-| 安装包字节数 / SHA-256 | `0.1.5`：4,474,884 / `A4DC201164155D3CDD406A7E727769C4393CE6C4EDB864DF499F844FCE88BE7B` |
-| Tauri updater 签名 | `0.1.5` detached signature 与 stable 元数据独立验证通过；Windows Authenticode 代码签名未配置 |
+| RC 版本 / commit | `0.1.7` / `ae8128e7a5836042fca21c38e3f502bfb22ba507` |
+| 安装包字节数 / SHA-256 | 4,468,819 / `37690B0DA664348A5D95B16E6C6F43101E8DFABFF8A70DC0B49260FC18335808` |
+| Tauri updater 签名 | `0.1.7` detached signature 与 `desktop-stable/latest.json` 独立验证通过；Windows Authenticode 代码签名未配置 |
 | Windows 版本 / build | Windows 11 专业版 / 26200 |
 | CPU / 逻辑处理器 / 内存 | AMD Ryzen 9 9950X3D / 32 / 95.6 GiB |
 | WebView2 版本 | 151.0.4129.93 |
-| DSH 版本 / 适配器状态 | `0.1.1-rc.2` runtime 与签名清单已发布；真实页面和皮肤适配器待 `0.1.6` GUI 激活后验收 |
-| 安全烟雾审计目录 | `%TEMP%\dsh-desktop-runtime-smoke\14a548d4b12641328e419f252157553c`（已保留） |
+| DSH 版本 / 适配器状态 | `0.1.1-rc.2` runtime 已由 `0.1.7` 真实 GUI 激活并进入官方 WebUI；皮肤业务交互仍待验收 |
+| 安全烟雾审计目录 | `%TEMP%\dsh-desktop-runtime-smoke\0a152cfbaa0047469c500facfcd8a93e`（已保留） |
 
 ### GUI 验收步骤
 
@@ -126,7 +126,7 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
 | 恢复默认且历史图片保留 | 待实测 | 待记录 |
 | 无效、损坏、超大和超尺寸错误 | 待实测 | 待记录 |
 | DSH 业务交互无回归 | 待实测 | 待记录 |
-| 不支持版本/DOM 失败关闭回退 | 自动门禁通过 | 真实 DSH 页面待 `0.1.6` 激活后实测 |
+| 不支持版本/DOM 失败关闭回退 | 自动门禁通过 | `0.1.1-rc.2` 官方页面已加载；不支持版本的真实回退仍待实测 |
 
 ### 默认视觉与 8K 皮肤性能对照
 
@@ -138,7 +138,7 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
 | 指标 | 默认视觉 | 8K 皮肤 | 判定/备注 |
 | --- | --- | --- | --- |
 | 进程到可点击窗口（ms） | 待实测（主窗口句柄出现为 145 ms，不等同 DOM 可点击） | 待实测 | 需用可点击探针判定 `< 5000 ms` |
-| DSH 双门 ready（ms） | 待实测 | 待实测 | `0.1.1-rc.2` 发布源已就绪，等待 GUI 首次安装验收 |
+| DSH 双门 ready（ms） | 1673（发布 runtime 烟雾）；冷启动激活另含两次完整性扫描 | 待实测 | `0.1.1-rc.2` 真实 GUI 激活通过 |
 | 前台 60 秒平均 CPU | 2.057%（仅 desktop 主进程、单核口径） | 待实测 | WebView2 进程组 CPU 尚未合并 |
 | 托盘 60 秒平均 CPU | 0.000%（desktop 主进程） | 待实测 | 默认视觉通过 |
 | Desktop Working Set / Private Bytes | 40.51 / 15.10 MiB | 待实测 | 记录增量 |
