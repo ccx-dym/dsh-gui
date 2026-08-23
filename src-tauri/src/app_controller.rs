@@ -11,6 +11,8 @@ use crate::runtime::command::{RuntimeLaunchSpec, reserve_loopback_port};
 use crate::runtime::install_state::InstallStateStore;
 use crate::runtime::install_state::{ActiveDeployment, RuntimeSkinCompatibility};
 use crate::runtime::{RuntimeError, RuntimeEventSink, RuntimeSupervisor};
+#[cfg(not(debug_assertions))]
+use crate::skin::effective_skin_compatibility;
 use crate::update::activation::{
     RuntimeBusyProvider, RuntimeBusyState, UnknownRuntimeBusyProvider,
 };
@@ -126,7 +128,7 @@ impl OfficialRuntimeLifecycle {
             app: self.app.clone(),
             trace: OperationTrace::begin(TraceKind::Runtime),
             dsh_version: Some(deployment.runtime.version.clone()),
-            skin_compatibility: deployment.runtime.skin_compatibility,
+            skin_compatibility: effective_skin_compatibility(&deployment.runtime),
         });
         let sink: Arc<dyn RuntimeEventSink> = Arc::new(ControllerEventSink::new(
             Arc::clone(&self.status),

@@ -1,12 +1,15 @@
 use super::{MaskTone, SkinController, SkinFit, SkinPosition, SkinSettings};
-use crate::runtime::install_state::RuntimeSkinCompatibility;
+use crate::runtime::install_state::{InstalledRuntime, RuntimeSkinCompatibility};
 use semver::Version;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Manager, State, Webview};
 
-pub const DSH_ADAPTER_V1: &str = "dsh-0.1.1-rc.1-v1";
-const VERIFIED_DSH_VERSION: &str = "0.1.1-rc.1";
+pub const DSH_ADAPTER_V1: &str = "dsh-0.1.1-rc.2-v1";
+const VERIFIED_DSH_VERSION: &str = "0.1.1-rc.2";
+const VERIFIED_NODE_VERSION: &str = "24.15.0";
+const REVIEWED_UNVERIFIED_MANIFEST_DIGEST: &str =
+    "61f98dda4c1bde5a76eb94837f1a9ca00ade9620fe4668329bbab3b0d0fb79c4";
 const STYLE_ID: &str = "dsh-desktop-skin-style";
 const BACKGROUND_ID: &str = "dsh-desktop-skin-background";
 
@@ -64,6 +67,27 @@ pub fn skin_runtime_policy(
     SkinRuntimePolicy {
         enabled,
         reason: (!enabled).then_some(SkinDisableReason::VersionUnverified),
+    }
+}
+
+/// 把已随桌面客户端复核的历史运行时清单提升为等效皮肤授权。
+///
+/// 首版 `0.1.1-rc.2` 清单在真实 DOM 验证前以 `unverified` 发布。桌面客户端
+/// 只能对版本、Node 与原始签名清单摘要全部精确匹配的既有部署提升权限；其他
+/// 未验证部署继续失败关闭，避免仅凭相同 semver 扩大授权范围。
+///
+/// :param runtime: 从权威 deployment pointer 读取的完整运行时描述符。
+/// :return: 精确命中已复核描述符时返回 `Verified`，否则保留原签名结论。
+/// :raises: 只比较已解析版本和规范摘要，不产生错误。
+pub(crate) fn effective_skin_compatibility(runtime: &InstalledRuntime) -> RuntimeSkinCompatibility {
+    if runtime.skin_compatibility == RuntimeSkinCompatibility::Unverified
+        && runtime.version.to_string() == VERIFIED_DSH_VERSION
+        && runtime.node_version.to_string() == VERIFIED_NODE_VERSION
+        && runtime.manifest_digest == REVIEWED_UNVERIFIED_MANIFEST_DIGEST
+    {
+        RuntimeSkinCompatibility::Verified
+    } else {
+        runtime.skin_compatibility
     }
 }
 
@@ -484,7 +508,7 @@ mod tests {
         let controller = SkinAdapterController::default();
         let url = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
         assert!(controller.bind_navigation(
-            &Version::parse("0.1.1-rc.1").expect("version"),
+            &Version::parse("0.1.1-rc.2").expect("version"),
             RuntimeSkinCompatibility::Verified,
             &url
         ));
@@ -503,7 +527,7 @@ mod tests {
     #[test]
     fn finished_page_must_match_the_bound_exact_origin_and_navigation_epoch() {
         let controller = SkinAdapterController::default();
-        let version = Version::parse("0.1.1-rc.1").expect("version");
+        let version = Version::parse("0.1.1-rc.2").expect("version");
         let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
         let other_port = tauri::Url::parse("http://127.0.0.1:43128/chat").expect("url");
         assert!(controller.bind_navigation(
@@ -545,7 +569,7 @@ mod tests {
     #[test]
     fn page_report_token_is_consumed_after_the_first_matching_report() {
         let controller = SkinAdapterController::default();
-        let version = Version::parse("0.1.1-rc.1").expect("version");
+        let version = Version::parse("0.1.1-rc.2").expect("version");
         let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
         assert!(controller.bind_navigation(
             &version,

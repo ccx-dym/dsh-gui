@@ -24,7 +24,7 @@ use crate::{
     runtime::install_state::{
         InstallStateError, InstallStateStore, InstalledRuntime, RuntimeSkinCompatibility,
     },
-    skin::skin_runtime_policy,
+    skin::{effective_skin_compatibility, skin_runtime_policy},
     update::{
         archive::{
             ArchiveInstallPolicy, ArchiveInstallRequest, RuntimeArchiveInstaller,
@@ -518,7 +518,7 @@ fn apply_notice(
 fn active_skin_compatible(runtime: &InstalledRuntime) -> bool {
     // 活动部署没有精确适配器时即使核心可用也必须恢复官方界面；显式
     // `Unverified` 候选在安装前已经由同一策略关闭。
-    skin_runtime_policy(&runtime.version, runtime.skin_compatibility).enabled
+    skin_runtime_policy(&runtime.version, effective_skin_compatibility(runtime)).enabled
 }
 
 fn refresh_active_runtime_state(state: &mut UpdateUiState, runtime: Option<&InstalledRuntime>) {
@@ -1858,15 +1858,29 @@ mod tests {
     #[test]
     fn active_runtime_without_an_exact_adapter_restores_official_ui() {
         let verified = InstalledRuntime::with_skin_compatibility(
-            "0.1.1-rc.1",
+            "0.1.1-rc.2",
             "a".repeat(64),
             "24.15.0",
             RuntimeSkinCompatibility::Verified,
         )
         .unwrap();
         let signed_unverified = InstalledRuntime::with_skin_compatibility(
-            "0.1.1-rc.1",
+            "0.1.1-rc.2",
             "b".repeat(64),
+            "24.15.0",
+            RuntimeSkinCompatibility::Unverified,
+        )
+        .unwrap();
+        let reviewed_rc2 = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.2",
+            "61f98dda4c1bde5a76eb94837f1a9ca00ade9620fe4668329bbab3b0d0fb79c4".to_owned(),
+            "24.15.0",
+            RuntimeSkinCompatibility::Unverified,
+        )
+        .unwrap();
+        let unrelated_rc2 = InstalledRuntime::with_skin_compatibility(
+            "0.1.1-rc.2",
+            "c".repeat(64),
             "24.15.0",
             RuntimeSkinCompatibility::Unverified,
         )
@@ -1874,6 +1888,8 @@ mod tests {
 
         assert!(active_skin_compatible(&verified));
         assert!(!active_skin_compatible(&signed_unverified));
+        assert!(active_skin_compatible(&reviewed_rc2));
+        assert!(!active_skin_compatible(&unrelated_rc2));
     }
 
     #[test]
@@ -1896,7 +1912,7 @@ mod tests {
     #[test]
     fn authoritative_active_runtime_restores_skin_after_notice_fields_are_cleared() {
         let runtime = InstalledRuntime::with_skin_compatibility(
-            "0.1.1-rc.1",
+            "0.1.1-rc.2",
             "a".repeat(64),
             "24.15.0",
             RuntimeSkinCompatibility::Verified,
@@ -1911,7 +1927,7 @@ mod tests {
         apply_notice(
             &mut state,
             &UpdateNotice::SkinUnverified {
-                current: Some("0.1.1-rc.1".to_owned()),
+                current: Some("0.1.1-rc.2".to_owned()),
                 official: "0.1.1-rc.2".to_owned(),
                 compatible: "0.1.1-rc.2".to_owned(),
             },
@@ -1921,19 +1937,19 @@ mod tests {
         apply_notice(
             &mut state,
             &UpdateNotice::UpToDate {
-                current: Some("0.1.1-rc.1".to_owned()),
-                official: "0.1.1-rc.1".to_owned(),
+                current: Some("0.1.1-rc.2".to_owned()),
+                official: "0.1.1-rc.2".to_owned(),
             },
             None,
         );
 
         refresh_active_runtime_state(&mut state, Some(&runtime));
 
-        assert_eq!(state.current_version.as_deref(), Some("0.1.1-rc.1"));
+        assert_eq!(state.current_version.as_deref(), Some("0.1.1-rc.2"));
         assert_eq!(state.skin_compatible, Some(true));
 
         let unverified = InstalledRuntime::with_skin_compatibility(
-            "0.1.1-rc.1",
+            "0.1.1-rc.2",
             "b".repeat(64),
             "24.15.0",
             RuntimeSkinCompatibility::Unverified,

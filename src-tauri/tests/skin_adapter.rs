@@ -29,7 +29,7 @@ fn fixture_settings() -> SkinSettings {
 
 #[test]
 fn page_plan_requires_exact_version_and_numeric_loopback_origin() {
-    let verified = Version::parse("0.1.1-rc.1").expect("version");
+    let verified = Version::parse("0.1.1-rc.2").expect("version");
     let official = tauri::Url::parse("http://127.0.0.1:43127/chat").expect("url");
     assert!(
         page_script(
@@ -78,10 +78,10 @@ fn page_plan_requires_exact_version_and_numeric_loopback_origin() {
 
 #[test]
 fn supports_only_the_exact_verified_dsh_version() {
-    let adapter = adapter_for(&Version::parse("0.1.1-rc.1").expect("version"))
+    let adapter = adapter_for(&Version::parse("0.1.1-rc.2").expect("version"))
         .expect("精确验证版本应有适配器");
-    assert_eq!(adapter.version(), "dsh-0.1.1-rc.1-v1");
-    assert!(adapter_for(&Version::parse("0.1.1-rc.2").expect("version")).is_none());
+    assert_eq!(adapter.version(), "dsh-0.1.1-rc.2-v1");
+    assert!(adapter_for(&Version::parse("0.1.1-rc.1").expect("version")).is_none());
     assert!(adapter_for(&Version::parse("0.1.2").expect("version")).is_none());
 }
 
@@ -90,13 +90,13 @@ fn runtime_policy_requires_both_signed_skin_compatibility_and_an_exact_adapter()
     let rc1 = Version::parse("0.1.1-rc.1").unwrap();
     let rc2 = Version::parse("0.1.1-rc.2").unwrap();
 
-    let verified = skin_runtime_policy(&rc1, RuntimeSkinCompatibility::Verified);
+    let verified = skin_runtime_policy(&rc2, RuntimeSkinCompatibility::Verified);
     assert!(verified.enabled);
     assert_eq!(verified.reason, None);
 
     for policy in [
+        skin_runtime_policy(&rc1, RuntimeSkinCompatibility::Verified),
         skin_runtime_policy(&rc1, RuntimeSkinCompatibility::Unverified),
-        skin_runtime_policy(&rc2, RuntimeSkinCompatibility::Verified),
         skin_runtime_policy(&rc2, RuntimeSkinCompatibility::Unverified),
     ] {
         assert!(!policy.enabled);
@@ -114,7 +114,7 @@ fn signed_unverified_exact_adapter_stays_disabled_after_restart() {
     let paths = AppPaths::from_roots(&root.join("roaming"), &root.join("local"));
     let layout = RuntimeLayout::from_paths(&paths);
     let runtime = InstalledRuntime::with_skin_compatibility(
-        "0.1.1-rc.1",
+        "0.1.1-rc.2",
         "a".repeat(64),
         "24.15.0",
         RuntimeSkinCompatibility::Unverified,

@@ -7,6 +7,7 @@ mod model;
 pub(crate) mod protocol;
 mod store;
 
+pub(crate) use adapter::effective_skin_compatibility;
 pub use adapter::{
     DSH_ADAPTER_V1, DshAdapter, SkinAdapterController, SkinAdapterReport, SkinDisableReason,
     SkinRuntimePolicy, adapter_for, adapter_script, cleanup_script, page_script,
