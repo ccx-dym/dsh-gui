@@ -250,7 +250,16 @@ impl RuntimeUi for TauriRuntimeUi {
     fn navigate_main(&self, url: &tauri::Url) -> Result<(), RuntimeError> {
         if let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>() {
             if let Some(version) = self.dsh_version.as_ref() {
-                adapter.bind_navigation(version, self.skin_compatibility, url);
+                let bound = adapter.bind_navigation(version, self.skin_compatibility, url);
+                crate::record_skin_stage(
+                    &self.app,
+                    if bound {
+                        crate::diagnostics::DiagnosticStage::SkinBindAccepted
+                    } else {
+                        crate::diagnostics::DiagnosticStage::SkinBindDenied
+                    },
+                    None,
+                );
             } else {
                 adapter.clear();
             }
@@ -264,6 +273,52 @@ impl RuntimeUi for TauriRuntimeUi {
         let result = main
             .navigate(url.clone())
             .map_err(|error| RuntimeError::Tauri(error.to_string()));
+        if result.is_ok()
+            && let Some(version) = self.dsh_version.clone()
+        {
+            let app = self.app.clone();
+            let expected_url = url.clone();
+            let skin_compatibility = self.skin_compatibility;
+            tauri::async_runtime::spawn(async move {
+                // WebView2 可能先恢复旧远程页面，且 DSH React 在 PageLoad::Finished 后才
+                // 挂载主题。延迟后重新核对当前精确来源和版本，再由原生侧刷新皮肤。
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let Some(main) = app.get_webview_window("main") else {
+                    return;
+                };
+                let Ok(current_url) = main.url() else {
+                    return;
+                };
+                if current_url.origin() != expected_url.origin() {
+                    return;
+                }
+                let Some(adapter) = app.try_state::<crate::skin::SkinAdapterController>() else {
+                    return;
+                };
+                if !adapter.bind_navigation(&version, skin_compatibility, &current_url) {
+                    crate::record_skin_stage(
+                        &app,
+                        crate::diagnostics::DiagnosticStage::SkinBindDenied,
+                        None,
+                    );
+                    return;
+                }
+                crate::record_skin_stage(
+                    &app,
+                    crate::diagnostics::DiagnosticStage::SkinBindAccepted,
+                    None,
+                );
+                let Some(skins) = app.try_state::<crate::skin::SkinController>() else {
+                    return;
+                };
+                let Ok(state) = skins.load() else {
+                    return;
+                };
+                if crate::skin::adapter::refresh_main_skin(&app, &state.settings).is_err() {
+                    crate::record_skin_apply_diagnostic(&app);
+                }
+            });
+        }
         if result.is_err()
             && let Some(adapter) = self.app.try_state::<crate::skin::SkinAdapterController>()
         {

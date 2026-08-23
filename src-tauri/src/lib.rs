@@ -136,9 +136,11 @@ pub fn run() {
                 return;
             };
             if payload.event() == tauri::webview::PageLoadEvent::Started {
+                record_skin_stage(app, DiagnosticStage::SkinPageStarted, None);
                 adapter.navigation_started(payload.url());
                 return;
             }
+            record_skin_stage(app, DiagnosticStage::SkinPageFinished, None);
             let Some(skins) = app.try_state::<SkinController>() else {
                 return;
             };
@@ -263,6 +265,32 @@ pub(crate) fn record_skin_apply_diagnostic(app: &AppHandle) {
         DiagnosticStage::SkinApply,
         DiagnosticErrorKind::TauriError,
     );
+}
+
+/// 记录皮肤链路中的固定阶段，不包含 URL、路径或用户设置。
+///
+/// :param app: 当前应用句柄，用于访问固定诊断 sink。
+/// :param stage: 来自封闭枚举的皮肤链路阶段。
+/// :param error_kind: 可选的固定错误类别，不包含动态正文。
+/// :return: 无返回数据。
+/// :raises: sink 缺失或异步写入失败时静默失败。
+pub(crate) fn record_skin_stage(
+    app: &AppHandle,
+    stage: DiagnosticStage,
+    error_kind: Option<DiagnosticErrorKind>,
+) {
+    let Some(sink) = app.try_state::<FileDiagnosticSink>() else {
+        return;
+    };
+    let trace = OperationTrace::begin(TraceKind::Runtime);
+    sink.record(DiagnosticEvent::new(
+        &trace,
+        stage,
+        0,
+        0,
+        Some(std::process::id()),
+        error_kind,
+    ));
 }
 
 #[cfg(test)]

@@ -427,6 +427,17 @@ pub fn report_skin_adapter(
     compatible: bool,
 ) -> SkinAdapterReport {
     let report = controller.report(&adapter_version, page_token, compatible);
+    if report.accepted {
+        crate::record_skin_stage(
+            &app,
+            if report.compatible {
+                crate::diagnostics::DiagnosticStage::SkinDomCompatible
+            } else {
+                crate::diagnostics::DiagnosticStage::SkinDomIncompatible
+            },
+            None,
+        );
+    }
     if report.accepted
         && !report.compatible
         && let Some(main) = app.get_webview_window("main")
