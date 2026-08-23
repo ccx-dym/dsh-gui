@@ -287,11 +287,13 @@ fn validate_active_snapshot(workspace: &ProbeWorkspace) -> Result<(), ProbeError
 
 fn validate_plain_directory(path: &Path) -> Result<(), ProbeError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| ProbeError::MissingWorkspace)?;
-    if !metadata.is_dir() {
-        return Err(ProbeError::MissingWorkspace);
-    }
+    // Windows 的目录符号链接在 symlink_metadata 下可能不会被视为普通目录；
+    // 必须先识别链接/重解析点，确保越界路径始终归类为安全边界错误。
     if metadata.file_type().is_symlink() || has_reparse_point(&metadata) {
         return Err(ProbeError::UnsafeBoundary);
+    }
+    if !metadata.is_dir() {
+        return Err(ProbeError::MissingWorkspace);
     }
     Ok(())
 }
