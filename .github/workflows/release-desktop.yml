@@ -20,11 +20,6 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
-      DSH_DESKTOP_NPM_REGISTRY_ROOT: ${{ vars.DSH_DESKTOP_NPM_REGISTRY_ROOT }}
-      DSH_DESKTOP_COMPAT_MANIFEST_URL: ${{ vars.DSH_DESKTOP_COMPAT_MANIFEST_URL }}
-      DSH_DESKTOP_COMPAT_SIGNATURE_URL: ${{ vars.DSH_DESKTOP_COMPAT_SIGNATURE_URL }}
-      DSH_DESKTOP_COMPAT_PUBLIC_KEY: ${{ vars.DSH_DESKTOP_COMPAT_PUBLIC_KEY }}
-      DSH_DESKTOP_UPDATE_ENDPOINT: ${{ vars.DSH_DESKTOP_UPDATE_ENDPOINT }}
     steps:
       - name: Checkout exact tagged source
         id: checkout
@@ -66,10 +61,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'corepack enable failed' }
           pnpm install --frozen-lockfile
           if ($LASTEXITCODE -ne 0) { throw 'locked dependency install failed' }
-      - name: Test and build signed current-user NSIS
+      - name: Test release source without production channel injection
+        id: checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          pnpm check
+          if ($LASTEXITCODE -ne 0) { throw 'desktop release checks failed' }
+      - name: Build signed current-user NSIS
         id: build
         shell: pwsh
         env:
+          DSH_DESKTOP_NPM_REGISTRY_ROOT: ${{ vars.DSH_DESKTOP_NPM_REGISTRY_ROOT }}
+          DSH_DESKTOP_COMPAT_MANIFEST_URL: ${{ vars.DSH_DESKTOP_COMPAT_MANIFEST_URL }}
+          DSH_DESKTOP_COMPAT_SIGNATURE_URL: ${{ vars.DSH_DESKTOP_COMPAT_SIGNATURE_URL }}
+          DSH_DESKTOP_COMPAT_PUBLIC_KEY: ${{ vars.DSH_DESKTOP_COMPAT_PUBLIC_KEY }}
+          DSH_DESKTOP_UPDATE_ENDPOINT: ${{ vars.DSH_DESKTOP_UPDATE_ENDPOINT }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
@@ -93,8 +101,6 @@ jobs:
           if ($endpoint.Scheme -cne 'https' -or -not [string]::IsNullOrEmpty($endpoint.UserInfo)) {
             throw 'desktop updater endpoint must be credential-free HTTPS'
           }
-          pnpm check
-          if ($LASTEXITCODE -ne 0) { throw 'desktop release checks failed' }
           $overlay = @{
             plugins = @{
               updater = @{

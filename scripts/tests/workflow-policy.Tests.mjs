@@ -336,7 +336,13 @@ test("desktop release 固定源码、完整门禁和 Tauri 独立签名输入", 
   assert.match(release.validate.run, /Cargo\.toml/);
   assert.match(release.validate.run, /tauri\.conf\.json/);
   assert.match(release.validate.run, /\\r\?\$/);
-  assert.match(release.build.run, /pnpm check/);
+  assert.match(release.checks.run, /pnpm check/);
+  assert.doesNotMatch(release.build.run, /pnpm check/);
+  assert.equal(workflow.jobs.release.env.DSH_DESKTOP_COMPAT_MANIFEST_URL, undefined);
+  assert.equal(
+    release.build.env.DSH_DESKTOP_COMPAT_MANIFEST_URL,
+    "${{ vars.DSH_DESKTOP_COMPAT_MANIFEST_URL }}",
+  );
   assert.match(release.build.run, /pnpm tauri build --bundles nsis/);
   assert.match(release.build.run, /WriteAllText/);
   assert.match(release.build.run, /--config \$overlayPath/);
