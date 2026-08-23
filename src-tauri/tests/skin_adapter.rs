@@ -146,13 +146,19 @@ fn signed_unverified_exact_adapter_stays_disabled_after_restart() {
 }
 
 #[test]
-fn script_checks_dom_before_inserting_one_pointer_transparent_layer() {
+fn script_checks_dom_before_painting_the_page_canvas() {
     let script = adapter_script(&fixture_settings()).expect("script");
     assert!(script.contains("document.querySelector('#root')"));
     assert!(script.contains("--dsw-alias-bg-base"));
     assert!(script.contains("--dsw-alias-bg-layer-1"));
     assert!(script.contains("--dsw-alias-bg-layer-2"));
-    assert!(script.contains("pointer-events:none"));
+    assert!(script.contains("body{background-color:transparent !important"));
+    assert!(script.contains("background-attachment:fixed !important"));
+    assert!(script.contains("body::before{content:\"\""));
+    assert!(script.contains("filter:blur(12px)"));
+    assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
+    assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
+    assert!(script.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.88) !important"));
     assert!(script.contains("dsh-desktop-skin-background"));
     assert_eq!(script.matches("createElement('div')").count(), 1);
     assert!(!script.contains("fetch("));

@@ -132,12 +132,22 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
     };
     let panel_opacity = f32::from(settings.panel_opacity_percent) / 100.0;
     let mask_opacity = f32::from(settings.mask_opacity_percent) / 100.0;
-    let blur_scale = 1.0 + f32::from(settings.blur_px) / 500.0;
+    // `body` 背景是 WebView2 中最可靠的兜底画布；仅在用户要求模糊时叠加伪元素，
+    // 即使伪元素的层叠上下文被上游改动，未模糊的背景仍保持可见。
+    let blur_overlay = if settings.blur_px == 0 {
+        String::new()
+    } else {
+        let blur_scale = 1.0 + f32::from(settings.blur_px) / 500.0;
+        format!(
+            r#"body::before{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba({mask_rgb},{mask_opacity:.2}),rgba({mask_rgb},{mask_opacity:.2})),url("http://dsh-skin.localhost/{digest}");background-repeat:no-repeat;background-size:{background_size};background-position:{background_position};filter:blur({blur}px);transform:scale({blur_scale:.3});transform-origin:center;will-change:transform}}"#,
+            blur = settings.blur_px,
+        )
+    };
 
     // DSH 的 PageLoad::Finished 早于 React 主题挂载，因此在有限帧数内只读重试 DOM
     // 合约。页面令牌同时写入进程内页面全局，避免旧导航的延迟回调覆盖新页面。
-    Some(format!(
-        r#"(()=>{{'use strict';const A='{adapter}',T={page_token},S='{style_id}',B='{background_id}',K='__DSH_DESKTOP_SKIN_PENDING__',V=['--dsw-alias-bg-base','--dsw-alias-bg-layer-1','--dsw-alias-bg-layer-2'],M=600;let n=0;const clean=()=>{{document.getElementById(S)?.remove();document.getElementById(B)?.remove();}};const report=(compatible)=>{{const invoke=globalThis.__TAURI_INTERNALS__?.invoke;if(typeof invoke==='function'){{const result=invoke('report_skin_adapter',{{adapterVersion:A,pageToken:T,compatible}});if(result&&typeof result.catch==='function'){{void result.catch(()=>{{}});}}}}}};const fail=()=>{{if(globalThis[K]!==T)return;delete globalThis[K];try{{clean();}}catch(_cleanupError){{}}try{{report(false);}}catch(_reportError){{}}}};const apply=()=>{{if(globalThis[K]!==T)return;try{{const root=document.querySelector('#root');const css=root?getComputedStyle(root):null;if(!root||!css||V.some((name)=>css.getPropertyValue(name).trim()==='')){{n+=1;if(n<M){{requestAnimationFrame(apply);}}else{{fail();}}return;}}clean();const bg=document.createElement('div');bg.id=B;bg.setAttribute('aria-hidden','true');bg.style.cssText='position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba({mask_rgb},{mask_opacity:.2}),rgba({mask_rgb},{mask_opacity:.2})),url("http://dsh-skin.localhost/{digest}");background-repeat:no-repeat;background-size:{background_size};background-position:{background_position};filter:blur({blur}px);transform:scale({blur_scale:.3});transform-origin:center;will-change:transform';const style=document.createElement('style');style.id=S;style.textContent='html,body,#root{{background:transparent !important}}#root{{position:relative;z-index:1;min-height:100vh}}:root{{--dsw-alias-bg-base:rgba({surface_rgb},{panel_opacity:.2});--dsw-alias-bg-layer-1:rgba({surface_rgb},{panel_opacity:.2});--dsw-alias-bg-layer-2:rgba({surface_rgb},{panel_opacity:.2});--dsh-desktop-border-opacity:{border_opacity:.2}}}';document.documentElement.prepend(bg);document.head.append(style);delete globalThis[K];report(true);}}catch(_error){{fail();}}}};try{{clean();const originOk=location.protocol==='http:'&&location.hostname==='127.0.0.1'&&location.port!=='';if(!originOk){{report(false);return;}}globalThis[K]=T;apply();}}catch(_error){{fail();}}}})();"#,
+    let script = format!(
+        r#"(()=>{{'use strict';const A='{adapter}',T={page_token},S='{style_id}',B='{background_id}',K='__DSH_DESKTOP_SKIN_PENDING__',V=['--dsw-alias-bg-base','--dsw-alias-bg-layer-1','--dsw-alias-bg-layer-2'],M=600;let n=0;const clean=()=>{{document.getElementById(S)?.remove();document.getElementById(B)?.remove();}};const report=(compatible)=>{{const invoke=globalThis.__TAURI_INTERNALS__?.invoke;if(typeof invoke==='function'){{const result=invoke('report_skin_adapter',{{adapterVersion:A,pageToken:T,compatible}});if(result&&typeof result.catch==='function'){{void result.catch(()=>{{}});}}}}}};const fail=()=>{{if(globalThis[K]!==T)return;delete globalThis[K];try{{clean();}}catch(_cleanupError){{}}try{{report(false);}}catch(_reportError){{}}}};const apply=()=>{{if(globalThis[K]!==T)return;try{{const root=document.querySelector('#root');const css=root?getComputedStyle(root):null;if(!root||!css||V.some((name)=>css.getPropertyValue(name).trim()==='')){{n+=1;if(n<M){{requestAnimationFrame(apply);}}else{{fail();}}return;}}clean();const bg=document.createElement('div');bg.id=B;bg.setAttribute('aria-hidden','true');bg.style.cssText='display:none';const style=document.createElement('style');style.id=S;style.textContent='html,#root{{background:transparent !important}}body{{background-color:transparent !important;background-image:linear-gradient(rgba({mask_rgb},{mask_opacity:.2}),rgba({mask_rgb},{mask_opacity:.2})),url("http://dsh-skin.localhost/{digest}") !important;background-repeat:no-repeat !important;background-size:{background_size} !important;background-position:{background_position} !important;background-attachment:fixed !important}}#root{{position:relative;min-height:100vh}}:root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},{panel_opacity:.2}) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},{panel_opacity:.2}) !important;--dsh-desktop-border-opacity:{border_opacity:.2} !important}}';document.documentElement.prepend(bg);document.head.append(style);delete globalThis[K];report(true);}}catch(_error){{fail();}}}};try{{clean();const originOk=location.protocol==='http:'&&location.hostname==='127.0.0.1'&&location.port!=='';if(!originOk){{report(false);return;}}globalThis[K]=T;apply();}}catch(_error){{fail();}}}})();"#,
         adapter = DSH_ADAPTER_V1,
         page_token = page_token,
         style_id = STYLE_ID,
@@ -147,11 +157,13 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
         digest = digest,
         background_size = background_size,
         background_position = background_position,
-        blur = settings.blur_px,
-        blur_scale = blur_scale,
         surface_rgb = surface_rgb,
         panel_opacity = panel_opacity,
         border_opacity = panel_opacity,
+    );
+    Some(script.replace(
+        "#root{position:relative;min-height:100vh}",
+        &format!("{blur_overlay}#root{{position:relative;z-index:1;min-height:100vh}}"),
     ))
 }
 
