@@ -99,8 +99,9 @@ export function updatePresentation(state: UpdateState): UpdatePresentation {
     case "unavailable":
       return {
         eyebrow: "更新服务",
-        heading: "发布通道尚未配置",
-        body: "当前测试构建没有兼容发布源，已安全保持现状。",
+        heading: "暂时无法读取发布通道",
+        body: "可以重新检查；现有 DSH 和本地数据不会受影响。",
+        primaryAction: retry,
         busy: false,
       };
     case "uninstalled":

@@ -7,6 +7,15 @@ import {
 } from "./runtime-events";
 
 describe("updatePresentation", () => {
+  it("启动快照暂不可用时保留重新检查入口", () => {
+    const presentation = updatePresentation(createInitialUpdateState());
+    expect(presentation.heading).toBe("暂时无法读取发布通道");
+    expect(presentation.primaryAction).toEqual({
+      command: "check_updates",
+      label: "重新检查",
+    });
+  });
+
   it("首次安装直接展示已验证版本的安装动作", () => {
     const presentation = updatePresentation({
       ...createInitialUpdateState(),
