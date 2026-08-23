@@ -12,6 +12,9 @@
     "allow-get-update-state",
     "allow-check-updates",
     "allow-install-compatible-update",
-    "allow-confirm-activation"
+    "allow-confirm-activation",
+    "allow-get-desktop-update-state",
+    "allow-check-desktop-update",
+    "allow-install-desktop-update"
   ]
 }

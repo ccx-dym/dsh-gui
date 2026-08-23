@@ -10,6 +10,9 @@ pub mod update;
 pub mod update_ui;
 
 use app_controller::{AppController, get_runtime_status, retry_runtime};
+use desktop_update::{
+    DesktopUpdateService, check_desktop_update, get_desktop_update_state, install_desktop_update,
+};
 use diagnostics::{
     DiagnosticErrorKind, DiagnosticEvent, DiagnosticLogger, DiagnosticPolicy, DiagnosticSink,
     DiagnosticStage, FileDiagnosticSink, OperationTrace, TraceKind,
@@ -26,11 +29,14 @@ use update_ui::{
     install_compatible_update,
 };
 
-pub const UPDATE_COMMAND_NAMES: [&str; 4] = [
+pub const UPDATE_COMMAND_NAMES: [&str; 7] = [
     "get_update_state",
     "check_updates",
     "install_compatible_update",
     "confirm_activation",
+    "get_desktop_update_state",
+    "check_desktop_update",
+    "install_desktop_update",
 ];
 
 /// 更新命令的进程内纵深来源校验；ACL 仍是第一道强制边界。
@@ -95,6 +101,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // 自定义协议必须在 setup 创建 WebView 前注册；回调只读取固定设置与托管图片目录。
         .register_uri_scheme_protocol("dsh-skin", |context, request| {
             skin::protocol::handle_tauri_skin_request(
@@ -110,6 +117,9 @@ pub fn run() {
             check_updates,
             install_compatible_update,
             confirm_activation,
+            get_desktop_update_state,
+            check_desktop_update,
+            install_desktop_update,
             get_skin_state,
             choose_skin_image,
             save_skin_settings,
@@ -145,6 +155,11 @@ pub fn run() {
             let logger = DiagnosticLogger::new(paths.logs.clone(), DiagnosticPolicy::default())?;
             let diagnostic_sink = FileDiagnosticSink::new(logger, 256)?;
             let update_controller = UpdateUiController::new(paths.clone());
+            let desktop_update_service = DesktopUpdateService::new(
+                paths.settings.clone(),
+                app.package_info().version.clone(),
+                app.handle().clone(),
+            );
             let skin_previews = skin::protocol::SkinPreviewRegistry::new(paths.skins.clone());
             let skin_controller = SkinController::new(
                 skin::SkinStore::new(paths.settings.clone(), paths.skins.clone()),
@@ -156,6 +171,7 @@ pub fn run() {
             controller.start_mock_runtime()?;
             app.manage(diagnostic_sink);
             app.manage(update_controller);
+            app.manage(desktop_update_service);
             app.manage(skin_previews);
             app.manage(skin_controller);
             app.manage(SkinAdapterController::default());
@@ -301,6 +317,9 @@ mod tests {
                 "check_updates",
                 "install_compatible_update",
                 "confirm_activation",
+                "get_desktop_update_state",
+                "check_desktop_update",
+                "install_desktop_update",
             ]
         );
     }

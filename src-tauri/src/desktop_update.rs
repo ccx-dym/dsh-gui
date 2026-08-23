@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri_plugin_updater::{Update, UpdaterExt};
+
 use crate::domain::{
     DesktopRelease, DesktopUpdateEnvelope, DesktopUpdateErrorKind, DesktopUpdateState,
 };
@@ -63,6 +66,222 @@ pub trait DesktopUpdateBackend: Send + Sync {
         &'a self,
         release: DesktopRelease,
     ) -> Pin<Box<dyn Future<Output = Result<(), DesktopUpdateError>> + Send + 'a>>;
+}
+
+/// Tauri updater 的 Rust-only 适配器；候选安装句柄不会暴露给任何 WebView。
+pub struct TauriDesktopUpdateBackend {
+    app: AppHandle,
+    selected: Mutex<Option<Update>>,
+}
+
+impl TauriDesktopUpdateBackend {
+    /// 创建只绑定当前应用句柄的 updater 后端。
+    ///
+    /// :param app: 当前 Tauri 应用句柄。
+    /// :return: 尚未选择任何远程版本的后端。
+    /// :raises: 构造过程不访问网络，不产生错误。
+    pub fn new(app: AppHandle) -> Self {
+        Self {
+            app,
+            selected: Mutex::new(None),
+        }
+    }
+}
+
+impl DesktopUpdateBackend for TauriDesktopUpdateBackend {
+    fn check<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<DesktopRelease>, DesktopUpdateError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let updater = self.app.updater().map_err(classify_updater_check_error)?;
+            let candidate = updater
+                .check()
+                .await
+                .map_err(classify_updater_check_error)?;
+            let Some(update) = candidate else {
+                *self.selected.lock().await = None;
+                return Ok(None);
+            };
+            let version =
+                Version::parse(&update.version).map_err(|_| DesktopUpdateError::InvalidMetadata)?;
+            let release = DesktopRelease {
+                version,
+                notes: update.body.clone(),
+                published_at: update.date.map(|value| value.to_string()),
+            };
+            *self.selected.lock().await = Some(update);
+            Ok(Some(release))
+        })
+    }
+
+    fn install<'a>(
+        &'a self,
+        release: DesktopRelease,
+    ) -> Pin<Box<dyn Future<Output = Result<(), DesktopUpdateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let update = self
+                .selected
+                .lock()
+                .await
+                .take()
+                .ok_or(DesktopUpdateError::InstallFailed)?;
+            let selected_version =
+                Version::parse(&update.version).map_err(|_| DesktopUpdateError::InvalidMetadata)?;
+            if selected_version != release.version {
+                return Err(DesktopUpdateError::InvalidMetadata);
+            }
+            // 先完整下载并校验 Tauri 签名，只有签名通过后才停止 DSH。这样断网或恶意
+            // 制品不会打断当前任务；安装器接管失败时再尽力恢复原 runtime。
+            let bytes = update
+                .download(|_, _| {}, || {})
+                .await
+                .map_err(classify_updater_install_error)?;
+            let runtime = self
+                .app
+                .try_state::<crate::app_controller::AppController>()
+                .ok_or(DesktopUpdateError::InstallFailed)?;
+            runtime
+                .stop()
+                .map_err(|_| DesktopUpdateError::InstallFailed)?;
+            match update.install(&bytes) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = runtime.restart();
+                    Err(classify_updater_install_error(error))
+                }
+            }
+        })
+    }
+}
+
+fn classify_updater_check_error(error: tauri_plugin_updater::Error) -> DesktopUpdateError {
+    use tauri_plugin_updater::Error;
+
+    match error {
+        Error::Reqwest(_) | Error::Network(_) => DesktopUpdateError::Offline,
+        Error::Minisign(_) | Error::Base64(_) | Error::SignatureUtf8(_) => {
+            DesktopUpdateError::SignatureInvalid
+        }
+        Error::EmptyEndpoints
+        | Error::Semver(_)
+        | Error::Serialization(_)
+        | Error::ReleaseNotFound
+        | Error::UnsupportedArch
+        | Error::UnsupportedOs
+        | Error::UrlParse(_)
+        | Error::TargetNotFound(_)
+        | Error::TargetsNotFound(_)
+        | Error::InsecureTransportProtocol => DesktopUpdateError::InvalidMetadata,
+        _ => DesktopUpdateError::InstallFailed,
+    }
+}
+
+fn classify_updater_install_error(error: tauri_plugin_updater::Error) -> DesktopUpdateError {
+    use tauri_plugin_updater::Error;
+
+    match error {
+        Error::Reqwest(_) | Error::Network(_) => DesktopUpdateError::Offline,
+        Error::Minisign(_) | Error::Base64(_) | Error::SignatureUtf8(_) => {
+            DesktopUpdateError::SignatureInvalid
+        }
+        _ => DesktopUpdateError::InstallFailed,
+    }
+}
+
+/// 本地命令共享的桌面更新服务。
+pub struct DesktopUpdateService {
+    controller: DesktopUpdateController,
+    backend: TauriDesktopUpdateBackend,
+}
+
+impl DesktopUpdateService {
+    /// 使用私有设置目录和当前客户端版本创建服务。
+    ///
+    /// :param settings_dir: 应用私有设置目录。
+    /// :param current_version: 当前客户端版本。
+    /// :param app: 当前 Tauri 应用句柄。
+    /// :return: 相互隔离的状态机与 Tauri updater 后端。
+    /// :raises: 构造过程不访问网络，不产生错误。
+    pub fn new(settings_dir: PathBuf, current_version: Version, app: AppHandle) -> Self {
+        Self {
+            controller: DesktopUpdateController::new(settings_dir, current_version),
+            backend: TauriDesktopUpdateBackend::new(app),
+        }
+    }
+}
+
+fn require_local_desktop_update(window: &WebviewWindow) -> Result<(), &'static str> {
+    let url = window.url().map_err(|_| "desktop_update_origin_denied")?;
+    if crate::update_command_allowed_for_url(url.as_str()) {
+        Ok(())
+    } else {
+        Err("desktop_update_origin_denied")
+    }
+}
+
+fn desktop_update_error_code(error: DesktopUpdateError) -> &'static str {
+    match error {
+        DesktopUpdateError::Offline => "desktop_update_offline",
+        DesktopUpdateError::InvalidMetadata => "desktop_update_invalid_metadata",
+        DesktopUpdateError::SignatureInvalid => "desktop_update_signature_invalid",
+        DesktopUpdateError::InstallFailed => "desktop_update_install_failed",
+    }
+}
+
+/// 获取桌面客户端更新状态。
+///
+/// :param window: 发起调用的本地 WebView。
+/// :param service: 桌面更新服务。
+/// :return: 当前独立 revision 快照。
+/// :raises: 非本地来源返回固定拒绝码。
+#[tauri::command]
+pub async fn get_desktop_update_state(
+    window: WebviewWindow,
+    service: tauri::State<'_, DesktopUpdateService>,
+) -> Result<DesktopUpdateEnvelope, &'static str> {
+    require_local_desktop_update(&window)?;
+    Ok(service.controller.snapshot().await)
+}
+
+/// 检查签名桌面发布通道。
+///
+/// :param window: 发起调用的本地 WebView。
+/// :param service: 桌面更新服务。
+/// :return: 检查后的独立 revision 快照。
+/// :raises: 来源、网络、元数据或状态持久化失败时返回固定错误码。
+#[tauri::command]
+pub async fn check_desktop_update(
+    window: WebviewWindow,
+    service: tauri::State<'_, DesktopUpdateService>,
+) -> Result<DesktopUpdateEnvelope, &'static str> {
+    require_local_desktop_update(&window)?;
+    service
+        .controller
+        .check(&service.backend)
+        .await
+        .map_err(desktop_update_error_code)
+}
+
+/// 安装最后一次检查选定的签名客户端版本。
+///
+/// :param window: 发起调用的本地 WebView。
+/// :param service: 桌面更新服务。
+/// :param expected_revision: 前端最后观察到的 revision。
+/// :return: 安装器接管后的独立 revision 快照。
+/// :raises: 来源、旧 revision、签名、下载或安装失败时返回固定错误码。
+#[tauri::command]
+pub async fn install_desktop_update(
+    window: WebviewWindow,
+    service: tauri::State<'_, DesktopUpdateService>,
+    expected_revision: u64,
+) -> Result<DesktopUpdateEnvelope, &'static str> {
+    require_local_desktop_update(&window)?;
+    service
+        .controller
+        .install(expected_revision, &service.backend)
+        .await
+        .map_err(desktop_update_error_code)
 }
 
 #[derive(Debug, Deserialize, Serialize)]

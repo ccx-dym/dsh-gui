@@ -18,6 +18,9 @@ fn command_permissions_expose_updates_only_to_local_main() {
         "allow-check-updates",
         "allow-install-compatible-update",
         "allow-confirm-activation",
+        "allow-get-desktop-update-state",
+        "allow-check-desktop-update",
+        "allow-install-desktop-update",
     ] {
         assert!(permissions.iter().any(|value| value == command));
     }
@@ -37,10 +40,42 @@ fn build_manifest_registers_every_exposed_update_command() {
         "check_updates",
         "install_compatible_update",
         "confirm_activation",
+        "get_desktop_update_state",
+        "check_desktop_update",
+        "install_desktop_update",
     ] {
         assert!(build_script.contains(&format!("\"{command}\"")));
     }
     assert!(build_script.contains("AppManifest::new().commands(COMMANDS)"));
+}
+
+#[test]
+fn desktop_updater_is_rust_only_and_never_granted_to_remote_dsh() {
+    let library = include_str!("../src/lib.rs");
+    for command in [
+        "get_desktop_update_state",
+        "check_desktop_update",
+        "install_desktop_update",
+    ] {
+        assert!(library.contains(command), "缺少桌面更新命令: {command}");
+    }
+    assert!(library.contains("tauri_plugin_updater::Builder::new().build()"));
+
+    let local: Value = serde_json::from_str(include_str!("../capabilities/default.json"))
+        .expect("local-main capability 必须是 JSON");
+    let remote: Value = serde_json::from_str(include_str!("../capabilities/skin-report.json"))
+        .expect("skin-report capability 必须是 JSON");
+    assert!(!local.to_string().contains("updater:"));
+    assert!(!remote.to_string().contains("desktop-update"));
+    assert!(!remote.to_string().contains("updater:"));
+
+    let config: Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config 必须是 JSON");
+    assert_eq!(config["bundle"]["createUpdaterArtifacts"], true);
+    assert_eq!(
+        config["plugins"]["updater"]["windows"]["installMode"],
+        "passive"
+    );
 }
 
 #[test]

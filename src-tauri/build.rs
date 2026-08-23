@@ -5,6 +5,8 @@ fn main() {
         "DSH_DESKTOP_COMPAT_MANIFEST_URL",
         "DSH_DESKTOP_COMPAT_SIGNATURE_URL",
         "DSH_DESKTOP_COMPAT_PUBLIC_KEY",
+        "DSH_DESKTOP_UPDATE_ENDPOINT",
+        "DSH_DESKTOP_UPDATE_PUBLIC_KEY",
     ] {
         println!("cargo:rerun-if-env-changed={key}");
     }
@@ -16,6 +18,9 @@ fn main() {
         "check_updates",
         "install_compatible_update",
         "confirm_activation",
+        "get_desktop_update_state",
+        "check_desktop_update",
+        "install_desktop_update",
         "get_skin_state",
         "choose_skin_image",
         "save_skin_settings",

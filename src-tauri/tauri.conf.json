@@ -50,6 +50,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
@@ -65,6 +66,15 @@
       "nsis": {
         "installMode": "currentUser",
         "languages": ["SimpChinese", "English"]
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": "",
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

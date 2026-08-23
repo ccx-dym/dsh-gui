@@ -24,6 +24,7 @@ tauri = { version = "=2.11.5", features = ["tray-icon"] }
 tauri-plugin-dialog = "=2.7.2"
 tauri-plugin-notification = "=2.3.3"
 tauri-plugin-single-instance = "=2.4.3"
+tauri-plugin-updater = "=2.10.1"
 thiserror = "=2.0.20"
 tokio = { version = "=1.53.1", default-features = false, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 url = "=2.5.8"
