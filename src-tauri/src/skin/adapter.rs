@@ -148,10 +148,11 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
     } else {
         let glass_blur_px = settings.glass_blur_px;
         let glass_filter = format!("blur({glass_blur_px}px) saturate(1.28)");
-        // 这些类名只属于经过版本门禁验证的 DSH 0.1.1-rc.2；背景染色可以分层，
-        // 但五个表面的标准与 WebKit 滤镜必须复用同一个半径。
+        // DSH 布局列包含 overflow:hidden，不能直接承载 backdrop-filter：该属性会让
+        // fixed 设置抽屉以窄列为包含块。滤镜统一放在正文后的全窗口遮罩层，各表面
+        // 只保留经过版本门禁验证的半透明染色和边缘装饰。
         format!(
-            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.50) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.74) !important;--dsw-specific-sidebar-fill:rgba({surface_rgb},0.18) !important;--dsh-desktop-border-opacity:0.58 !important}}.pI_x6G_centerCol,.pI_x6G_sidebarCol,.pI_x6G_detailsCol,[data-composer-card],#dsh-desktop-titlebar{{backdrop-filter:{glass_filter};-webkit-backdrop-filter:{glass_filter}}}.pI_x6G_centerCol{{background:rgba({surface_rgb},0.20) !important}}.pI_x6G_sidebarCol{{background:rgba({surface_rgb},0.30) !important;box-shadow:inset -1px 0 0 rgba(255,255,255,0.18),12px 0 36px rgba(0,0,0,0.12)}}.pI_x6G_detailsCol{{background:rgba({surface_rgb},0.34) !important;box-shadow:inset 1px 0 0 rgba(255,255,255,0.16),-12px 0 36px rgba(0,0,0,0.10)}}[data-composer-card]{{background:rgba({surface_rgb},0.36) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}#dsh-desktop-titlebar{{background:rgba({surface_rgb},0.24);border-bottom:1px solid rgba(255,255,255,0.42);box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 30px rgba(0,0,0,0.12)}}"#,
+            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.50) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.74) !important;--dsw-specific-sidebar-fill:rgba({surface_rgb},0.18) !important;--dsh-desktop-border-opacity:0.58 !important}}body::after{{backdrop-filter:{glass_filter};-webkit-backdrop-filter:{glass_filter}}}.pI_x6G_centerCol{{background:rgba({surface_rgb},0.20) !important}}.pI_x6G_sidebarCol{{background:rgba({surface_rgb},0.30) !important;box-shadow:inset -1px 0 0 rgba(255,255,255,0.18),12px 0 36px rgba(0,0,0,0.12)}}.pI_x6G_detailsCol{{background:rgba({surface_rgb},0.34) !important;box-shadow:inset 1px 0 0 rgba(255,255,255,0.16),-12px 0 36px rgba(0,0,0,0.10)}}[data-composer-card]{{background:rgba({surface_rgb},0.36) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}#dsh-desktop-titlebar{{background:rgba({surface_rgb},0.24);border-bottom:1px solid rgba(255,255,255,0.42);box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 30px rgba(0,0,0,0.12)}}"#,
         )
     };
 

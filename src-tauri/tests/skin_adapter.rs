@@ -318,6 +318,24 @@ fn positive_glass_blur_uses_one_radius_for_every_verified_surface() {
 }
 
 #[test]
+fn positive_glass_blur_keeps_fixed_overlays_out_of_clipped_layout_containers() {
+    let mut settings = fixture_settings();
+    settings.glass_blur_px = 16;
+    let css = execute_style_text(&settings);
+    let filter = "blur(16px) saturate(1.28)";
+
+    // DSH 的布局列使用 overflow:hidden；滤镜必须放在其背后的全窗口层，
+    // 否则浏览器会把列变为 fixed 子元素的包含块并挤压设置抽屉。
+    let glass_layer =
+        format!("body::after{{backdrop-filter:{filter};-webkit-backdrop-filter:{filter}}}");
+    assert!(css.contains(&glass_layer));
+    assert_eq!(css.matches("backdrop-filter:").count(), 2);
+    assert!(!css.contains(
+        ".pI_x6G_centerCol,.pI_x6G_sidebarCol,.pI_x6G_detailsCol,[data-composer-card],#dsh-desktop-titlebar{backdrop-filter"
+    ));
+}
+
+#[test]
 fn unsupported_or_disabled_state_generates_only_cleanup_script() {
     let script = cleanup_script();
     assert!(script.contains("dsh-desktop-skin-style"));
