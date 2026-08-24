@@ -114,6 +114,8 @@ pub enum DiagnosticStage {
     TrayRestart,
     UpdateProbe,
     UpdateCheck,
+    WindowChromeAction,
+    WindowChromeApply,
 }
 
 /// 可记录的有限错误类别白名单，不携带底层 source 或动态上下文。
@@ -432,6 +434,8 @@ fn is_persisted_stage(value: &str) -> bool {
             | "tray_restart"
             | "update_probe"
             | "update_check"
+            | "window_chrome_action"
+            | "window_chrome_apply"
     )
 }
 

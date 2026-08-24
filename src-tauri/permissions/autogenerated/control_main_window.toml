@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-control-main-window"
+description = "Enables the control_main_window command without any pre-configured scope."
+commands.allow = ["control_main_window"]
+
+[[permission]]
+identifier = "deny-control-main-window"
+description = "Denies the control_main_window command without any pre-configured scope."
+commands.deny = ["control_main_window"]
