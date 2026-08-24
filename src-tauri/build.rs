@@ -26,6 +26,7 @@ fn main() {
         "save_skin_settings",
         "reset_skin_settings",
         "report_skin_adapter",
+        "control_main_window",
     ];
     let attributes = tauri_build::Attributes::new()
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));

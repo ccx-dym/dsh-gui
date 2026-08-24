@@ -291,6 +291,39 @@ async fn under_limit_partial_jsonl_is_truncated_to_its_last_valid_line() {
 }
 
 #[tokio::test]
+async fn window_chrome_stages_survive_bounded_log_recovery() {
+    let directory = isolated_directory("window-chrome-recovery");
+    fs::create_dir_all(&directory).expect("应创建日志目录");
+    let slot = directory.join("diagnostics-0.jsonl");
+    let mut bytes = Vec::new();
+    for stage in [
+        DiagnosticStage::WindowChromeAction,
+        DiagnosticStage::WindowChromeApply,
+    ] {
+        bytes.extend(serde_json::to_vec(&event(stage, None)).expect("固定事件应可序列化"));
+        bytes.push(b'\n');
+    }
+    fs::write(&slot, bytes).expect("应预置窗口标题栏诊断");
+    let logger = DiagnosticLogger::new(
+        directory,
+        DiagnosticPolicy {
+            max_file_bytes: 1024,
+            slot_count: 2,
+        },
+    )
+    .expect("策略合法");
+
+    logger
+        .write(&event(DiagnosticStage::CompatibilityCheck, None))
+        .await
+        .expect("应保留合法窗口标题栏事件");
+
+    let repaired = fs::read_to_string(slot).expect("应读取修复后的槽位");
+    assert!(repaired.contains(r#""stage":"window_chrome_action""#));
+    assert!(repaired.contains(r#""stage":"window_chrome_apply""#));
+}
+
+#[tokio::test]
 async fn complete_json_with_a_non_generated_secret_trace_is_not_preserved() {
     let directory = isolated_directory("secret-trace-recovery");
     fs::create_dir_all(&directory).expect("应创建日志目录");

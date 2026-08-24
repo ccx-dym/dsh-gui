@@ -18,7 +18,8 @@
         "height": 780,
         "minWidth": 880,
         "minHeight": 600,
-        "resizable": true
+        "resizable": true,
+        "decorations": false
       },
       {
         "label": "updates",
@@ -44,7 +45,13 @@
       }
     ],
     "security": {
-      "capabilities": ["local-main", "local-appearance", "official-skin-report"],
+      "capabilities": [
+        "local-main",
+        "local-appearance",
+        "official-skin-report",
+        "main-window-chrome-local",
+        "main-window-chrome-remote"
+      ],
       "csp": "default-src 'self'; img-src 'self' data: dsh-skin: http://dsh-skin.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
     }
   },

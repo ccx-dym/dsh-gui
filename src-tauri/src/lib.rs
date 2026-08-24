@@ -135,15 +135,24 @@ pub fn run() {
                 return;
             }
             let app = webview.app_handle();
-            let Some(adapter) = app.try_state::<SkinAdapterController>() else {
-                return;
-            };
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 record_skin_stage(app, DiagnosticStage::SkinPageStarted, None);
-                adapter.navigation_started(payload.url());
+                if let Some(adapter) = app.try_state::<SkinAdapterController>() {
+                    adapter.navigation_started(payload.url());
+                }
                 return;
             }
             record_skin_stage(app, DiagnosticStage::SkinPageFinished, None);
+            if window_chrome::apply_to_main(webview).is_err() {
+                record_app_diagnostic(
+                    app,
+                    DiagnosticStage::WindowChromeApply,
+                    DiagnosticErrorKind::TauriError,
+                );
+            }
+            let Some(adapter) = app.try_state::<SkinAdapterController>() else {
+                return;
+            };
             let Some(skins) = app.try_state::<SkinController>() else {
                 return;
             };
@@ -208,6 +217,20 @@ pub fn run() {
             if !matches!(window.label(), "main" | "updates" | "appearance") {
                 return;
             }
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::Resized(_))
+                && let Some(main) = window.app_handle().get_webview_window("main")
+                && let Ok(maximized) = main.is_maximized()
+                && main
+                    .eval(window_chrome::sync_maximized_script(maximized))
+                    .is_err()
+            {
+                record_app_diagnostic(
+                    window.app_handle(),
+                    DiagnosticStage::WindowChromeApply,
+                    DiagnosticErrorKind::TauriError,
+                );
+            }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
@@ -266,6 +289,19 @@ pub(crate) fn record_skin_apply_diagnostic(app: &AppHandle) {
     record_app_diagnostic(
         app,
         DiagnosticStage::SkinApply,
+        DiagnosticErrorKind::TauriError,
+    );
+}
+
+/// 记录主窗口动作执行失败，不携带动作、URL 或底层错误正文。
+///
+/// :param app: 当前应用句柄，用于访问受控诊断 sink。
+/// :return: 无返回数据；记录操作不影响窗口状态。
+/// :raises: sink 缺失或异步写入失败时静默失败。
+pub(crate) fn record_window_chrome_action_diagnostic(app: &AppHandle) {
+    record_app_diagnostic(
+        app,
+        DiagnosticStage::WindowChromeAction,
         DiagnosticErrorKind::TauriError,
     );
 }

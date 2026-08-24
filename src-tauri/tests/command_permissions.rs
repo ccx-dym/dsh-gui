@@ -265,3 +265,61 @@ fn successful_skin_mutations_refresh_main_without_exposing_more_commands() {
     let adapter = include_str!("../src/skin/adapter.rs");
     assert!(adapter.contains("crate::record_skin_apply_diagnostic(&app)"));
 }
+
+#[test]
+fn only_main_is_frameless_and_window_control_has_two_narrow_capabilities() {
+    let config: Value =
+        serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config");
+    let windows = config["app"]["windows"].as_array().expect("windows");
+    let main = windows
+        .iter()
+        .find(|item| item["label"] == "main")
+        .expect("main window");
+    let updates = windows
+        .iter()
+        .find(|item| item["label"] == "updates")
+        .expect("updates window");
+    let appearance = windows
+        .iter()
+        .find(|item| item["label"] == "appearance")
+        .expect("appearance window");
+
+    assert_eq!(main["decorations"], false);
+    assert!(updates.get("decorations").is_none());
+    assert!(appearance.get("decorations").is_none());
+    let enabled = config["app"]["security"]["capabilities"]
+        .as_array()
+        .expect("enabled capabilities");
+    for identifier in [
+        "main-window-chrome-local",
+        "main-window-chrome-remote",
+    ] {
+        assert!(enabled.iter().any(|value| value == identifier));
+    }
+
+    let local: Value = serde_json::from_str(include_str!(
+        "../capabilities/main-window-chrome-local.json"
+    ))
+    .expect("local chrome capability");
+    let remote: Value = serde_json::from_str(include_str!(
+        "../capabilities/main-window-chrome-remote.json"
+    ))
+    .expect("remote chrome capability");
+    assert_eq!(local["local"], true);
+    assert_eq!(local["windows"], serde_json::json!(["main"]));
+    assert_eq!(remote["local"], false);
+    assert_eq!(remote["windows"], serde_json::json!(["main"]));
+    assert_eq!(
+        remote["remote"]["urls"],
+        serde_json::json!(["http://127.0.0.1:*"])
+    );
+    assert_eq!(
+        local["permissions"],
+        serde_json::json!(["allow-control-main-window"])
+    );
+    assert_eq!(
+        remote["permissions"],
+        serde_json::json!(["allow-control-main-window"])
+    );
+    assert!(include_str!("../build.rs").contains("\"control_main_window\""));
+}
