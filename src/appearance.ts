@@ -74,6 +74,8 @@ interface AppearanceViewRefs {
   tone: HTMLSelectElement;
   blur: HTMLInputElement;
   blurOutput: HTMLOutputElement;
+  glassBlur: HTMLInputElement;
+  glassBlurOutput: HTMLOutputElement;
   mask: HTMLInputElement;
   maskOutput: HTMLOutputElement;
   imageOpacity: HTMLInputElement;
@@ -83,6 +85,10 @@ interface AppearanceViewRefs {
   save: HTMLButtonElement;
   reset: HTMLButtonElement;
 }
+
+type WebkitBackdropStyle = CSSStyleDeclaration & {
+  webkitBackdropFilter: string;
+};
 
 const appearanceViews = new WeakMap<HTMLElement, AppearanceViewRefs>();
 const activeDisposers = new WeakMap<HTMLElement, () => void>();
@@ -117,7 +123,7 @@ function createSlider(
   const output = document.createElement("output");
   output.setAttribute("for", id);
   output.textContent = `${value}%`;
-  if (action === "blur") output.textContent = `${value}px`;
+  if (action === "blur" || action === "glass-blur") output.textContent = `${value}px`;
   const input = document.createElement("input");
   input.id = id;
   input.type = "range";
@@ -165,6 +171,23 @@ function patchAppearanceView(
   // hidden 同时关闭背景本体及其遮罩伪元素，不留下半透明覆盖层。
   refs.background.hidden = !state.draft.immersive;
   refs.content.style.filter = "";
+  const glassBlur = state.draft.glassBlurPx;
+  if (glassBlur === 0) {
+    refs.content.style.removeProperty("backdrop-filter");
+    (refs.content.style as WebkitBackdropStyle).webkitBackdropFilter = "";
+    refs.content.style.background = "transparent";
+    refs.content.style.boxShadow = "none";
+  } else {
+    const glassFilter = `blur(${glassBlur}px) saturate(1.28)`;
+    refs.content.style.setProperty("backdrop-filter", glassFilter);
+    (refs.content.style as WebkitBackdropStyle).webkitBackdropFilter = glassFilter;
+    refs.content.style.background =
+      state.draft.maskTone === "dark"
+        ? "rgba(22, 28, 38, 0.36)"
+        : "rgba(255, 255, 255, 0.36)";
+    refs.content.style.boxShadow =
+      "inset 0 1px 0 rgba(255, 255, 255, 0.20), 0 18px 48px rgba(0, 0, 0, 0.18)";
+  }
 
   refs.immersive.checked = state.draft.immersive;
   refs.fit.value = state.draft.fit;
@@ -172,6 +195,8 @@ function patchAppearanceView(
   refs.tone.value = state.draft.maskTone;
   refs.blur.value = String(state.draft.blurPx);
   refs.blurOutput.textContent = `${state.draft.blurPx}px`;
+  refs.glassBlur.value = String(state.draft.glassBlurPx);
+  refs.glassBlurOutput.textContent = `${state.draft.glassBlurPx}px`;
   refs.mask.value = String(state.draft.maskOpacityPercent);
   refs.maskOutput.textContent = `${state.draft.maskOpacityPercent}%`;
   refs.imageOpacity.value = String(state.draft.imageOpacityPercent);
@@ -361,6 +386,14 @@ export function renderAppearance(
     fitField,
     positionField,
     createSlider("skin-blur", "背景模糊", state.draft.blurPx, 0, 32, "blur"),
+    createSlider(
+      "skin-glass-blur",
+      "毛玻璃强度",
+      state.draft.glassBlurPx,
+      0,
+      32,
+      "glass-blur",
+    ),
     toneField,
     createSlider("skin-mask", "遮罩强度", state.draft.maskOpacityPercent, 0, 80, "mask"),
     createSlider(
@@ -390,6 +423,8 @@ export function renderAppearance(
     tone,
     blur: root.querySelector<HTMLInputElement>("#skin-blur")!,
     blurOutput: root.querySelector<HTMLOutputElement>("output[for='skin-blur']")!,
+    glassBlur: root.querySelector<HTMLInputElement>("#skin-glass-blur")!,
+    glassBlurOutput: root.querySelector<HTMLOutputElement>("output[for='skin-glass-blur']")!,
     mask: root.querySelector<HTMLInputElement>("#skin-mask")!,
     maskOutput: root.querySelector<HTMLOutputElement>("output[for='skin-mask']")!,
     imageOpacity: root.querySelector<HTMLInputElement>("#skin-image-opacity")!,
@@ -437,6 +472,9 @@ export async function initializeAppearance(
     if (!(event.target instanceof HTMLInputElement)) return;
     const value = Number(event.target.value);
     if (event.target.dataset.control === "blur") dispatch({ type: "visuals", blurPx: value });
+    if (event.target.dataset.control === "glass-blur") {
+      dispatch({ type: "visuals", glassBlurPx: value });
+    }
     if (event.target.dataset.control === "mask") dispatch({ type: "visuals", maskOpacityPercent: value });
     if (event.target.dataset.control === "image-opacity") {
       dispatch({ type: "visuals", imageOpacityPercent: value });

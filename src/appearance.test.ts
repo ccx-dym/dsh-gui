@@ -15,6 +15,7 @@ const envelope = {
     fit: "cover" as const,
     position: "center" as const,
     blur_px: 12,
+    glass_blur_px: 0,
     mask_tone: "dark" as const,
     mask_opacity_percent: 34,
     panel_opacity_percent: 82,
@@ -107,6 +108,40 @@ describe("外观设置", () => {
     expect(root.querySelector("output[for='skin-image-opacity']")?.textContent).toBe("82%");
   });
 
+  it("毛玻璃滑块使用 0 到 32px 并只实时模糊稳定内容层", async () => {
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const dispose = await initializeAppearance(root, bridge());
+    const slider = root.querySelector<HTMLInputElement>("#skin-glass-blur")!;
+    const output = root.querySelector<HTMLOutputElement>("output[for='skin-glass-blur']")!;
+    const background = root.querySelector<HTMLElement>("[data-skin-background]")!;
+    const content = root.querySelector<HTMLElement>("[data-skin-preview-content]")!;
+
+    expect(root.querySelector("label[for='skin-glass-blur']")?.textContent).toBe("毛玻璃强度");
+    expect(slider.min).toBe("0");
+    expect(slider.max).toBe("32");
+    expect(slider.step).toBe("1");
+    expect(output.textContent).toBe("0px");
+    expect(content.style.getPropertyValue("backdrop-filter")).toBe("");
+    expect(content.style.boxShadow).toBe("none");
+
+    slider.focus();
+    slider.value = "16";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(root.querySelector("#skin-glass-blur")).toBe(slider);
+    expect(document.activeElement).toBe(slider);
+    expect(output.textContent).toBe("16px");
+    expect(content.style.getPropertyValue("backdrop-filter")).toBe("blur(16px) saturate(1.28)");
+    expect(
+      (content.style as CSSStyleDeclaration & { webkitBackdropFilter: string })
+        .webkitBackdropFilter,
+    ).toBe("blur(16px) saturate(1.28)");
+    expect(content.style.boxShadow).not.toBe("none");
+    expect(background.style.filter).toBe("blur(12px)");
+    expect(root.querySelectorAll("[data-skin-background]")).toHaveLength(1);
+    dispose();
+  });
+
   it("图片不透明度实时只作用于背景图片层", async () => {
     const root = document.querySelector<HTMLElement>("#app")!;
     const dispose = await initializeAppearance(root, bridge());
@@ -191,7 +226,11 @@ describe("外观设置", () => {
     expect(invoke.mock.calls.filter(([name]) => name === "save_skin_settings")).toHaveLength(1);
     expect(invoke).toHaveBeenCalledWith("save_skin_settings", {
       expectedRevision: 2,
-      draft: expect.objectContaining({ blur_px: 12, panel_opacity_percent: 82 }),
+      draft: expect.objectContaining({
+        blur_px: 12,
+        glass_blur_px: 0,
+        panel_opacity_percent: 82,
+      }),
     });
     expect(root.querySelector<HTMLButtonElement>("[data-action='save']")?.disabled).toBe(true);
     finish?.(envelope);

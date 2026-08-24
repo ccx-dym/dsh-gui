@@ -316,6 +316,7 @@ describe("启动页", () => {
             fit: "cover",
             position: "center",
             blur_px: 0,
+            glass_blur_px: 0,
             mask_tone: "light",
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,

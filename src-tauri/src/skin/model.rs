@@ -80,6 +80,8 @@ pub struct SkinDraft {
     pub fit: SkinFit,
     pub position: SkinPosition,
     pub blur_px: u8,
+    /// DSH 内容表面对唯一背景图应用的毛玻璃模糊半径。
+    pub glass_blur_px: u8,
     pub mask_tone: MaskTone,
     pub mask_opacity_percent: u8,
     /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
@@ -95,6 +97,8 @@ pub struct SkinSettings {
     pub fit: SkinFit,
     pub position: SkinPosition,
     pub blur_px: u8,
+    /// DSH 内容表面对唯一背景图应用的毛玻璃模糊半径。
+    pub glass_blur_px: u8,
     pub mask_tone: MaskTone,
     pub mask_opacity_percent: u8,
     /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
@@ -109,6 +113,7 @@ impl Default for SkinSettings {
             fit: SkinFit::Cover,
             position: SkinPosition::Center,
             blur_px: 0,
+            glass_blur_px: 0,
             mask_tone: MaskTone::Light,
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,
@@ -124,6 +129,7 @@ impl From<SkinDraft> for SkinSettings {
             fit: value.fit,
             position: value.position,
             blur_px: value.blur_px,
+            glass_blur_px: value.glass_blur_px,
             mask_tone: value.mask_tone,
             mask_opacity_percent: value.mask_opacity_percent,
             panel_opacity_percent: value.panel_opacity_percent,

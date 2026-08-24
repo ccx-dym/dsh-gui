@@ -1,4 +1,4 @@
-use super::model::{SkinDraft, SkinSettings, SkinStateEnvelope};
+use super::model::{MaskTone, SkinDraft, SkinFit, SkinPosition, SkinSettings, SkinStateEnvelope};
 use crate::runtime::atomic_file::replace_file;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
+const LEGACY_SCHEMA_VERSION: u8 = 1;
 const MAX_BLUR_PX: u8 = 32;
+const MAX_GLASS_BLUR_PX: u8 = 32;
 const MAX_MASK_OPACITY_PERCENT: u8 = 80;
 const MAX_IMAGE_OPACITY_PERCENT: u8 = 100;
 const DIGEST_LENGTH: usize = 64;
@@ -88,6 +90,27 @@ struct PersistedSkinState {
     schema: u8,
     revision: u64,
     settings: SkinSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedSkinStateV1 {
+    schema: u8,
+    revision: u64,
+    settings: SkinSettingsV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkinSettingsV1 {
+    immersive: bool,
+    image_digest: Option<String>,
+    fit: SkinFit,
+    position: SkinPosition,
+    blur_px: u8,
+    mask_tone: MaskTone,
+    mask_opacity_percent: u8,
+    panel_opacity_percent: u8,
 }
 
 #[derive(Debug)]
@@ -175,6 +198,7 @@ impl SkinStore {
                 fit: defaults.fit,
                 position: defaults.position,
                 blur_px: defaults.blur_px,
+                glass_blur_px: defaults.glass_blur_px,
                 mask_tone: defaults.mask_tone,
                 mask_opacity_percent: defaults.mask_opacity_percent,
                 panel_opacity_percent: defaults.panel_opacity_percent,
@@ -199,14 +223,46 @@ impl SkinStore {
             }
         };
         let bytes = read_settings_bounded(&mut target_guard)?;
-        let persisted: PersistedSkinState =
+        // 先只读取版本分派，再对目标 DTO 做严格反序列化；这样旧版可迁移，
+        // 新版缺字段或任一版本出现未知字段时仍会失败关闭。
+        let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| SkinError::CorruptSettings)?;
-        if persisted.schema != SCHEMA_VERSION {
-            return Err(SkinError::CorruptSettings);
-        }
-        let envelope = SkinStateEnvelope {
-            revision: persisted.revision,
-            settings: persisted.settings,
+        let schema = value
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(SkinError::CorruptSettings)?;
+        let envelope = match schema {
+            schema if schema == u64::from(LEGACY_SCHEMA_VERSION) => {
+                let PersistedSkinStateV1 {
+                    schema,
+                    revision,
+                    settings,
+                } = serde_json::from_value(value).map_err(|_| SkinError::CorruptSettings)?;
+                debug_assert_eq!(schema, LEGACY_SCHEMA_VERSION);
+                SkinStateEnvelope {
+                    revision,
+                    settings: SkinSettings {
+                        immersive: settings.immersive,
+                        image_digest: settings.image_digest,
+                        fit: settings.fit,
+                        position: settings.position,
+                        blur_px: settings.blur_px,
+                        glass_blur_px: 0,
+                        mask_tone: settings.mask_tone,
+                        mask_opacity_percent: settings.mask_opacity_percent,
+                        panel_opacity_percent: settings.panel_opacity_percent,
+                    },
+                }
+            }
+            schema if schema == u64::from(SCHEMA_VERSION) => {
+                let persisted: PersistedSkinState =
+                    serde_json::from_value(value).map_err(|_| SkinError::CorruptSettings)?;
+                SkinStateEnvelope {
+                    revision: persisted.revision,
+                    settings: persisted.settings,
+                }
+            }
+            _ => return Err(SkinError::CorruptSettings),
         };
         self.validate_loaded_settings(&envelope.settings)?;
         Ok(LoadedSkinState {
@@ -230,6 +286,7 @@ impl SkinStore {
             settings.immersive,
             settings.image_digest.as_deref(),
             settings.blur_px,
+            settings.glass_blur_px,
             settings.mask_opacity_percent,
             settings.panel_opacity_percent,
         )
@@ -240,6 +297,7 @@ impl SkinStore {
             draft.immersive,
             draft.image_digest.as_deref(),
             draft.blur_px,
+            draft.glass_blur_px,
             draft.mask_opacity_percent,
             draft.panel_opacity_percent,
         )
@@ -250,10 +308,12 @@ impl SkinStore {
         immersive: bool,
         image_digest: Option<&str>,
         blur_px: u8,
+        glass_blur_px: u8,
         mask_opacity_percent: u8,
         panel_opacity_percent: u8,
     ) -> Result<(), SkinError> {
         if blur_px > MAX_BLUR_PX
+            || glass_blur_px > MAX_GLASS_BLUR_PX
             || mask_opacity_percent > MAX_MASK_OPACITY_PERCENT
             // schema 1 的字段名为 panel_opacity_percent；新版本保留该键并将其解释为图片透明度。
             || panel_opacity_percent > MAX_IMAGE_OPACITY_PERCENT

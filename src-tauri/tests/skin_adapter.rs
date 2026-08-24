@@ -21,10 +21,46 @@ fn fixture_settings() -> SkinSettings {
         fit: SkinFit::Cover,
         position: SkinPosition::Center,
         blur_px: 12,
+        glass_blur_px: 0,
         mask_tone: MaskTone::Light,
         mask_opacity_percent: 22,
         panel_opacity_percent: 88,
     }
+}
+
+fn execute_style_text(settings: &SkinSettings) -> String {
+    let script = adapter_script(settings).expect("沉浸皮肤应生成脚本");
+    let harness = format!(
+        r#"const inserted=[];
+const root={{}};
+global.requestAnimationFrame=(callback)=>{{callback();return 1;}};
+global.document={{
+  getElementById:()=>null,
+  querySelector:()=>root,
+  createElement:(tag)=>({{id:'',style:{{cssText:''}},setAttribute:()=>{{}},textContent:'',tag}}),
+  documentElement:{{prepend:(node)=>inserted.push(node)}},
+  head:{{append:(node)=>inserted.push(node)}}
+}};
+global.getComputedStyle=()=>({{getPropertyValue:()=> '#151517'}});
+global.location={{protocol:'http:',hostname:'127.0.0.1',port:'43127'}};
+global.__TAURI_INTERNALS__={{invoke:()=>Promise.resolve()}};
+{script}
+const style=inserted.find((node)=>node.tag==='style');
+console.log(style?.textContent??'NO_STYLE');"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("前端工具链必须提供 node");
+    assert!(
+        output.status.success(),
+        "Node harness 执行失败: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("CSS 输出必须是 UTF-8")
+        .trim()
+        .to_owned()
 }
 
 #[test]
@@ -159,11 +195,7 @@ fn script_checks_dom_before_painting_the_page_canvas() {
     assert!(script.contains("filter:blur(12px)"));
     assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
     assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
-    assert!(script.contains("--dsw-specific-sidebar-fill:transparent !important"));
-    assert!(script.contains("[data-composer-card]{background:transparent !important}"));
     assert!(!script.contains("--dsw-specific-input-major:transparent"));
-    assert!(script.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
-    assert!(script.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.88) !important"));
     assert!(script.contains("dsh-desktop-skin-background"));
     assert_eq!(script.matches("createElement('div')").count(), 1);
     assert!(!script.contains("fetch("));
@@ -244,6 +276,41 @@ console.log(style?.textContent??'NO_STYLE');"#
     assert!(css.contains("opacity:0.37"));
     assert!(!css.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.37)"));
     assert!(!css.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.37)"));
+}
+
+#[test]
+fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
+    let mut settings = fixture_settings();
+    settings.glass_blur_px = 0;
+    let css = execute_style_text(&settings);
+
+    assert_eq!(css.matches("http://dsh-skin.localhost/").count(), 1);
+    assert!(!css.contains("backdrop-filter"));
+    assert!(!css.contains(".pI_x6G_centerCol{"));
+    assert!(!css.contains("box-shadow:inset"));
+    assert!(css.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
+}
+
+#[test]
+fn positive_glass_blur_uses_one_radius_for_every_verified_surface() {
+    for radius in [1, 16, 32] {
+        let mut settings = fixture_settings();
+        settings.glass_blur_px = radius;
+        let css = execute_style_text(&settings);
+
+        for selector in [
+            ".pI_x6G_centerCol",
+            ".pI_x6G_sidebarCol",
+            ".pI_x6G_detailsCol",
+            "[data-composer-card]",
+            "#dsh-desktop-titlebar",
+        ] {
+            assert!(css.contains(selector), "缺少选择器 {selector}");
+        }
+        let filter = format!("blur({radius}px) saturate(1.28)");
+        assert_eq!(css.matches(&filter).count(), 2);
+        assert_eq!(css.matches("http://dsh-skin.localhost/").count(), 1);
+    }
 }
 
 #[test]

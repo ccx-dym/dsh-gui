@@ -139,17 +139,33 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
         r#"body::before{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:url("http://dsh-skin.localhost/{digest}");background-repeat:no-repeat;background-size:{background_size};background-position:{background_position};filter:blur({blur}px);transform:scale({blur_scale:.3});transform-origin:center;opacity:{image_opacity:.2};will-change:transform,opacity}}body::after{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:rgba({mask_rgb},{mask_opacity:.2})}}"#,
         blur = settings.blur_px,
     );
+    // 零值精确保留实验前的透明皮肤层级；只有正值才增加玻璃滤镜和装饰，
+    // 因此升级旧设置不会在未授权保存时改变主窗口视觉。
+    let glass_surfaces = if settings.glass_blur_px == 0 {
+        format!(
+            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.88) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.88) !important;--dsw-specific-sidebar-fill:transparent !important;--dsh-desktop-border-opacity:0.88 !important}}[data-composer-card]{{background:transparent !important}}"#,
+        )
+    } else {
+        let glass_blur_px = settings.glass_blur_px;
+        let glass_filter = format!("blur({glass_blur_px}px) saturate(1.28)");
+        // 这些类名只属于经过版本门禁验证的 DSH 0.1.1-rc.2；背景染色可以分层，
+        // 但五个表面的标准与 WebKit 滤镜必须复用同一个半径。
+        format!(
+            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.50) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.74) !important;--dsw-specific-sidebar-fill:rgba({surface_rgb},0.18) !important;--dsh-desktop-border-opacity:0.58 !important}}.pI_x6G_centerCol,.pI_x6G_sidebarCol,.pI_x6G_detailsCol,[data-composer-card],#dsh-desktop-titlebar{{backdrop-filter:{glass_filter};-webkit-backdrop-filter:{glass_filter}}}.pI_x6G_centerCol{{background:rgba({surface_rgb},0.20) !important}}.pI_x6G_sidebarCol{{background:rgba({surface_rgb},0.30) !important;box-shadow:inset -1px 0 0 rgba(255,255,255,0.18),12px 0 36px rgba(0,0,0,0.12)}}.pI_x6G_detailsCol{{background:rgba({surface_rgb},0.34) !important;box-shadow:inset 1px 0 0 rgba(255,255,255,0.16),-12px 0 36px rgba(0,0,0,0.10)}}[data-composer-card]{{background:rgba({surface_rgb},0.36) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}#dsh-desktop-titlebar{{background:rgba({surface_rgb},0.24);border-bottom:1px solid rgba(255,255,255,0.42);box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 30px rgba(0,0,0,0.12)}}"#,
+        )
+    };
 
     // DSH 的 PageLoad::Finished 早于 React 主题挂载，因此在有限帧数内只读重试 DOM
     // 合约。页面令牌同时写入进程内页面全局，避免旧导航的延迟回调覆盖新页面。
     let script = format!(
-        r#"(()=>{{'use strict';const A='{adapter}',T={page_token},S='{style_id}',B='{background_id}',K='__DSH_DESKTOP_SKIN_PENDING__',V=['--dsw-alias-bg-base','--dsw-alias-bg-layer-1','--dsw-alias-bg-layer-2'],M=600;let n=0;const clean=()=>{{document.getElementById(S)?.remove();document.getElementById(B)?.remove();}};const report=(compatible)=>{{const invoke=globalThis.__TAURI_INTERNALS__?.invoke;if(typeof invoke==='function'){{const result=invoke('report_skin_adapter',{{adapterVersion:A,pageToken:T,compatible}});if(result&&typeof result.catch==='function'){{void result.catch(()=>{{}});}}}}}};const fail=()=>{{if(globalThis[K]!==T)return;delete globalThis[K];try{{clean();}}catch(_cleanupError){{}}try{{report(false);}}catch(_reportError){{}}}};const apply=()=>{{if(globalThis[K]!==T)return;try{{const root=document.querySelector('#root');const css=root?getComputedStyle(root):null;if(!root||!css||V.some((name)=>css.getPropertyValue(name).trim()==='')){{n+=1;if(n<M){{requestAnimationFrame(apply);}}else{{fail();}}return;}}clean();const bg=document.createElement('div');bg.id=B;bg.setAttribute('aria-hidden','true');bg.style.cssText='display:none';const style=document.createElement('style');style.id=S;style.textContent='html,#root{{background:transparent !important}}body{{background-color:rgb({surface_rgb}) !important;background-image:none !important}}{background_layers}#root{{position:relative;z-index:1;min-height:100vh}}:root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.88) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.88) !important;--dsw-specific-sidebar-fill:transparent !important;--dsh-desktop-border-opacity:0.88 !important}}[data-composer-card]{{background:transparent !important}}';document.documentElement.prepend(bg);document.head.append(style);delete globalThis[K];report(true);}}catch(_error){{fail();}}}};try{{clean();const originOk=location.protocol==='http:'&&location.hostname==='127.0.0.1'&&location.port!=='';if(!originOk){{report(false);return;}}globalThis[K]=T;apply();}}catch(_error){{fail();}}}})();"#,
+        r#"(()=>{{'use strict';const A='{adapter}',T={page_token},S='{style_id}',B='{background_id}',K='__DSH_DESKTOP_SKIN_PENDING__',V=['--dsw-alias-bg-base','--dsw-alias-bg-layer-1','--dsw-alias-bg-layer-2'],M=600;let n=0;const clean=()=>{{document.getElementById(S)?.remove();document.getElementById(B)?.remove();}};const report=(compatible)=>{{const invoke=globalThis.__TAURI_INTERNALS__?.invoke;if(typeof invoke==='function'){{const result=invoke('report_skin_adapter',{{adapterVersion:A,pageToken:T,compatible}});if(result&&typeof result.catch==='function'){{void result.catch(()=>{{}});}}}}}};const fail=()=>{{if(globalThis[K]!==T)return;delete globalThis[K];try{{clean();}}catch(_cleanupError){{}}try{{report(false);}}catch(_reportError){{}}}};const apply=()=>{{if(globalThis[K]!==T)return;try{{const root=document.querySelector('#root');const css=root?getComputedStyle(root):null;if(!root||!css||V.some((name)=>css.getPropertyValue(name).trim()==='')){{n+=1;if(n<M){{requestAnimationFrame(apply);}}else{{fail();}}return;}}clean();const bg=document.createElement('div');bg.id=B;bg.setAttribute('aria-hidden','true');bg.style.cssText='display:none';const style=document.createElement('style');style.id=S;style.textContent='html,#root{{background:transparent !important}}body{{background-color:rgb({surface_rgb}) !important;background-image:none !important}}{background_layers}#root{{position:relative;z-index:1;min-height:100vh}}{glass_surfaces}';document.documentElement.prepend(bg);document.head.append(style);delete globalThis[K];report(true);}}catch(_error){{fail();}}}};try{{clean();const originOk=location.protocol==='http:'&&location.hostname==='127.0.0.1'&&location.port!=='';if(!originOk){{report(false);return;}}globalThis[K]=T;apply();}}catch(_error){{fail();}}}})();"#,
         adapter = DSH_ADAPTER_V1,
         page_token = page_token,
         style_id = STYLE_ID,
         background_id = BACKGROUND_ID,
         surface_rgb = surface_rgb,
         background_layers = background_layers,
+        glass_surfaces = glass_surfaces,
     );
     Some(script)
 }

@@ -30,6 +30,7 @@ fn valid_draft() -> SkinDraft {
         fit: SkinFit::Cover,
         position: SkinPosition::Center,
         blur_px: 12,
+        glass_blur_px: 0,
         mask_tone: MaskTone::Light,
         mask_opacity_percent: 24,
         panel_opacity_percent: 86,
@@ -66,6 +67,15 @@ fn valid_settings_json() -> serde_json::Value {
     })
 }
 
+fn valid_settings_v2_json() -> serde_json::Value {
+    let mut settings = valid_settings_json();
+    settings
+        .as_object_mut()
+        .expect("设置夹具应为对象")
+        .insert("glass_blur_px".to_owned(), serde_json::json!(0));
+    settings
+}
+
 #[test]
 fn defaults_are_non_immersive_and_bounded() {
     let settings = SkinSettings::default();
@@ -75,6 +85,128 @@ fn defaults_are_non_immersive_and_bounded() {
     assert_eq!(settings.blur_px, 0);
     assert_eq!(settings.mask_opacity_percent, 22);
     assert_eq!(settings.panel_opacity_percent, 88);
+}
+
+#[test]
+fn glass_blur_defaults_to_zero_and_rejects_values_above_32px() {
+    let settings = SkinSettings::default();
+    assert_eq!(settings.glass_blur_px, 0);
+
+    let (store, _) = fixture_store("glass-blur-range");
+    let accepted = store
+        .save(
+            0,
+            SkinDraft {
+                glass_blur_px: 32,
+                ..valid_draft()
+            },
+        )
+        .expect("32px 应处于闭区间内");
+    assert_eq!(accepted.settings.glass_blur_px, 32);
+
+    let error = store
+        .save(
+            accepted.revision,
+            SkinDraft {
+                glass_blur_px: 33,
+                ..valid_draft()
+            },
+        )
+        .expect_err("33px 必须被拒绝");
+    assert_eq!(error.kind(), SkinErrorKind::InvalidSettings);
+}
+
+#[test]
+fn schema_one_loads_without_writing_and_next_save_upgrades_to_schema_two() {
+    let (store, root) = fixture_store("schema-one-migration");
+    let path = root.join("settings").join("skin.json");
+    fs::write(&path, persisted_json(7, valid_settings_json())).expect("应写入 schema 1 夹具");
+
+    let loaded = store.load().expect("schema 1 应迁移到内存");
+    assert_eq!(loaded.revision, 7);
+    assert_eq!(loaded.settings.glass_blur_px, 0);
+    let disk_before_save: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("应读取旧设置")).expect("应解析旧设置");
+    assert_eq!(disk_before_save["schema"], 1);
+
+    let settings = loaded.settings;
+    store
+        .save(
+            loaded.revision,
+            SkinDraft {
+                immersive: settings.immersive,
+                image_digest: settings.image_digest,
+                fit: settings.fit,
+                position: settings.position,
+                blur_px: settings.blur_px,
+                glass_blur_px: settings.glass_blur_px,
+                mask_tone: settings.mask_tone,
+                mask_opacity_percent: settings.mask_opacity_percent,
+                panel_opacity_percent: settings.panel_opacity_percent,
+            },
+        )
+        .expect("显式保存应升级设置");
+
+    let disk_after_save: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("应读取新设置")).expect("应解析新设置");
+    assert_eq!(disk_after_save["schema"], 2);
+    assert_eq!(disk_after_save["settings"]["glass_blur_px"], 0);
+}
+
+#[test]
+fn schema_two_requires_a_bounded_integer_glass_blur_without_unknown_fields() {
+    let cases = [
+        ("missing", {
+            let mut settings = valid_settings_v2_json();
+            settings
+                .as_object_mut()
+                .expect("设置夹具应为对象")
+                .remove("glass_blur_px");
+            settings
+        }),
+        ("unknown", {
+            let mut settings = valid_settings_v2_json();
+            settings
+                .as_object_mut()
+                .expect("设置夹具应为对象")
+                .insert("unexpected".to_owned(), serde_json::json!(true));
+            settings
+        }),
+        ("negative", {
+            let mut settings = valid_settings_v2_json();
+            settings["glass_blur_px"] = serde_json::json!(-1);
+            settings
+        }),
+        ("fraction", {
+            let mut settings = valid_settings_v2_json();
+            settings["glass_blur_px"] = serde_json::json!(1.5);
+            settings
+        }),
+        ("above-maximum", {
+            let mut settings = valid_settings_v2_json();
+            settings["glass_blur_px"] = serde_json::json!(33);
+            settings
+        }),
+    ];
+
+    for (name, settings) in cases {
+        let (store, root) = fixture_store(name);
+        fs::write(
+            root.join("settings").join("skin.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 2,
+                "revision": 4,
+                "settings": settings,
+            }))
+            .expect("应编码 schema 2 夹具"),
+        )
+        .expect("应写入 schema 2 夹具");
+        assert_eq!(
+            store.load().expect_err("无效 schema 2 必须失败关闭").kind(),
+            SkinErrorKind::CorruptSettings,
+            "case: {name}",
+        );
+    }
 }
 
 #[test]
@@ -105,6 +237,7 @@ fn reset_changes_only_the_pointer_and_keeps_imported_files() {
     assert_eq!(reset.revision, 2);
     assert!(!reset.settings.immersive);
     assert!(reset.settings.image_digest.is_none());
+    assert_eq!(reset.settings.glass_blur_px, 0);
     assert!(image.exists(), "恢复默认不得删除历史图片");
 }
 

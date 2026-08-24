@@ -18,6 +18,7 @@ export interface SkinSettingsWire {
   fit: SkinFit;
   position: SkinPosition;
   blur_px: number;
+  glass_blur_px: number;
   mask_tone: MaskTone;
   mask_opacity_percent: number;
   panel_opacity_percent: number;
@@ -43,6 +44,7 @@ export interface SkinDraft {
   fit: SkinFit;
   position: SkinPosition;
   blurPx: number;
+  glassBlurPx: number;
   maskTone: MaskTone;
   maskOpacityPercent: number;
   imageOpacityPercent: number;
@@ -66,6 +68,7 @@ export type SkinDraftAction =
   | {
       type: "visuals";
       blurPx?: number;
+      glassBlurPx?: number;
       maskOpacityPercent?: number;
       imageOpacityPercent?: number;
     }
@@ -93,6 +96,7 @@ function draftFromWire(settings: SkinSettingsWire): SkinDraft {
     fit: settings.fit,
     position: settings.position,
     blurPx: clampInteger(settings.blur_px, 0, 32),
+    glassBlurPx: clampInteger(settings.glass_blur_px, 0, 32),
     maskTone: settings.mask_tone,
     maskOpacityPercent: clampInteger(settings.mask_opacity_percent, 0, 80),
     // 保留旧 wire 字段名以兼容已经落盘的 schema 1 设置，领域语义改为图片不透明度。
@@ -107,6 +111,7 @@ export function skinDraftToWire(draft: SkinDraft): SkinSettingsWire {
     fit: draft.fit,
     position: draft.position,
     blur_px: clampInteger(draft.blurPx, 0, 32),
+    glass_blur_px: clampInteger(draft.glassBlurPx, 0, 32),
     mask_tone: draft.maskTone,
     mask_opacity_percent: clampInteger(draft.maskOpacityPercent, 0, 80),
     panel_opacity_percent: clampInteger(draft.imageOpacityPercent, 0, 100),
@@ -150,6 +155,10 @@ export function reduceSkinDraft(
             action.blurPx === undefined
               ? state.draft.blurPx
               : clampInteger(action.blurPx, 0, 32),
+          glassBlurPx:
+            action.glassBlurPx === undefined
+              ? state.draft.glassBlurPx
+              : clampInteger(action.glassBlurPx, 0, 32),
           maskOpacityPercent:
             action.maskOpacityPercent === undefined
               ? state.draft.maskOpacityPercent

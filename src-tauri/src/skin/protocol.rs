@@ -730,6 +730,7 @@ mod tests {
             fit: SkinFit::Cover,
             position: SkinPosition::Center,
             blur_px: 0,
+            glass_blur_px: 0,
             mask_tone: MaskTone::Light,
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,

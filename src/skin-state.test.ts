@@ -14,6 +14,7 @@ const savedEnvelope: SkinStateEnvelopeWire = {
     fit: "cover",
     position: "center",
     blur_px: 0,
+    glass_blur_px: 0,
     mask_tone: "light",
     mask_opacity_percent: 22,
     panel_opacity_percent: 88,
@@ -25,11 +26,13 @@ describe("皮肤草稿 reducer", () => {
     const state = reduceSkinDraft(createInitialSkinState(savedEnvelope), {
       type: "visuals",
       blurPx: 99.8,
+      glassBlurPx: 99.8,
       maskOpacityPercent: -4,
       imageOpacityPercent: -1,
     });
 
     expect(state.draft.blurPx).toBe(32);
+    expect(state.draft.glassBlurPx).toBe(32);
     expect(state.draft.maskOpacityPercent).toBe(0);
     expect(state.draft.imageOpacityPercent).toBe(0);
 
@@ -39,6 +42,7 @@ describe("皮肤草稿 reducer", () => {
     });
     expect(maximum.draft.imageOpacityPercent).toBe(100);
     expect(skinDraftToWire(maximum.draft).panel_opacity_percent).toBe(100);
+    expect(skinDraftToWire(maximum.draft).glass_blur_px).toBe(32);
   });
 
   it("选图只更新本地草稿且不改变已提交 revision", () => {
@@ -75,13 +79,18 @@ describe("皮肤草稿 reducer", () => {
       type: "state-received",
       envelope: {
         revision: 5,
-        settings: { ...savedEnvelope.settings, blur_px: 12 },
+        settings: {
+          ...savedEnvelope.settings,
+          blur_px: 12,
+          glass_blur_px: 16,
+        },
       },
     });
 
     expect(stale).toBe(local);
     expect(current.revision).toBe(5);
     expect(current.draft.blurPx).toBe(12);
+    expect(current.draft.glassBlurPx).toBe(16);
   });
 
   it("外部事件更新数据但不结束正在执行的操作", () => {
