@@ -9,6 +9,7 @@ pub mod skin;
 pub mod tray;
 pub mod update;
 pub mod update_ui;
+pub mod window_chrome;
 
 use app_controller::{AppController, get_runtime_status, retry_runtime};
 use desktop_update::{
@@ -29,6 +30,7 @@ use update_ui::{
     UpdateUiController, check_updates, confirm_activation, get_update_state,
     install_compatible_update,
 };
+use window_chrome::control_main_window;
 
 pub const UPDATE_COMMAND_NAMES: [&str; 7] = [
     "get_update_state",
@@ -125,7 +127,8 @@ pub fn run() {
             choose_skin_image,
             save_skin_settings,
             reset_skin_settings,
-            report_skin_adapter
+            report_skin_adapter,
+            control_main_window
         ])
         .on_page_load(|webview, payload| {
             if webview.label() != "main" {
