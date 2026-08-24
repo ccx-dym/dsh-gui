@@ -152,9 +152,10 @@ fn script_checks_dom_before_painting_the_page_canvas() {
     assert!(script.contains("--dsw-alias-bg-base"));
     assert!(script.contains("--dsw-alias-bg-layer-1"));
     assert!(script.contains("--dsw-alias-bg-layer-2"));
-    assert!(script.contains("body{background-color:transparent !important"));
-    assert!(script.contains("background-attachment:fixed !important"));
+    assert!(script.contains("body{background-color:rgb(255,255,255) !important"));
+    assert!(script.contains("background-image:none !important"));
     assert!(script.contains("body::before{content:\"\""));
+    assert!(script.contains("body::after{content:\"\""));
     assert!(script.contains("filter:blur(12px)"));
     assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
     assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
@@ -206,6 +207,43 @@ setImmediate(()=>{{console.log(reported===true&&inserted.length===2?'RETRIED':'B
         .expect("前端工具链必须提供 node");
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "RETRIED");
+}
+
+#[test]
+fn executable_script_applies_opacity_only_to_the_wallpaper_layer() {
+    let mut settings = fixture_settings();
+    settings.blur_px = 0;
+    settings.panel_opacity_percent = 37;
+    let script = adapter_script(&settings).expect("script");
+    let harness = format!(
+        r#"const inserted=[];
+const root={{}};
+global.requestAnimationFrame=(callback)=>{{callback();return 1;}};
+global.document={{
+  getElementById:()=>null,
+  querySelector:()=>root,
+  createElement:(tag)=>({{id:'',style:{{cssText:''}},setAttribute:()=>{{}},textContent:'',tag}}),
+  documentElement:{{prepend:(node)=>inserted.push(node)}},
+  head:{{append:(node)=>inserted.push(node)}}
+}};
+global.getComputedStyle=()=>({{getPropertyValue:()=> '#151517'}});
+global.location={{protocol:'http:',hostname:'127.0.0.1',port:'43127'}};
+global.__TAURI_INTERNALS__={{invoke:()=>Promise.resolve()}};
+{script}
+const style=inserted.find((node)=>node.tag==='style');
+console.log(style?.textContent??'NO_STYLE');"#
+    );
+    let output = Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("前端工具链必须提供 node");
+    assert!(output.status.success());
+    let css = String::from_utf8_lossy(&output.stdout);
+
+    assert!(css.contains("body::before{content:\"\""));
+    assert!(css.contains("opacity:0.37"));
+    assert!(!css.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.37)"));
+    assert!(!css.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.37)"));
 }
 
 #[test]

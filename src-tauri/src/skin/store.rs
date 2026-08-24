@@ -11,8 +11,7 @@ use thiserror::Error;
 const SCHEMA_VERSION: u8 = 1;
 const MAX_BLUR_PX: u8 = 32;
 const MAX_MASK_OPACITY_PERCENT: u8 = 80;
-const MIN_PANEL_OPACITY_PERCENT: u8 = 55;
-const MAX_PANEL_OPACITY_PERCENT: u8 = 100;
+const MAX_IMAGE_OPACITY_PERCENT: u8 = 100;
 const DIGEST_LENGTH: usize = 64;
 const REGISTERED_EXTENSIONS: [&str; 3] = ["png", "jpg", "webp"];
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -256,8 +255,8 @@ impl SkinStore {
     ) -> Result<(), SkinError> {
         if blur_px > MAX_BLUR_PX
             || mask_opacity_percent > MAX_MASK_OPACITY_PERCENT
-            || !(MIN_PANEL_OPACITY_PERCENT..=MAX_PANEL_OPACITY_PERCENT)
-                .contains(&panel_opacity_percent)
+            // schema 1 的字段名为 panel_opacity_percent；新版本保留该键并将其解释为图片透明度。
+            || panel_opacity_percent > MAX_IMAGE_OPACITY_PERCENT
             || image_digest.is_some_and(|digest| !is_canonical_digest(digest))
         {
             return Err(SkinError::InvalidSettings);

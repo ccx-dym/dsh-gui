@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createInitialSkinState,
   reduceSkinDraft,
+  skinDraftToWire,
   type SkinStateEnvelopeWire,
 } from "./skin-state";
 
@@ -25,12 +26,19 @@ describe("皮肤草稿 reducer", () => {
       type: "visuals",
       blurPx: 99.8,
       maskOpacityPercent: -4,
-      panelOpacityPercent: 12,
+      imageOpacityPercent: -1,
     });
 
     expect(state.draft.blurPx).toBe(32);
     expect(state.draft.maskOpacityPercent).toBe(0);
-    expect(state.draft.panelOpacityPercent).toBe(55);
+    expect(state.draft.imageOpacityPercent).toBe(0);
+
+    const maximum = reduceSkinDraft(state, {
+      type: "visuals",
+      imageOpacityPercent: 101,
+    });
+    expect(maximum.draft.imageOpacityPercent).toBe(100);
+    expect(skinDraftToWire(maximum.draft).panel_opacity_percent).toBe(100);
   });
 
   it("选图只更新本地草稿且不改变已提交 revision", () => {
@@ -92,7 +100,7 @@ describe("皮肤草稿 reducer", () => {
       });
 
       expect(updated.revision).toBe(5);
-      expect(updated.draft.panelOpacityPercent).toBe(91);
+      expect(updated.draft.imageOpacityPercent).toBe(91);
       expect(updated.busy).toEqual({ kind, id: 7 });
     }
   });
