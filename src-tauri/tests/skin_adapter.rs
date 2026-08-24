@@ -195,7 +195,11 @@ fn script_checks_dom_before_painting_the_page_canvas() {
     assert!(script.contains("filter:blur(12px)"));
     assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
     assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
+    assert!(script.contains("--dsw-specific-sidebar-fill:transparent !important"));
+    assert!(script.contains("[data-composer-card]{background:transparent !important}"));
     assert!(!script.contains("--dsw-specific-input-major:transparent"));
+    assert!(script.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
+    assert!(script.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.88) !important"));
     assert!(script.contains("dsh-desktop-skin-background"));
     assert_eq!(script.matches("createElement('div')").count(), 1);
     assert!(!script.contains("fetch("));
