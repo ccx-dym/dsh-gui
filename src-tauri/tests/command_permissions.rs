@@ -290,10 +290,7 @@ fn only_main_is_frameless_and_window_control_has_two_narrow_capabilities() {
     let enabled = config["app"]["security"]["capabilities"]
         .as_array()
         .expect("enabled capabilities");
-    for identifier in [
-        "main-window-chrome-local",
-        "main-window-chrome-remote",
-    ] {
+    for identifier in ["main-window-chrome-local", "main-window-chrome-remote"] {
         assert!(enabled.iter().any(|value| value == identifier));
     }
 
