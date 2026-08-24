@@ -92,7 +92,24 @@ $evidence = [ordered]@{
         authenticode = 'NotSigned'
         path = (Join-Path $auditRoot 'fixture.exe')
     }
-    process_observation = [ordered]@{ status = 'not_run' }
+    process_observation = [ordered]@{
+        status = 'passed'
+        desktop_process_id = 1234
+        observation_seconds = 60
+        elapsed_seconds = 60.1
+        root_process = [ordered]@{
+            process_count = 1
+            cpu_percent = 0.1
+            working_set_bytes = 100
+            private_bytes = 80
+            CommandLine = '--nested-secret'
+        }
+        descendants = [ordered]@{ process_count = 0; cpu_percent = $null; working_set_bytes = 0; private_bytes = 0 }
+        webview2 = [ordered]@{ process_count = 0; cpu_percent = $null; working_set_bytes = 0; private_bytes = 0 }
+        node = [ordered]@{ process_count = 0; cpu_percent = $null; working_set_bytes = 0; private_bytes = 0 }
+        new_process_ids = @()
+        exited_process_ids = @()
+    }
     checks = $checks
 }
 
@@ -108,7 +125,7 @@ if ($markdown -notmatch '(?s)offline_restart.*not_run') {
 }
 foreach ($content in @($json, $markdown)) {
     if ($content -match [regex]::Escape($auditRoot) -or
-        $content -match 'CommandLine|API_KEY|--secret') {
+        $content -match 'CommandLine|API_KEY|--secret|--nested-secret') {
         throw '证据文件包含未批准的敏感字段'
     }
 }

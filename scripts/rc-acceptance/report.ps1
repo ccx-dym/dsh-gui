@@ -55,6 +55,21 @@ function Get-RcOverallResult {
     return 'passed'
 }
 
+function ConvertTo-RcSafeProcessAggregate {
+    param([Parameter(Mandatory)] $Aggregate)
+
+    return [ordered]@{
+        process_count = [int]$Aggregate.process_count
+        cpu_percent = if ($null -eq $Aggregate.cpu_percent) {
+            $null
+        } else {
+            [double]$Aggregate.cpu_percent
+        }
+        working_set_bytes = [uint64]$Aggregate.working_set_bytes
+        private_bytes = [uint64]$Aggregate.private_bytes
+    }
+}
+
 function ConvertTo-RcSafeEvidence {
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Evidence)
@@ -72,18 +87,17 @@ function ConvertTo-RcSafeEvidence {
         }
     })
 
-    $safeProcess = [ordered]@{ status = [string]$Evidence.process_observation.status }
-    foreach ($name in @(
-        'desktop_process_id', 'observation_seconds', 'elapsed_seconds',
-        'root_process', 'descendants', 'webview2', 'node',
-        'new_process_ids', 'exited_process_ids'
-    )) {
-        if ($Evidence.process_observation.PSObject.Properties.Name -contains $name) {
-            $safeProcess[$name] = $Evidence.process_observation.$name
-        } elseif ($Evidence.process_observation -is [System.Collections.IDictionary] -and
-            $Evidence.process_observation.Contains($name)) {
-            $safeProcess[$name] = $Evidence.process_observation[$name]
+    $process = $Evidence.process_observation
+    $safeProcess = [ordered]@{ status = [string]$process.status }
+    if ([string]$process.status -ceq 'passed') {
+        $safeProcess.desktop_process_id = [int]$process.desktop_process_id
+        $safeProcess.observation_seconds = [int]$process.observation_seconds
+        $safeProcess.elapsed_seconds = [double]$process.elapsed_seconds
+        foreach ($name in @('root_process', 'descendants', 'webview2', 'node')) {
+            $safeProcess[$name] = ConvertTo-RcSafeProcessAggregate -Aggregate $process.$name
         }
+        $safeProcess.new_process_ids = @($process.new_process_ids | ForEach-Object { [int]$_ })
+        $safeProcess.exited_process_ids = @($process.exited_process_ids | ForEach-Object { [int]$_ })
     }
 
     return [ordered]@{

@@ -48,6 +48,49 @@ pwsh -NoProfile -File scripts/smoke-runtime.ps1 `
 闭包、大小和 SHA-256，再使用独立 `DSH_HOME` 启动真实官方 WebUI，并同时验证精确
 stdout 就绪信号与 HTTP 200。runtime 目录本身保持只读，进程树在探活结束后回收。
 
+## RC 自动证据采集
+
+每轮 Windows RC 必须先使用专用当前用户测试安装和全新的测试数据目录；证据脚本不读取
+真实用户数据，也不安装、卸载或控制桌面进程。先对候选 NSIS 执行无 PID 预检：
+
+```powershell
+pwsh -NoProfile -File scripts/rc-acceptance.ps1 `
+  -Installer src-tauri/target/release/bundle/nsis/DSH-Desktop_0.1.13_x64-setup.exe `
+  -AuditDirectory C:/rc-audit/dsh-desktop-0.1.13-preflight
+```
+
+脚本记录三处一致的 Desktop 版本、Git commit、Windows/WebView2、安装包字节数、SHA-256
+和 Authenticode 固定状态，并生成 `evidence.json` 与 `report.md`。审计目录必须是尚不存在的
+普通新目录；脚本拒绝盘符根、用户目录根、仓库根以及经 junction/reparse 解析的父目录，
+且从不覆盖或删除已有证据。
+
+人工启动已经确认属于本轮专用测试安装的 RC 后，可按任务管理器中的精确 PID 采集默认
+视觉或 8K 皮肤的进程组指标：
+
+```powershell
+pwsh -NoProfile -File scripts/rc-acceptance.ps1 `
+  -Installer src-tauri/target/release/bundle/nsis/DSH-Desktop_0.1.13_x64-setup.exe `
+  -AuditDirectory C:/rc-audit/dsh-desktop-0.1.13-default `
+  -DesktopProcessId 1234 `
+  -ObservationSeconds 60
+```
+
+每次场景使用不同的全新审计目录。进程采样只记录调用者指定 PID 及其后代的 PID、父 PID、
+固定进程名、CPU、Working Set 和 Private Bytes；不读取命令行、可执行路径、环境变量、
+窗口标题或用户内容。脚本不得自动断网，不得自动终止或重启 DSH Desktop、Node、WebView2，
+也不得为了形成“完整退出”证据主动杀进程。
+
+自动采集后仍需执行下方人工矩阵。首次报告中的 GUI、Windows 10、WebView2 缺失补装和
+Authenticode 项均为 `not_run`；只有实际执行并留下可复核证据后才能改为 `passed`。缺少
+Windows 10 测试机或正式代码签名证书时必须保持 `not_run`，不能把外部条件降级为通过。
+测试完成后运行：
+
+```powershell
+pnpm test:rc-acceptance
+git diff --check
+pnpm check
+```
+
 ## Windows RC 手工验收矩阵
 
 必须使用全新的、专门用于本轮 RC 的数据目录和当前用户安装；不得把个人真实 DSH_HOME
