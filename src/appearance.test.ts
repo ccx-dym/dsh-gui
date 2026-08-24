@@ -104,7 +104,26 @@ describe("外观设置", () => {
     renderAppearance(root, createInitialSkinState(envelope));
 
     expect(root.querySelector("output[for='skin-blur']")?.textContent).toBe("12px");
-    expect(root.querySelector("output[for='skin-panel']")?.textContent).toBe("82%");
+    expect(root.querySelector("output[for='skin-image-opacity']")?.textContent).toBe("82%");
+  });
+
+  it("图片不透明度实时只作用于背景图片层", async () => {
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const dispose = await initializeAppearance(root, bridge());
+    const slider = root.querySelector<HTMLInputElement>("#skin-image-opacity")!;
+    const background = root.querySelector<HTMLElement>("[data-skin-background]")!;
+    const content = root.querySelector<HTMLElement>("[data-skin-preview-content]")!;
+
+    expect(root.querySelector("label[for='skin-image-opacity']")?.textContent).toBe("图片不透明度");
+    expect(slider.min).toBe("0");
+    expect(slider.max).toBe("100");
+
+    slider.value = "37";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(background.style.opacity).toBe("0.37");
+    expect(content.style.opacity).toBe("");
+    dispose();
   });
 
   it("关闭沉浸模式隐藏背景和遮罩并可在原节点恢复", () => {

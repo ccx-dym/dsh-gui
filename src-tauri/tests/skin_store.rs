@@ -123,10 +123,6 @@ fn visual_bounds_and_noncanonical_digests_are_rejected() {
             ..valid_draft()
         },
         SkinDraft {
-            panel_opacity_percent: 54,
-            ..valid_draft()
-        },
-        SkinDraft {
             panel_opacity_percent: 101,
             ..valid_draft()
         },
@@ -143,6 +139,33 @@ fn visual_bounds_and_noncanonical_digests_are_rejected() {
         );
     }
     assert_eq!(store.load().expect("拒绝后应保留默认值").revision, 0);
+}
+
+#[test]
+fn image_opacity_accepts_the_full_percentage_range() {
+    let (store, _) = fixture_store("image-opacity-range");
+
+    let hidden = store
+        .save(
+            0,
+            SkinDraft {
+                panel_opacity_percent: 0,
+                ..valid_draft()
+            },
+        )
+        .expect("图片不透明度 0% 应有效");
+    let visible = store
+        .save(
+            hidden.revision,
+            SkinDraft {
+                panel_opacity_percent: 100,
+                ..valid_draft()
+            },
+        )
+        .expect("图片不透明度 100% 应有效");
+
+    assert_eq!(hidden.settings.panel_opacity_percent, 0);
+    assert_eq!(visible.settings.panel_opacity_percent, 100);
 }
 
 #[test]

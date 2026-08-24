@@ -18,10 +18,11 @@
 .appearance__layout { display: grid; grid-template-columns: minmax(280px, 1.08fr) minmax(300px, .92fr); gap: clamp(22px, 4vw, 46px); margin-top: 34px; align-items: start; }
 
 .skin-preview { position: sticky; top: 22px; isolation: isolate; min-height: 472px; overflow: hidden; border: 1px solid rgb(255 255 255 / 84%); border-radius: 28px 8px 28px 8px; background: #8ed8fb; box-shadow: 0 24px 64px rgb(39 139 192 / 20%); }
-.skin-preview__background { position: absolute; z-index: -2; inset: 0; background-color: #8ed8fb; background-repeat: no-repeat; will-change: transform; pointer-events: none; }
-.skin-preview__background::after { position: absolute; inset: 0; background: rgb(255 255 255 / var(--mask-opacity)); content: ""; pointer-events: none; }
-.skin-preview[data-tone="dark"] .skin-preview__background::after { background: rgb(8 32 51 / var(--mask-opacity)); }
-.skin-preview__content { position: absolute; right: 24px; bottom: 24px; left: 24px; display: flex; min-height: 110px; padding: 20px; align-items: center; gap: 16px; border: 1px solid rgb(255 255 255 / 65%); border-radius: 4px 20px 20px 20px; background: rgb(255 255 255 / var(--panel-opacity)); box-shadow: 0 15px 38px rgb(25 102 145 / 18%); color: #113e59; backdrop-filter: saturate(115%); }
+.skin-preview__background { position: absolute; z-index: -2; inset: 0; background-repeat: no-repeat; will-change: transform, opacity; pointer-events: none; }
+.skin-preview::after { position: absolute; z-index: -1; inset: 0; background: rgb(255 255 255 / var(--mask-opacity)); content: ""; pointer-events: none; }
+.skin-preview[data-tone="dark"]::after { background: rgb(8 32 51 / var(--mask-opacity)); }
+.skin-preview[data-immersive="false"]::after { display: none; }
+.skin-preview__content { position: absolute; right: 24px; bottom: 24px; left: 24px; display: flex; min-height: 110px; padding: 20px; align-items: center; gap: 16px; border: 1px solid rgb(255 255 255 / 65%); border-radius: 4px 20px 20px 20px; background: rgb(255 255 255 / 82%); box-shadow: 0 15px 38px rgb(25 102 145 / 18%); color: #113e59; backdrop-filter: saturate(115%); }
 .skin-preview__brand { display: grid; width: 48px; height: 48px; flex: 0 0 auto; place-items: center; border-radius: 50%; color: #fff; background: #28a9ed; font-weight: 750; }
 .skin-preview__content strong, .skin-preview__content span { display: block; }
 .skin-preview__content span { margin-top: 5px; color: #527388; font-size: 12px; line-height: 1.5; }

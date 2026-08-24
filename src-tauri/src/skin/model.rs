@@ -82,6 +82,7 @@ pub struct SkinDraft {
     pub blur_px: u8,
     pub mask_tone: MaskTone,
     pub mask_opacity_percent: u8,
+    /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
     pub panel_opacity_percent: u8,
 }
 
@@ -96,6 +97,7 @@ pub struct SkinSettings {
     pub blur_px: u8,
     pub mask_tone: MaskTone,
     pub mask_opacity_percent: u8,
+    /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
     pub panel_opacity_percent: u8,
 }
 

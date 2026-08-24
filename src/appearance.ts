@@ -76,8 +76,8 @@ interface AppearanceViewRefs {
   blurOutput: HTMLOutputElement;
   mask: HTMLInputElement;
   maskOutput: HTMLOutputElement;
-  panel: HTMLInputElement;
-  panelOutput: HTMLOutputElement;
+  imageOpacity: HTMLInputElement;
+  imageOpacityOutput: HTMLOutputElement;
   status: HTMLElement;
   choose: HTMLButtonElement;
   save: HTMLButtonElement;
@@ -144,8 +144,8 @@ function patchAppearanceView(
   state: SkinEditorState,
 ): void {
   refs.preview.dataset.tone = state.draft.maskTone;
+  refs.preview.dataset.immersive = String(state.draft.immersive);
   refs.preview.style.setProperty("--mask-opacity", String(state.draft.maskOpacityPercent / 100));
-  refs.preview.style.setProperty("--panel-opacity", String(state.draft.panelOpacityPercent / 100));
   const imageUrl = previewUrl(state);
   refs.background.style.backgroundImage =
     imageUrl === null ? "none" : `url(${JSON.stringify(imageUrl)})`;
@@ -158,6 +158,7 @@ function patchAppearanceView(
   refs.background.style.backgroundPosition = BACKGROUND_POSITIONS[state.draft.position];
   refs.background.style.filter = `blur(${state.draft.blurPx}px)`;
   refs.background.style.transform = `scale(${1 + state.draft.blurPx / 320})`;
+  refs.background.style.opacity = String(state.draft.imageOpacityPercent / 100);
   refs.background.style.pointerEvents = "none";
   refs.background.style.animation = "none";
   refs.background.style.transition = "none";
@@ -173,8 +174,8 @@ function patchAppearanceView(
   refs.blurOutput.textContent = `${state.draft.blurPx}px`;
   refs.mask.value = String(state.draft.maskOpacityPercent);
   refs.maskOutput.textContent = `${state.draft.maskOpacityPercent}%`;
-  refs.panel.value = String(state.draft.panelOpacityPercent);
-  refs.panelOutput.textContent = `${state.draft.panelOpacityPercent}%`;
+  refs.imageOpacity.value = String(state.draft.imageOpacityPercent);
+  refs.imageOpacityOutput.textContent = `${state.draft.imageOpacityPercent}%`;
 
   const hasImage = state.draft.imageDigest !== null;
   refs.imageNote.firstChild!.textContent = hasImage
@@ -223,8 +224,8 @@ export function renderAppearance(
   preview.className = "skin-preview";
   preview.setAttribute("aria-label", "皮肤实时预览");
   preview.dataset.tone = state.draft.maskTone;
+  preview.dataset.immersive = String(state.draft.immersive);
   preview.style.setProperty("--mask-opacity", String(state.draft.maskOpacityPercent / 100));
-  preview.style.setProperty("--panel-opacity", String(state.draft.panelOpacityPercent / 100));
 
   const background = document.createElement("div");
   background.className = "skin-preview__background";
@@ -243,6 +244,7 @@ export function renderAppearance(
   background.style.backgroundPosition = BACKGROUND_POSITIONS[state.draft.position];
   background.style.filter = `blur(${state.draft.blurPx}px)`;
   background.style.transform = `scale(${1 + state.draft.blurPx / 320})`;
+  background.style.opacity = String(state.draft.imageOpacityPercent / 100);
   background.style.pointerEvents = "none";
   background.style.animation = "none";
   background.style.transition = "none";
@@ -361,7 +363,14 @@ export function renderAppearance(
     createSlider("skin-blur", "背景模糊", state.draft.blurPx, 0, 32, "blur"),
     toneField,
     createSlider("skin-mask", "遮罩强度", state.draft.maskOpacityPercent, 0, 80, "mask"),
-    createSlider("skin-panel", "面板不透明度", state.draft.panelOpacityPercent, 55, 100, "panel"),
+    createSlider(
+      "skin-image-opacity",
+      "图片不透明度",
+      state.draft.imageOpacityPercent,
+      0,
+      100,
+      "image-opacity",
+    ),
     status,
     actions,
   );
@@ -383,8 +392,8 @@ export function renderAppearance(
     blurOutput: root.querySelector<HTMLOutputElement>("output[for='skin-blur']")!,
     mask: root.querySelector<HTMLInputElement>("#skin-mask")!,
     maskOutput: root.querySelector<HTMLOutputElement>("output[for='skin-mask']")!,
-    panel: root.querySelector<HTMLInputElement>("#skin-panel")!,
-    panelOutput: root.querySelector<HTMLOutputElement>("output[for='skin-panel']")!,
+    imageOpacity: root.querySelector<HTMLInputElement>("#skin-image-opacity")!,
+    imageOpacityOutput: root.querySelector<HTMLOutputElement>("output[for='skin-image-opacity']")!,
     status,
     choose,
     save,
@@ -429,7 +438,9 @@ export async function initializeAppearance(
     const value = Number(event.target.value);
     if (event.target.dataset.control === "blur") dispatch({ type: "visuals", blurPx: value });
     if (event.target.dataset.control === "mask") dispatch({ type: "visuals", maskOpacityPercent: value });
-    if (event.target.dataset.control === "panel") dispatch({ type: "visuals", panelOpacityPercent: value });
+    if (event.target.dataset.control === "image-opacity") {
+      dispatch({ type: "visuals", imageOpacityPercent: value });
+    }
   };
 
   const onChange = (event: Event): void => {

@@ -45,7 +45,7 @@ export interface SkinDraft {
   blurPx: number;
   maskTone: MaskTone;
   maskOpacityPercent: number;
-  panelOpacityPercent: number;
+  imageOpacityPercent: number;
 }
 
 export interface SkinEditorState {
@@ -67,7 +67,7 @@ export type SkinDraftAction =
       type: "visuals";
       blurPx?: number;
       maskOpacityPercent?: number;
-      panelOpacityPercent?: number;
+      imageOpacityPercent?: number;
     }
   | { type: "image-selected" | "preview-image"; image: SkinImageView }
   | { type: "state-received"; envelope: SkinStateEnvelopeWire }
@@ -95,7 +95,8 @@ function draftFromWire(settings: SkinSettingsWire): SkinDraft {
     blurPx: clampInteger(settings.blur_px, 0, 32),
     maskTone: settings.mask_tone,
     maskOpacityPercent: clampInteger(settings.mask_opacity_percent, 0, 80),
-    panelOpacityPercent: clampInteger(settings.panel_opacity_percent, 55, 100),
+    // 保留旧 wire 字段名以兼容已经落盘的 schema 1 设置，领域语义改为图片不透明度。
+    imageOpacityPercent: clampInteger(settings.panel_opacity_percent, 0, 100),
   };
 }
 
@@ -108,7 +109,7 @@ export function skinDraftToWire(draft: SkinDraft): SkinSettingsWire {
     blur_px: clampInteger(draft.blurPx, 0, 32),
     mask_tone: draft.maskTone,
     mask_opacity_percent: clampInteger(draft.maskOpacityPercent, 0, 80),
-    panel_opacity_percent: clampInteger(draft.panelOpacityPercent, 55, 100),
+    panel_opacity_percent: clampInteger(draft.imageOpacityPercent, 0, 100),
   };
 }
 
@@ -153,10 +154,10 @@ export function reduceSkinDraft(
             action.maskOpacityPercent === undefined
               ? state.draft.maskOpacityPercent
               : clampInteger(action.maskOpacityPercent, 0, 80),
-          panelOpacityPercent:
-            action.panelOpacityPercent === undefined
-              ? state.draft.panelOpacityPercent
-              : clampInteger(action.panelOpacityPercent, 55, 100),
+          imageOpacityPercent:
+            action.imageOpacityPercent === undefined
+              ? state.draft.imageOpacityPercent
+              : clampInteger(action.imageOpacityPercent, 0, 100),
         },
       };
     case "image-selected":
