@@ -258,6 +258,23 @@ pub struct SkinAdapterReport {
 }
 
 impl SkinAdapterController {
+    /// 判断页面是否仍匹配原生侧当前绑定的精确 DSH 来源。
+    ///
+    /// :param url: 当前调用方 WebView 的完整 URL。
+    /// :return: 仅数字回环来源与活动绑定完全一致时返回 `true`。
+    /// :raises: 状态锁异常时失败关闭为 `false`。
+    pub(crate) fn allows_page(&self, url: &tauri::Url) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        numeric_loopback_origin(url).is_some_and(|origin| {
+            state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.origin == origin)
+        })
+    }
+
     /// 将门禁绑定到权威激活部署的精确 DSH 版本。
     ///
     /// :param version: 已验证激活部署的 DSH 版本。
