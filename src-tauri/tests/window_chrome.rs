@@ -128,3 +128,37 @@ setImmediate(()=>{{
         "TITLEBAR_OK"
     );
 }
+
+#[test]
+fn window_controls_stay_in_one_row_when_remote_page_styles_nav() {
+    let harness = format!(
+        r#"
+const {{JSDOM}}=require('jsdom');
+const dom=new JSDOM('<!doctype html><html><head><style>nav{{display:grid!important;flex-direction:column!important;flex-wrap:wrap!important}}</style></head><body><main id="root"></main></body></html>',{{runScripts:'dangerously'}});
+dom.window.__TAURI_INTERNALS__={{invoke:()=>Promise.resolve({{maximized:false}})}};
+dom.window.eval({script});
+const controls=dom.window.document.querySelector('#dsh-desktop-titlebar nav');
+const computed=dom.window.getComputedStyle(controls);
+const ok=computed.display==='flex'
+  && computed.flexDirection==='row'
+  && computed.flexWrap==='nowrap'
+  && computed.height==='31px';
+console.log(ok?'TITLEBAR_ROW_OK':JSON.stringify({{display:computed.display,flexDirection:computed.flexDirection,flexWrap:computed.flexWrap,height:computed.height}}));
+"#,
+        script = serde_json::to_string(titlebar_script()).expect("serialize titlebar script"),
+    );
+    let output = Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("前端工具链必须提供 node");
+
+    assert!(
+        output.status.success(),
+        "JSDOM 标题栏布局测试失败: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "TITLEBAR_ROW_OK"
+    );
+}
