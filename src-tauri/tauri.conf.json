@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "DSH Desktop",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "identifier": "com.community.dsh-desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -36,8 +36,8 @@
         "label": "appearance",
         "title": "DSH Desktop · 外观",
         "url": "index.html?view=appearance",
-        "width": 760,
-        "height": 720,
+        "width": 960,
+        "height": 820,
         "minWidth": 680,
         "minHeight": 620,
         "visible": false,

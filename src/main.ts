@@ -385,6 +385,8 @@ void initializeDesktopUpdateState();
 // appearance 是预定义的本地窗口入口；分派发生在任何运行时命令之前，避免设置 UI 混入主启动页。
 const view = new URLSearchParams(window.location.search).get("view");
 if (view === "appearance") {
+  // 外观页内容可超过窗口高度；显式视图标记让其滚动规则不会泄漏到主窗口。
+  document.documentElement.dataset.view = "appearance";
   void import("./appearance").then(({ initializeAppearance }) =>
     initializeAppearance(root),
   );

@@ -1,3 +1,9 @@
+/* 只覆盖独立外观窗口的固定视口，确保小窗口仍可查看全部参数且不影响主窗口。 */
+html[data-view="appearance"],
+html[data-view="appearance"] body {
+  overflow-y: auto;
+}
+
 .appearance {
   --ink: #123f5c;
   --muted: #54778c;
@@ -15,9 +21,11 @@
 .appearance__eyebrow { margin: 0 0 8px; color: #188dc9; font: 700 11px/1.2 "Cascadia Mono", monospace; letter-spacing: .13em; }
 .appearance h1 { margin: 0; font: 680 clamp(27px, 5vw, 40px)/1.08 "Segoe UI Variable Display", "Microsoft YaHei UI", sans-serif; letter-spacing: -.04em; }
 .appearance__heading > p:last-child { margin: 12px 0 0; color: var(--muted); font-size: 14px; }
-.appearance__layout { display: grid; grid-template-columns: minmax(280px, 1.08fr) minmax(300px, .92fr); gap: clamp(22px, 4vw, 46px); margin-top: 34px; align-items: start; }
+.appearance__layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: clamp(22px, 4vw, 46px); margin-top: 34px; align-items: start; }
 
-.skin-preview { position: sticky; top: 22px; isolation: isolate; min-height: 472px; overflow: hidden; border: 1px solid rgb(255 255 255 / 84%); border-radius: 28px 8px 28px 8px; background: #8ed8fb; box-shadow: 0 24px 64px rgb(39 139 192 / 20%); }
+.skin-preview, .appearance-editor { min-width: 0; }
+
+.skin-preview { position: relative; isolation: isolate; min-height: clamp(330px, 55vh, 520px); overflow: hidden; border: 1px solid rgb(255 255 255 / 84%); border-radius: 28px 8px 28px 8px; background: #8ed8fb; box-shadow: 0 24px 64px rgb(39 139 192 / 20%); }
 .skin-preview__background { position: absolute; z-index: -2; inset: 0; background-repeat: no-repeat; will-change: transform, opacity; pointer-events: none; }
 .skin-preview::after { position: absolute; z-index: -1; inset: 0; background: rgb(255 255 255 / var(--mask-opacity)); content: ""; pointer-events: none; }
 .skin-preview[data-tone="dark"]::after { background: rgb(8 32 51 / var(--mask-opacity)); }
@@ -49,9 +57,9 @@
 .appearance--unavailable { display: grid; place-content: center; gap: 8px; text-align: center; }
 .appearance--unavailable span { margin-top: 8px; color: var(--muted); font-size: 13px; }
 
-@media (max-width: 760px) {
-  .appearance__layout { grid-template-columns: 1fr; }
-  .skin-preview { position: relative; top: 0; min-height: 330px; }
+@media (min-width: 1100px) {
+  .appearance__layout { grid-template-columns: minmax(0, 1.08fr) minmax(300px, .92fr); }
+  .skin-preview { position: sticky; top: 22px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

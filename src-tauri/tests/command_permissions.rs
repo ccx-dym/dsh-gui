@@ -104,8 +104,8 @@ fn appearance_window_is_local_hidden_and_owns_every_skin_mutation_command() {
         .expect("必须存在独立外观设置窗口");
     assert_eq!(appearance["url"], "index.html?view=appearance");
     assert_eq!(appearance["visible"], false);
-    assert_eq!(appearance["width"], 760);
-    assert_eq!(appearance["height"], 720);
+    assert_eq!(appearance["width"], 960);
+    assert_eq!(appearance["height"], 820);
     assert_eq!(appearance["minWidth"], 680);
     assert_eq!(appearance["minHeight"], 620);
 

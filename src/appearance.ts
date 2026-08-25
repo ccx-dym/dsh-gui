@@ -139,12 +139,13 @@ function createSlider(
 }
 
 function previewUrl(state: SkinEditorState): string | null {
-  if (state.previewImage?.digest === state.draft.imageDigest) {
-    return state.previewImage.protocolUrl;
-  }
-  return state.draft.imageDigest === null
-    ? null
-    : `dsh-skin://localhost/${state.draft.imageDigest}`;
+  const digest =
+    state.previewImage?.digest === state.draft.imageDigest
+      ? state.previewImage.digest
+      : state.draft.imageDigest;
+  // WebView2 会把 Tauri 自定义协议映射到固定 HTTP 传输主机；CSS background
+  // 不会像普通导航一样可靠地改写公开 scheme，因此预览层直接使用该固定形式。
+  return digest === null ? null : `http://dsh-skin.localhost/${digest}`;
 }
 
 function patchAppearanceView(

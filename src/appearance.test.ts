@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   initializeAppearance,
   renderAppearance,
@@ -38,9 +40,85 @@ function bridge(overrides: Partial<AppearanceBridge> = {}): AppearanceBridge {
 
 beforeEach(() => {
   document.body.innerHTML = '<div id="app"></div>';
+  document.documentElement.removeAttribute("data-view");
 });
 
 describe("外观设置", () => {
+  it("外观内容超过窗口高度时页面保留纵向滚动能力", () => {
+    const globalStyle = document.createElement("style");
+    globalStyle.textContent = readFileSync(
+      resolve(process.cwd(), "src", "styles.css"),
+      "utf8",
+    );
+    const appearanceStyle = document.createElement("style");
+    appearanceStyle.textContent = readFileSync(
+      resolve(process.cwd(), "src", "appearance.css"),
+      "utf8",
+    );
+    document.head.append(globalStyle, appearanceStyle);
+
+    expect(getComputedStyle(document.documentElement).overflowY).not.toBe("auto");
+    expect(getComputedStyle(document.body).overflowY).not.toBe("auto");
+
+    document.documentElement.dataset.view = "appearance";
+    expect(getComputedStyle(document.documentElement).overflowY).toBe("auto");
+    expect(getComputedStyle(document.body).overflowY).toBe("auto");
+
+    globalStyle.remove();
+    appearanceStyle.remove();
+  });
+
+  it("已保存图片使用 WebView2 可加载的传输地址进行实时预览", () => {
+    const root = document.querySelector<HTMLElement>("#app")!;
+
+    renderAppearance(root, createInitialSkinState(envelope));
+
+    expect(
+      root.querySelector<HTMLElement>("[data-skin-background]")?.style
+        .backgroundImage,
+    ).toBe(`url("http://dsh-skin.localhost/${"b".repeat(64)}")`);
+  });
+
+  it("外观布局默认单列且只在足够宽时切换为可收缩双列", () => {
+    const style = document.createElement("style");
+    style.textContent = readFileSync(
+      resolve(process.cwd(), "src", "appearance.css"),
+      "utf8",
+    );
+    document.head.append(style);
+    const rules = Array.from(style.sheet?.cssRules ?? []);
+    const baseLayout = rules.find(
+      (rule): rule is CSSStyleRule =>
+        rule.type === CSSRule.STYLE_RULE &&
+        (rule as CSSStyleRule).selectorText === ".appearance__layout",
+    );
+    const wideLayout = rules
+      .filter(
+        (rule): rule is CSSMediaRule => rule.type === CSSRule.MEDIA_RULE,
+      )
+      .find((rule) => rule.conditionText === "(min-width: 1100px)")
+      ?.cssRules;
+    const wideGrid = Array.from(wideLayout ?? []).find(
+      (rule): rule is CSSStyleRule =>
+        rule.type === CSSRule.STYLE_RULE &&
+        (rule as CSSStyleRule).selectorText === ".appearance__layout",
+    );
+    const shrinkablePanels = rules.find(
+      (rule): rule is CSSStyleRule =>
+        rule.type === CSSRule.STYLE_RULE &&
+        (rule as CSSStyleRule).selectorText ===
+          ".skin-preview, .appearance-editor",
+    );
+
+    expect(baseLayout?.style.getPropertyValue("grid-template-columns")).toBe(
+      "minmax(0, 1fr)",
+    );
+    expect(wideGrid?.style.getPropertyValue("grid-template-columns")).toBe(
+      "minmax(0, 1.08fr) minmax(300px, .92fr)",
+    );
+    expect(shrinkablePanels?.style.getPropertyValue("min-width")).toBe("0px");
+  });
+
   it("只渲染一个合成背景且模糊不作用于内容层", () => {
     const state = reduceSkinDraft(createInitialSkinState(envelope), {
       type: "preview-image",
