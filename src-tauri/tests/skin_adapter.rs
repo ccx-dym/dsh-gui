@@ -302,6 +302,22 @@ fn composer_and_user_messages_share_opacity_but_keep_independent_shapes() {
 }
 
 #[test]
+fn botanical_baroque_decorations_use_fixed_noninteractive_svg_layers() {
+    let css = execute_style_text(&fixture_settings());
+
+    assert!(css.contains("[data-composer-card]::before{content:\"\";position:absolute"));
+    assert!(css.contains(
+        "[data-chat-flow-kind=\"user\"] [data-slot=\"conversation.message.images\"]+div::before{content:\"\";position:absolute"
+    ));
+    assert_eq!(css.matches("data:image/svg+xml").count(), 6);
+    assert_eq!(css.matches("pointer-events:none").count(), 4);
+    assert!(css.contains("background-repeat:no-repeat"));
+    assert!(css.contains("rgba(255,211,151,0.72)"));
+    assert!(!css.contains("<script"));
+    assert!(!css.contains("javascript:"));
+}
+
+#[test]
 fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
     let mut settings = fixture_settings();
     settings.glass_blur_px = 0;

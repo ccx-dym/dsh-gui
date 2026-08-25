@@ -15,6 +15,45 @@ const BACKGROUND_ID: &str = "dsh-desktop-skin-background";
 const COMPOSER_SELECTOR: &str = "[data-composer-card]";
 const USER_MESSAGE_SELECTOR: &str =
     r#"[data-chat-flow-kind="user"] [data-slot="conversation.message.images"]+div"#;
+const COMPOSER_TOP_LEFT_VINE_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 72 64%27%3E",
+    "%3Cpath d=%27M3 62C9 43 19 31 37 25C49 21 58 13 64 3%27 fill=%27none%27 stroke=%27%23A9DDA4%27 stroke-width=%272%27 stroke-linecap=%27round%27/%3E",
+    "%3Cpath d=%27M14 45C7 42 7 35 9 30C16 31 20 36 14 45ZM35 26C29 20 32 14 37 11C42 16 42 22 35 26ZM51 17C48 10 53 6 59 5C61 11 58 16 51 17Z%27 fill=%27%23A9DDA4%27 fill-opacity=%27.82%27/%3E",
+    "%3Ccircle cx=%2725%27 cy=%2734%27 r=%275%27 fill=%27%23F3ABD3%27/%3E%3Ccircle cx=%2725%27 cy=%2734%27 r=%272%27 fill=%27%23FFD397%27/%3E%3C/svg%3E"
+);
+const COMPOSER_CREST_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 124 24%27%3E",
+    "%3Cpath d=%27M2 18C24 18 27 6 48 10C57 12 58 4 62 3C66 4 67 12 76 10C97 6 100 18 122 18%27 fill=%27none%27 stroke=%27%23FFD397%27 stroke-width=%271.5%27 stroke-linecap=%27round%27/%3E",
+    "%3Cpath d=%27M54 12L62 5L70 12L62 19Z%27 fill=%27%23F3ABD3%27 fill-opacity=%27.82%27 stroke=%27%23FFD397%27/%3E%3C/svg%3E"
+);
+const COMPOSER_BOTTOM_RIGHT_VINE_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 72 64%27%3E",
+    "%3Cg transform=%27translate(72 64) rotate(180)%27%3E%3Cpath d=%27M3 62C9 43 19 31 37 25C49 21 58 13 64 3%27 fill=%27none%27 stroke=%27%23A9DDA4%27 stroke-width=%272%27 stroke-linecap=%27round%27/%3E",
+    "%3Cpath d=%27M14 45C7 42 7 35 9 30C16 31 20 36 14 45ZM35 26C29 20 32 14 37 11C42 16 42 22 35 26ZM51 17C48 10 53 6 59 5C61 11 58 16 51 17Z%27 fill=%27%23A9DDA4%27 fill-opacity=%27.82%27/%3E",
+    "%3Ccircle cx=%2725%27 cy=%2734%27 r=%275%27 fill=%27%23F3ABD3%27/%3E%3Ccircle cx=%2725%27 cy=%2734%27 r=%272%27 fill=%27%23FFD397%27/%3E%3C/g%3E%3C/svg%3E"
+);
+const COMPOSER_BEADS_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 156 8%27%3E",
+    "%3Cpath d=%27M2 3H154%27 stroke=%27%23FFD397%27 stroke-opacity=%27.55%27/%3E",
+    "%3Cg fill=%27%23F3ABD3%27%3E%3Ccircle cx=%2742%27 cy=%273%27 r=%272%27/%3E%3Ccircle cx=%2758%27 cy=%273%27 r=%272%27/%3E%3Ccircle cx=%2774%27 cy=%273%27 r=%272%27/%3E%3Ccircle cx=%2790%27 cy=%273%27 r=%272%27/%3E%3Ccircle cx=%27106%27 cy=%273%27 r=%272%27/%3E%3C/g%3E%3C/svg%3E"
+);
+const MESSAGE_TOP_RIGHT_SPRIG_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 58 42%27%3E",
+    "%3Cpath d=%27M2 7C18 8 25 17 32 27C37 34 46 38 56 40%27 fill=%27none%27 stroke=%27%23A9DDA4%27 stroke-width=%272%27 stroke-linecap=%27round%27/%3E",
+    "%3Cpath d=%27M17 11C14 5 18 2 23 2C25 7 23 11 17 11ZM35 28C36 21 42 20 47 23C46 29 42 32 35 28Z%27 fill=%27%23A9DDA4%27 fill-opacity=%27.82%27/%3E",
+    "%3Ccircle cx=%2729%27 cy=%2721%27 r=%274.5%27 fill=%27%23F3ABD3%27/%3E%3Ccircle cx=%2729%27 cy=%2721%27 r=%271.8%27 fill=%27%23FFD397%27/%3E%3C/svg%3E"
+);
+const MESSAGE_BOTTOM_LEFT_FLOURISH_SVG: &str = concat!(
+    "data:image/svg+xml,",
+    "%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 48 28%27%3E",
+    "%3Cpath d=%27M2 25C12 24 15 15 21 14C28 13 27 22 20 22C12 22 13 7 27 5C36 4 39 10 46 3%27 fill=%27none%27 stroke=%27%23FFD397%27 stroke-width=%271.5%27 stroke-linecap=%27round%27/%3E",
+    "%3Cpath d=%27M27 5C29 10 35 12 39 9%27 fill=%27none%27 stroke=%27%23A9DDA4%27 stroke-width=%271.5%27/%3E%3C/svg%3E"
+);
 
 /// 与一个经过人工验证的 DSH DOM 合约绑定的适配器标识。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,14 +142,30 @@ pub fn adapter_script(settings: &SkinSettings) -> Option<String> {
     adapter_script_for_page(settings, 0)
 }
 
+fn conversation_decoration_css() -> String {
+    // 每个图层保持独立尺寸和锚点；中心透明，业务内容仍由真实 DOM 绘制。
+    format!(
+        r#"{composer}::before{{content:"";position:absolute;inset:-3px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{top_left}"),url("{crest}"),url("{bottom_right}"),url("{beads}");background-position:left top,center top,right bottom,center bottom;background-size:72px 64px,124px 24px,72px 64px,156px 8px;background-repeat:no-repeat}}{message}::before{{content:"";position:absolute;inset:-2px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{sprig}"),url("{flourish}");background-position:right top,left bottom;background-size:58px 42px,48px 28px;background-repeat:no-repeat}}"#,
+        composer = COMPOSER_SELECTOR,
+        message = USER_MESSAGE_SELECTOR,
+        top_left = COMPOSER_TOP_LEFT_VINE_SVG,
+        crest = COMPOSER_CREST_SVG,
+        bottom_right = COMPOSER_BOTTOM_RIGHT_VINE_SVG,
+        beads = COMPOSER_BEADS_SVG,
+        sprig = MESSAGE_TOP_RIGHT_SPRIG_SVG,
+        flourish = MESSAGE_BOTTOM_LEFT_FLOURISH_SVG,
+    )
+}
+
 fn conversation_surface_css(surface_rgb: &str, opacity: f32) -> String {
     // 输入卡片是持续交互的操作面，使用更完整的轮廓和阴影；历史气泡降低悬浮层级，
     // 两者只共享用户可调的不透明度，避免再次耦合完整视觉声明。
-    format!(
+    let surfaces = format!(
         r#"{composer}{{position:relative;isolation:isolate;overflow:visible !important;background:rgba({surface_rgb},{opacity:.2}) !important;border:1px solid rgba(255,211,151,0.72) !important;border-radius:22px !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18),0 0 18px rgba(255,211,151,0.08)}}{message}{{position:relative;isolation:isolate;overflow:visible !important;background:rgba({surface_rgb},{opacity:.2}) !important;border:1px solid rgba(255,211,151,0.62) !important;border-radius:18px 18px 6px 18px !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 28px rgba(0,0,0,0.14)}}"#,
         composer = COMPOSER_SELECTOR,
         message = USER_MESSAGE_SELECTOR,
-    )
+    );
+    format!("{surfaces}{}", conversation_decoration_css())
 }
 
 fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<String> {
