@@ -12,6 +12,9 @@ const REVIEWED_UNVERIFIED_MANIFEST_DIGEST: &str =
     "61f98dda4c1bde5a76eb94837f1a9ca00ade9620fe4668329bbab3b0d0fb79c4";
 const STYLE_ID: &str = "dsh-desktop-skin-style";
 const BACKGROUND_ID: &str = "dsh-desktop-skin-background";
+const COMPOSER_SELECTOR: &str = "[data-composer-card]";
+const USER_MESSAGE_SELECTOR: &str =
+    r#"[data-chat-flow-kind="user"] [data-slot="conversation.message.images"]+div"#;
 
 /// 与一个经过人工验证的 DSH DOM 合约绑定的适配器标识。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +103,16 @@ pub fn adapter_script(settings: &SkinSettings) -> Option<String> {
     adapter_script_for_page(settings, 0)
 }
 
+fn conversation_surface_css(surface_rgb: &str, opacity: f32) -> String {
+    // 输入卡片是持续交互的操作面，使用更完整的轮廓和阴影；历史气泡降低悬浮层级，
+    // 两者只共享用户可调的不透明度，避免再次耦合完整视觉声明。
+    format!(
+        r#"{composer}{{position:relative;isolation:isolate;overflow:visible !important;background:rgba({surface_rgb},{opacity:.2}) !important;border:1px solid rgba(255,211,151,0.72) !important;border-radius:22px !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18),0 0 18px rgba(255,211,151,0.08)}}{message}{{position:relative;isolation:isolate;overflow:visible !important;background:rgba({surface_rgb},{opacity:.2}) !important;border:1px solid rgba(255,211,151,0.62) !important;border-radius:18px 18px 6px 18px !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 28px rgba(0,0,0,0.14)}}"#,
+        composer = COMPOSER_SELECTOR,
+        message = USER_MESSAGE_SELECTOR,
+    )
+}
+
 fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<String> {
     if !settings.immersive {
         return None;
@@ -141,11 +154,9 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
         r#"body::before{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:url("http://dsh-skin.localhost/{digest}");background-repeat:no-repeat;background-size:{background_size};background-position:{background_position};filter:blur({blur}px);transform:scale({blur_scale:.3});transform-origin:center;opacity:{image_opacity:.2};will-change:transform,opacity}}body::after{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:rgba({mask_rgb},{mask_opacity:.2})}}"#,
         blur = settings.blur_px,
     );
-    // DSH 为用户消息提供稳定的语义 flow 与 slot 属性；通过二者的相邻关系定位气泡，
-    // 避免绑定构建时生成的 class。输入框和气泡复用同一组声明，保证共享滑块视觉一致。
-    let conversation_surfaces = format!(
-        r#"[data-composer-card]{{background:rgba({surface_rgb},{conversation_surface_opacity:.2}) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}[data-chat-flow-kind="user"] [data-slot="conversation.message.images"]+div{{background:rgba({surface_rgb},{conversation_surface_opacity:.2}) !important;border:1px solid rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}"#,
-    );
+    // DSH 为用户消息提供稳定的语义 flow 与 slot 属性；通过语义选择器定位气泡，
+    // 避免绑定构建时生成的 class，同时让两个表面只共享透明度而非完整造型。
+    let conversation_surfaces = conversation_surface_css(surface_rgb, conversation_surface_opacity);
     // 零值精确保留实验前的透明皮肤层级；只有正值才增加玻璃滤镜和装饰，
     // 因此升级旧设置不会在未授权保存时改变主窗口视觉。
     let glass_surfaces = if settings.glass_blur_px == 0 {

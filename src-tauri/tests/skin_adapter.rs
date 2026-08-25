@@ -197,7 +197,9 @@ fn script_checks_dom_before_painting_the_page_canvas() {
     assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
     assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
     assert!(script.contains("--dsw-specific-sidebar-fill:transparent !important"));
-    assert!(script.contains("[data-composer-card]{background:rgba(255,255,255,0.85)"));
+    assert!(script.contains(
+        "[data-composer-card]{position:relative;isolation:isolate;overflow:visible !important;background:rgba(255,255,255,0.85)"
+    ));
     assert!(!script.contains("--dsw-specific-input-major:transparent"));
     assert!(script.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
     assert!(script.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.88) !important"));
@@ -284,13 +286,19 @@ console.log(style?.textContent??'NO_STYLE');"#
 }
 
 #[test]
-fn composer_and_user_messages_share_the_conversation_surface_opacity() {
+fn composer_and_user_messages_share_opacity_but_keep_independent_shapes() {
     let css = execute_style_text(&fixture_settings());
 
-    assert!(css.contains("[data-composer-card]{background:rgba(255,255,255,0.85)"));
     assert!(css.contains(
-        "[data-chat-flow-kind=\"user\"] [data-slot=\"conversation.message.images\"]+div{background:rgba(255,255,255,0.85)"
+        "[data-composer-card]{position:relative;isolation:isolate;overflow:visible !important;background:rgba(255,255,255,0.85)"
     ));
+    assert!(css.contains("border-radius:22px !important"));
+    assert!(css.contains(
+        "[data-chat-flow-kind=\"user\"] [data-slot=\"conversation.message.images\"]+div{position:relative;isolation:isolate;overflow:visible !important;background:rgba(255,255,255,0.85)"
+    ));
+    assert!(css.contains("border-radius:18px 18px 6px 18px !important"));
+    assert!(css.contains("0 18px 48px rgba(0,0,0,0.18)"));
+    assert!(css.contains("0 10px 28px rgba(0,0,0,0.14)"));
 }
 
 #[test]
