@@ -367,6 +367,92 @@ describe("启动页", () => {
     expect(tauriMocks.invoke).toHaveBeenCalledWith("get_runtime_status");
   });
 
+  it("首次 IPC 瞬时失败后自动重新同步运行状态", async () => {
+    let runtimeAttempts = 0;
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_runtime_status") {
+        runtimeAttempts += 1;
+        if (runtimeAttempts === 1) {
+          throw new Error("bridge 尚未就绪");
+        }
+        return {
+          phase: "ready",
+          message: "DSH 已就绪",
+          url: "http://127.0.0.1:43127/",
+          pid: 43127,
+        };
+      }
+      if (command === "get_desktop_update_state") {
+        return {
+          revision: 6,
+          state: { phase: "up_to_date" },
+        };
+      }
+      return {
+        revision: 0,
+        state: {
+          revision: 0,
+          phase: "unavailable",
+          notificationsEnabled: true,
+          shouldNotify: false,
+        },
+      };
+    });
+
+    await import("./main");
+
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector("[data-status-message]")?.textContent,
+      ).toBe("DSH 已就绪");
+    });
+    expect(document.body.textContent).not.toContain("status_unavailable");
+  });
+
+  it("首次事件订阅瞬时失败后自动重新建立监听", async () => {
+    let runtimeListenAttempts = 0;
+    tauriMocks.listen.mockImplementation(async (eventName: string) => {
+      if (eventName === "runtime-status") {
+        runtimeListenAttempts += 1;
+        if (runtimeListenAttempts === 1) {
+          throw new Error("事件 bridge 尚未就绪");
+        }
+      }
+      return () => undefined;
+    });
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_runtime_status") {
+        return {
+          phase: "ready",
+          message: "DSH 已就绪",
+          url: "http://127.0.0.1:43127/",
+          pid: 43127,
+        };
+      }
+      if (command === "get_desktop_update_state") {
+        return { revision: 6, state: { phase: "up_to_date" } };
+      }
+      return {
+        revision: 0,
+        state: {
+          revision: 0,
+          phase: "unavailable",
+          notificationsEnabled: true,
+          shouldNotify: false,
+        },
+      };
+    });
+
+    await import("./main");
+
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector("[data-status-message]")?.textContent,
+      ).toBe("DSH 已就绪");
+    });
+    expect(runtimeListenAttempts).toBe(2);
+  });
+
   it("在请求状态快照前建立运行事件监听", async () => {
     const callOrder: string[] = [];
     tauriMocks.listen.mockImplementationOnce(async () => {
@@ -554,11 +640,25 @@ describe("启动页", () => {
   });
 
   it("状态初始化失败时不显示 bridge 返回的敏感正文", async () => {
-    tauriMocks.invoke.mockRejectedValueOnce(
-      new Error(
-        "AKIAIOSFODNN7EXAMPLE https://host/?token=x C:\\用户\\私密.json",
-      ),
-    );
+    tauriMocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_runtime_status") {
+        throw new Error(
+          "AKIAIOSFODNN7EXAMPLE https://host/?token=x C:\\用户\\私密.json",
+        );
+      }
+      if (command === "get_desktop_update_state") {
+        return { revision: 0, state: { phase: "unavailable" } };
+      }
+      return {
+        revision: 0,
+        state: {
+          revision: 0,
+          phase: "unavailable",
+          notificationsEnabled: true,
+          shouldNotify: false,
+        },
+      };
+    });
 
     await import("./main");
 

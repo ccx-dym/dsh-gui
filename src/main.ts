@@ -129,6 +129,28 @@ let updateBusy = false;
 let desktopUpdateState = createInitialDesktopUpdateState();
 let desktopUpdateBusy = false;
 
+const STARTUP_SYNC_ATTEMPTS = 3;
+const STARTUP_SYNC_RETRY_DELAY_MS = 100;
+
+async function retryStartupSync<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < STARTUP_SYNC_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < STARTUP_SYNC_ATTEMPTS) {
+        // Release WebView 可能先于 Rust 管理状态就绪；短暂等待后只重试初始同步，
+        // 避免把一次启动竞态永久呈现为不可恢复故障。
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, STARTUP_SYNC_RETRY_DELAY_MS);
+        });
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function resyncUpdateFailure(): Promise<void> {
   try {
     const snapshot = await invoke<UpdateStateEnvelope>("get_update_state");
@@ -312,12 +334,16 @@ async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
   let hasReceivedRuntimeEvent = false;
   try {
     // 先建立订阅以封闭启动竞态窗口；订阅期间的新事件优先于随后返回的旧快照。
-    await listen<RuntimeEvent>("runtime-status", ({ payload }) => {
-      hasReceivedRuntimeEvent = true;
-      status = reduceRuntimeEvent(status, payload);
-      renderRuntimeStatus(root, status);
-    });
-    const snapshot = await invoke<RuntimeStatus>("get_runtime_status");
+    await retryStartupSync(() =>
+      listen<RuntimeEvent>("runtime-status", ({ payload }) => {
+        hasReceivedRuntimeEvent = true;
+        status = reduceRuntimeEvent(status, payload);
+        renderRuntimeStatus(root, status);
+      }),
+    );
+    const snapshot = await retryStartupSync(() =>
+      invoke<RuntimeStatus>("get_runtime_status"),
+    );
     if (!hasReceivedRuntimeEvent) {
       status = snapshot;
       renderRuntimeStatus(root, status);
@@ -336,11 +362,15 @@ async function initializeRuntimeStatus(root: HTMLElement): Promise<void> {
 async function initializeUpdateState(): Promise<void> {
   try {
     // 与运行时状态一致：先订阅，再取 revision 快照；两者统一择新而非依赖布尔标记。
-    await listen<UpdateStateEnvelope>("update-state", ({ payload }) => {
-      updateState = reduceUpdateEvent(updateState, payload);
-      renderUpdateState(runtimeUpdateRoot, updateState);
-    });
-    const snapshot = await invoke<UpdateStateEnvelope>("get_update_state");
+    await retryStartupSync(() =>
+      listen<UpdateStateEnvelope>("update-state", ({ payload }) => {
+        updateState = reduceUpdateEvent(updateState, payload);
+        renderUpdateState(runtimeUpdateRoot, updateState);
+      }),
+    );
+    const snapshot = await retryStartupSync(() =>
+      invoke<UpdateStateEnvelope>("get_update_state"),
+    );
     updateState = reduceUpdateEvent(updateState, snapshot);
     renderUpdateState(runtimeUpdateRoot, updateState);
   } catch {
@@ -355,16 +385,18 @@ async function initializeUpdateState(): Promise<void> {
 
 async function initializeDesktopUpdateState(): Promise<void> {
   try {
-    await listen<DesktopUpdateEnvelope>("desktop-update-state", ({ payload }) => {
-      desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, payload);
-      renderDesktopUpdateState(
-        desktopUpdateRoot,
-        desktopUpdateState,
-        desktopUpdateBusy,
-      );
-    });
-    const snapshot = await invoke<DesktopUpdateEnvelope>(
-      "get_desktop_update_state",
+    await retryStartupSync(() =>
+      listen<DesktopUpdateEnvelope>("desktop-update-state", ({ payload }) => {
+        desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, payload);
+        renderDesktopUpdateState(
+          desktopUpdateRoot,
+          desktopUpdateState,
+          desktopUpdateBusy,
+        );
+      }),
+    );
+    const snapshot = await retryStartupSync(() =>
+      invoke<DesktopUpdateEnvelope>("get_desktop_update_state"),
     );
     desktopUpdateState = reduceDesktopUpdateEvent(desktopUpdateState, snapshot);
   } catch {

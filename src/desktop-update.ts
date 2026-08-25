@@ -61,8 +61,8 @@ export function desktopUpdatePresentation(
     case "unavailable":
       return {
         eyebrow: "桌面客户端",
-        heading: "客户端更新通道尚未配置",
-        body: "当前版本仍可使用，不影响已安装的 DSH。",
+        heading: "尚未检查客户端更新",
+        body: "可随时检查独立签名发布通道，不影响已安装的 DSH。",
         primaryAction: {
           command: "check_desktop_update",
           label: "检查客户端更新",

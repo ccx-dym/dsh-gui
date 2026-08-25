@@ -47,10 +47,21 @@ describe("桌面客户端更新", () => {
     expect(root.querySelector("img")).toBeNull();
   });
 
-  it("初始状态可安全呈现未配置通道", () => {
+  it("初始状态可安全呈现尚未检查", () => {
     expect(createInitialDesktopUpdateState()).toEqual({
       revision: 0,
       phase: "unavailable",
     });
+  });
+
+  it("未检查状态不误报更新通道缺失", () => {
+    const presentation = desktopUpdatePresentation({
+      revision: 0,
+      phase: "unavailable",
+    });
+
+    expect(presentation.heading).toBe("尚未检查客户端更新");
+    expect(presentation.body).not.toContain("通道尚未配置");
+    expect(presentation.primaryAction?.label).toBe("检查客户端更新");
   });
 });

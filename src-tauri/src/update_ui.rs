@@ -1200,6 +1200,33 @@ pub async fn cold_bootstrap(
     result
 }
 
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveDeploymentAvailability {
+    Installed,
+    NotInstalled,
+    Invalid,
+}
+
+#[cfg(any(not(debug_assertions), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetryableActivationPlan {
+    StartActiveWithNotice,
+    StayLocalWithNotice,
+    RecoveryRequired,
+}
+
+#[cfg(any(not(debug_assertions), test))]
+fn plan_retryable_activation(
+    availability: ActiveDeploymentAvailability,
+) -> RetryableActivationPlan {
+    match availability {
+        ActiveDeploymentAvailability::Installed => RetryableActivationPlan::StartActiveWithNotice,
+        ActiveDeploymentAvailability::NotInstalled => RetryableActivationPlan::StayLocalWithNotice,
+        ActiveDeploymentAvailability::Invalid => RetryableActivationPlan::RecoveryRequired,
+    }
+}
+
 #[cfg(not(debug_assertions))]
 async fn cold_bootstrap_inner(
     app: &AppHandle,
@@ -1273,7 +1300,48 @@ async fn cold_bootstrap_inner(
         }
     }
 
-    let Some(pending) = load_single_confirmed_pending(&update_controller.paths)? else {
+    let pending = match load_single_confirmed_pending(&update_controller.paths) {
+        Ok(pending) => pending,
+        Err("activation_retry_available") => {
+            let availability = match InstallStateStore::new(layout.clone()).load() {
+                Ok(_) => ActiveDeploymentAvailability::Installed,
+                Err(InstallStateError::NotInstalled) => ActiveDeploymentAvailability::NotInstalled,
+                Err(_) => ActiveDeploymentAvailability::Invalid,
+            };
+            match plan_retryable_activation(availability) {
+                RetryableActivationPlan::StartActiveWithNotice => {
+                    // 失败回执只约束候选版本的再次激活；当前权威 deployment 已经
+                    // 通过独立校验，可以继续服务用户，同时保留显式重试入口。
+                    app_controller
+                        .start_active_runtime()
+                        .map_err(|_| "runtime_start_failed")?;
+                    update_controller
+                        .publish_cold_phase(
+                            app,
+                            UpdateUiPhase::RecoveryRequired,
+                            Some("activation_retry_available"),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                RetryableActivationPlan::StayLocalWithNotice => {
+                    update_controller
+                        .publish_cold_phase(
+                            app,
+                            UpdateUiPhase::RecoveryRequired,
+                            Some("activation_retry_available"),
+                        )
+                        .await;
+                    return Ok(());
+                }
+                RetryableActivationPlan::RecoveryRequired => {
+                    return Err("activation_recovery_required");
+                }
+            }
+        }
+        Err(code) => return Err(code),
+    };
+    let Some(pending) = pending else {
         return match InstallStateStore::new(layout).load() {
             Ok(_) => app_controller
                 .start_active_runtime()
@@ -1822,13 +1890,14 @@ fn write_new_or_matching(path: &std::path::Path, bytes: &[u8]) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        ColdRecoveryPlan, ColdRecoveryResult, OrphanCandidateDisposition, PendingActivation,
-        ProgressPublishThrottle, UpdateUiController, UpdateUiPhase, UpdateUiState,
+        ActiveDeploymentAvailability, ColdRecoveryPlan, ColdRecoveryResult,
+        OrphanCandidateDisposition, PendingActivation, ProgressPublishThrottle,
+        RetryableActivationPlan, UpdateUiController, UpdateUiPhase, UpdateUiState,
         activation_receipt, active_skin_compatible, apply_notice, bounded_download_percent,
         confirmation_path, confirmation_skin_compatibility, finish_cold_recovery,
         inspect_orphan_candidate_with, load_single_confirmed_pending, pending_matches_active,
-        pending_path, persist_pending, plan_cold_recovery, recover_orphan_candidate_with,
-        refresh_active_runtime_state, write_activation_receipt,
+        pending_path, persist_pending, plan_cold_recovery, plan_retryable_activation,
+        recover_orphan_candidate_with, refresh_active_runtime_state, write_activation_receipt,
     };
 
     #[test]
@@ -2421,6 +2490,22 @@ mod tests {
                 .expect("新确认的 attempt 应可重试")
                 .generation,
             retry.generation
+        );
+    }
+
+    #[test]
+    fn pending_retry_receipt_still_starts_authoritative_deployment() {
+        assert_eq!(
+            plan_retryable_activation(ActiveDeploymentAvailability::Installed),
+            RetryableActivationPlan::StartActiveWithNotice
+        );
+        assert_eq!(
+            plan_retryable_activation(ActiveDeploymentAvailability::Invalid),
+            RetryableActivationPlan::RecoveryRequired
+        );
+        assert_eq!(
+            plan_retryable_activation(ActiveDeploymentAvailability::NotInstalled),
+            RetryableActivationPlan::StayLocalWithNotice
         );
     }
 
