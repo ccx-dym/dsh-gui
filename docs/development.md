@@ -54,9 +54,13 @@ stdout 就绪信号与 HTTP 200。runtime 目录本身保持只读，进程树�
 真实用户数据，也不安装、卸载或控制桌面进程。先对候选 NSIS 执行无 PID 预检：
 
 ```powershell
+$installer = Get-ChildItem -LiteralPath src-tauri/target/release/bundle/nsis `
+  -File -Filter 'DSH-Desktop_*_x64-setup.exe' |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
 pwsh -NoProfile -File scripts/rc-acceptance.ps1 `
-  -Installer src-tauri/target/release/bundle/nsis/DSH-Desktop_0.1.13_x64-setup.exe `
-  -AuditDirectory C:/rc-audit/dsh-desktop-0.1.13-preflight
+  -Installer $installer.FullName `
+  -AuditDirectory C:/rc-audit/dsh-desktop-current-preflight
 ```
 
 脚本记录三处一致的 Desktop 版本、Git commit、Windows/WebView2、安装包字节数、SHA-256
@@ -69,8 +73,8 @@ pwsh -NoProfile -File scripts/rc-acceptance.ps1 `
 
 ```powershell
 pwsh -NoProfile -File scripts/rc-acceptance.ps1 `
-  -Installer src-tauri/target/release/bundle/nsis/DSH-Desktop_0.1.13_x64-setup.exe `
-  -AuditDirectory C:/rc-audit/dsh-desktop-0.1.13-default `
+  -Installer $installer.FullName `
+  -AuditDirectory C:/rc-audit/dsh-desktop-current-default `
   -DesktopProcessId 1234 `
   -ObservationSeconds 60
 ```
@@ -94,7 +98,8 @@ pnpm check
 ## Windows RC 手工验收矩阵
 
 必须使用全新的、专门用于本轮 RC 的数据目录和当前用户安装；不得把个人真实 DSH_HOME
-作为验收输入。自动化结果不能替代以下 GUI、托盘、通知和进程树检查：
+作为验收输入。自动化结果不能替代以下 GUI、托盘、通知和进程树检查。下表保留了早期
+RC 的真实基线，带版本号的结果属于对应历史版本，不能直接视为当前 RC 已通过：
 
 | 场景 | 操作与通过条件 | 实测 |
 | --- | --- | --- |
@@ -136,14 +141,14 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
 
 | 项目 | 实测值 |
 | --- | --- |
-| RC 版本 / commit | `0.1.7` / `ae8128e7a5836042fca21c38e3f502bfb22ba507` |
-| 安装包字节数 / SHA-256 | 4,468,819 / `37690B0DA664348A5D95B16E6C6F43101E8DFABFF8A70DC0B49260FC18335808` |
-| Tauri updater 签名 | `0.1.7` detached signature 与 `desktop-stable/latest.json` 独立验证通过；Windows Authenticode 代码签名未配置 |
+| RC 版本 / commit | `0.1.18` / `90a7813e7f818c1b9b50188d1d94cb187cd0d58a` |
+| 安装包字节数 / SHA-256 | 4,513,415 / `98FA5931877C4C792CB30E86EFCB60AF8774E187DFAB8F9A9DC48AAF51CAF097` |
+| Tauri updater 签名 | `0.1.18` detached signature 使用发布环境公钥独立验证通过；Windows Authenticode 状态为 `NotSigned` |
 | Windows 版本 / build | Windows 11 专业版 / 26200 |
 | CPU / 逻辑处理器 / 内存 | AMD Ryzen 9 9950X3D / 32 / 95.6 GiB |
-| WebView2 版本 | 151.0.4129.93 |
-| DSH 版本 / 适配器状态 | `0.1.1-rc.2` runtime 已由 `0.1.7` 真实 GUI 激活并进入官方 WebUI；皮肤业务交互仍待验收 |
-| 安全烟雾审计目录 | `%TEMP%\dsh-desktop-runtime-smoke\0a152cfbaa0047469c500facfcd8a93e`（已保留） |
+| WebView2 版本 | 151.0.4129.101 |
+| DSH 版本 / 适配器状态 | `0.1.1-rc.2` 官方 WebUI 在安全重试后可见，输入卡片的金色轮廓、点珠和右下藤蔓已实际显示；完整聊天视觉矩阵仍待验收 |
+| RC 预检审计目录 | `%TEMP%\dsh-rc-0.1.18-docs-cb381863a6dc42889c121c1118450610`（结果按设计为 `not_run`，证据已保留） |
 
 ### GUI 验收步骤
 
@@ -167,6 +172,9 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
     更新”窗口继续使用 Windows 原生标题栏。
 11. 在 100% 和 125% Windows 缩放下分别检查普通与最大化状态，确认标题栏按钮、拖动区
     和页面布局未错位。
+12. 检查固定 C×H 对话装饰：输入卡片显示左上藤蔓、顶部卷草、右下藤蔓和底边点珠；
+    用户气泡只显示右上花枝和左下卷草；长消息、多行输入不重叠，所有控件仍可点击；窗口
+    宽度不大于 `900px` 时只隐藏输入卡片的中央卷草和点珠。
 
 | GUI 场景 | 结果 | 证据/备注（脱敏） |
 | --- | --- | --- |
@@ -178,6 +186,7 @@ NSIS 当前用户安装和真实 WebView2；选择专门用于测试的 PNG、JP
 | 无效、损坏、超大和超尺寸错误 | 待实测 | 待记录 |
 | DSH 业务交互无回归 | 待实测 | 待记录 |
 | 不支持版本/DOM 失败关闭回退 | 自动门禁通过 | `0.1.1-rc.2` 官方页面已加载；不支持版本的真实回退仍待实测 |
+| C×H 输入卡片与用户气泡装饰 | 部分通过 | `0.1.18` 实际显示输入卡片金色轮廓、点珠和右下藤蔓；用户气泡、长文本、多行输入和窄窗口矩阵仍待实测 |
 
 ### 默认视觉与 8K 皮肤性能对照
 

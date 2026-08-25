@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">DSH Desktop 0.1.18 沉浸式对话效果示意</title>
+  <desc id="desc">连续背景上的桌面侧栏、用户消息气泡和植物系巴洛克输入卡片。</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#101d3d"/>
+      <stop offset="0.55" stop-color="#253f72"/>
+      <stop offset="1" stop-color="#76638f"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7b8fbe" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#122441" stop-opacity=".75"/>
+    </linearGradient>
+    <radialGradient id="moon">
+      <stop offset="0" stop-color="#fff1c4"/>
+      <stop offset="1" stop-color="#e7cda1" stop-opacity=".72"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#050914" flood-opacity=".32"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="675" rx="20" fill="url(#sky)"/>
+  <circle cx="780" cy="155" r="72" fill="url(#moon)" opacity=".72"/>
+  <path d="M250 505C430 405 600 450 770 385C925 325 1050 380 1200 300V675H0V570C90 550 165 545 250 505Z" fill="url(#water)"/>
+  <g fill="#d6e3ff" opacity=".3">
+    <circle cx="520" cy="95" r="3"/><circle cx="645" cy="68" r="2"/><circle cx="925" cy="105" r="3"/>
+    <circle cx="1100" cy="220" r="2"/><circle cx="455" cy="240" r="2"/>
+  </g>
+
+  <rect width="1200" height="38" fill="#08162b" fill-opacity=".76"/>
+  <circle cx="20" cy="19" r="7" fill="#62c8f4"/>
+  <text x="38" y="25" fill="#eaf4ff" font-family="Segoe UI, sans-serif" font-size="14">DSH Desktop</text>
+  <g fill="none" stroke="#dbe8ff" stroke-width="1.5" opacity=".85">
+    <path d="M1120 19h14"/><rect x="1150" y="14" width="10" height="10"/><path d="M1179 14l10 10m0-10-10 10"/>
+  </g>
+
+  <rect x="0" y="38" width="250" height="637" fill="#07182e" fill-opacity=".62"/>
+  <text x="24" y="86" fill="#f1f6ff" font-family="Segoe UI, sans-serif" font-size="22" font-weight="600">deepseek</text>
+  <rect x="18" y="118" width="214" height="44" rx="12" fill="#ffffff" fill-opacity=".13" stroke="#ffffff" stroke-opacity=".18"/>
+  <text x="86" y="146" fill="#f6f8ff" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="15">＋ 新会话</text>
+  <text x="22" y="204" fill="#aebdd5" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="14">工作区</text>
+  <rect x="14" y="232" width="222" height="42" rx="9" fill="#6d8fc5" fill-opacity=".25"/>
+  <text x="34" y="258" fill="#ecf4ff" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="14">沉浸式皮肤预览</text>
+  <text x="22" y="638" fill="#e5efff" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="14">⚙ 设置</text>
+
+  <text x="292" y="84" fill="#f1f5ff" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="16">对话</text>
+  <line x1="292" y1="99" x2="334" y2="99" stroke="#69a6ff" stroke-width="2"/>
+
+  <g filter="url(#shadow)">
+    <rect x="900" y="120" width="245" height="74" rx="20" fill="#101622" fill-opacity=".82" stroke="#ffd397" stroke-opacity=".7"/>
+    <text x="932" y="164" fill="#f8f8fb" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="17">这个边框可以单独设置吗？</text>
+    <path d="M1136 121c-20 8-28 20-31 38m7-18c10-1 16 5 17 14m-19-3c-9 0-14 7-13 15" fill="none" stroke="#a9dda4" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="1110" cy="151" r="5" fill="#f3abd3"/><circle cx="1110" cy="151" r="2" fill="#ffd397"/>
+    <path d="M900 187c18-1 25-13 36-13 12 0 8 14-2 11" fill="none" stroke="#ffd397" stroke-width="1.5"/>
+  </g>
+
+  <g fill="#f4f6ff" font-family="Microsoft YaHei, Segoe UI, sans-serif">
+    <text x="330" y="252" font-size="18" font-weight="600">可以。输入卡片和历史问题气泡现在使用两套独立造型。</text>
+    <text x="330" y="292" font-size="16" fill="#dbe5f6">装饰由固定内嵌 SVG 绘制，不会拦截点击，也不会随背景拉伸。</text>
+    <text x="330" y="329" font-size="16" fill="#dbe5f6">窄窗口会隐藏中央卷草和点珠，保留两侧角花。</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="315" y="492" width="820" height="132" rx="24" fill="#111722" fill-opacity=".84" stroke="#ffd397" stroke-opacity=".8"/>
+    <text x="350" y="546" fill="#aeb5c3" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="17">给智能体发消息</text>
+    <line x1="350" y1="583" x2="1098" y2="583" stroke="#ffffff" stroke-opacity=".08"/>
+    <circle cx="350" cy="603" r="15" fill="#ffffff" fill-opacity=".12"/>
+    <path d="M343 603h14m-7-7v14" stroke="#dbe5f6" stroke-width="1.5"/>
+    <text x="380" y="609" fill="#e2e8f3" font-family="Segoe UI, sans-serif" font-size="14">Workspace Write</text>
+    <circle cx="1094" cy="601" r="18" fill="#547ab9"/>
+    <path d="M1094 610V592m0 0-7 7m7-7 7 7" fill="none" stroke="#edf4ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <path d="M318 548c8-26 20-40 44-50 14-6 25-14 34-27" fill="none" stroke="#a9dda4" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M342 516c-13-4-14-14-9-22 11 1 17 9 9 22m28-24c-7-10-1-18 9-21 6 9 3 18-9 21" fill="#a9dda4" fill-opacity=".9"/>
+    <circle cx="359" cy="501" r="7" fill="#f3abd3"/><circle cx="359" cy="501" r="3" fill="#ffd397"/>
+
+    <path d="M1054 620c16-20 31-29 53-34 13-3 22-12 27-27" fill="none" stroke="#a9dda4" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M1090 592c0-12 9-17 18-14 0 10-6 16-18 14m24-14c-2-10 5-15 14-15 2 9-4 15-14 15" fill="#a9dda4" fill-opacity=".9"/>
+    <circle cx="1108" cy="588" r="7" fill="#f3abd3"/><circle cx="1108" cy="588" r="3" fill="#ffd397"/>
+
+    <path d="M650 495c34 0 44 14 65 7 9-3 9-13 10-14 1 1 1 11 10 14 21 7 31-7 65-7" fill="none" stroke="#ffd397" stroke-width="1.6" stroke-linecap="round"/>
+    <path d="M716 501l9-10 9 10-9 9z" fill="#f3abd3" stroke="#ffd397"/>
+    <line x1="650" y1="620" x2="800" y2="620" stroke="#ffd397" stroke-opacity=".55"/>
+    <g fill="#f3abd3"><circle cx="690" cy="620" r="2.5"/><circle cx="708" cy="620" r="2.5"/><circle cx="726" cy="620" r="2.5"/><circle cx="744" cy="620" r="2.5"/><circle cx="762" cy="620" r="2.5"/></g>
+  </g>
+
+  <rect x="955" y="642" width="215" height="24" rx="12" fill="#07101f" fill-opacity=".74"/>
+  <text x="1062" y="659" text-anchor="middle" fill="#dce7f8" font-family="Microsoft YaHei, Segoe UI, sans-serif" font-size="12">0.1.18 效果示意 · 非真实会话截图</text>
+</svg>
