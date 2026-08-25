@@ -318,7 +318,32 @@ fn botanical_baroque_decorations_use_fixed_noninteractive_svg_layers() {
 }
 
 #[test]
-fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
+fn narrow_windows_hide_secondary_composer_ornaments_without_removing_corners() {
+    let css = execute_style_text(&fixture_settings());
+
+    assert!(css.contains(
+        "@media(max-width:900px){[data-composer-card]::before{background-size:72px 64px,0 0,72px 64px,0 0}}"
+    ));
+    assert_eq!(css.matches("data:image/svg+xml").count(), 6);
+}
+
+#[test]
+fn fixed_conversation_ornaments_do_not_depend_on_glass_blur() {
+    for radius in [0, 16] {
+        let mut settings = fixture_settings();
+        settings.glass_blur_px = radius;
+        let css = execute_style_text(&settings);
+
+        assert!(css.contains("[data-composer-card]::before"));
+        assert!(css.contains(
+            "[data-chat-flow-kind=\"user\"] [data-slot=\"conversation.message.images\"]+div::before"
+        ));
+        assert_eq!(css.matches("data:image/svg+xml").count(), 6);
+    }
+}
+
+#[test]
+fn zero_glass_blur_keeps_one_wallpaper_without_backdrop_filter() {
     let mut settings = fixture_settings();
     settings.glass_blur_px = 0;
     let css = execute_style_text(&settings);
@@ -328,6 +353,8 @@ fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
     assert!(!css.contains(".pI_x6G_centerCol{"));
     assert!(css.contains("[data-chat-flow-kind=\"user\"]"));
     assert!(css.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
+    assert!(css.contains("[data-composer-card]::before"));
+    assert_eq!(css.matches("data:image/svg+xml").count(), 6);
 }
 
 #[test]

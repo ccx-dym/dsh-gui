@@ -145,7 +145,7 @@ pub fn adapter_script(settings: &SkinSettings) -> Option<String> {
 fn conversation_decoration_css() -> String {
     // 每个图层保持独立尺寸和锚点；中心透明，业务内容仍由真实 DOM 绘制。
     format!(
-        r#"{composer}::before{{content:"";position:absolute;inset:-3px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{top_left}"),url("{crest}"),url("{bottom_right}"),url("{beads}");background-position:left top,center top,right bottom,center bottom;background-size:72px 64px,124px 24px,72px 64px,156px 8px;background-repeat:no-repeat}}{message}::before{{content:"";position:absolute;inset:-2px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{sprig}"),url("{flourish}");background-position:right top,left bottom;background-size:58px 42px,48px 28px;background-repeat:no-repeat}}"#,
+        r#"{composer}::before{{content:"";position:absolute;inset:-3px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{top_left}"),url("{crest}"),url("{bottom_right}"),url("{beads}");background-position:left top,center top,right bottom,center bottom;background-size:72px 64px,124px 24px,72px 64px,156px 8px;background-repeat:no-repeat}}{message}::before{{content:"";position:absolute;inset:-2px;z-index:0;pointer-events:none;border-radius:inherit;background-image:url("{sprig}"),url("{flourish}");background-position:right top,left bottom;background-size:58px 42px,48px 28px;background-repeat:no-repeat}}@media(max-width:900px){{{composer}::before{{background-size:72px 64px,0 0,72px 64px,0 0}}}}"#,
         composer = COMPOSER_SELECTOR,
         message = USER_MESSAGE_SELECTOR,
         top_left = COMPOSER_TOP_LEFT_VINE_SVG,
