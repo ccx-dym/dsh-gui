@@ -25,6 +25,7 @@ fn fixture_settings() -> SkinSettings {
         mask_tone: MaskTone::Light,
         mask_opacity_percent: 22,
         panel_opacity_percent: 88,
+        conversation_surface_opacity_percent: 85,
     }
 }
 
@@ -196,7 +197,7 @@ fn script_checks_dom_before_painting_the_page_canvas() {
     assert!(script.contains(":root,#root{--dsw-alias-bg-base:"));
     assert!(script.contains("--dsw-alias-bg-base:transparent !important"));
     assert!(script.contains("--dsw-specific-sidebar-fill:transparent !important"));
-    assert!(script.contains("[data-composer-card]{background:transparent !important}"));
+    assert!(script.contains("[data-composer-card]{background:rgba(255,255,255,0.85)"));
     assert!(!script.contains("--dsw-specific-input-major:transparent"));
     assert!(script.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
     assert!(script.contains("--dsw-alias-bg-layer-2:rgba(255,255,255,0.88) !important"));
@@ -283,6 +284,16 @@ console.log(style?.textContent??'NO_STYLE');"#
 }
 
 #[test]
+fn composer_and_user_messages_share_the_conversation_surface_opacity() {
+    let css = execute_style_text(&fixture_settings());
+
+    assert!(css.contains("[data-composer-card]{background:rgba(255,255,255,0.85)"));
+    assert!(css.contains(
+        "[data-chat-flow-kind=\"user\"] [data-slot=\"conversation.message.images\"]+div{background:rgba(255,255,255,0.85)"
+    ));
+}
+
+#[test]
 fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
     let mut settings = fixture_settings();
     settings.glass_blur_px = 0;
@@ -291,7 +302,7 @@ fn zero_glass_blur_keeps_one_wallpaper_without_glass_decorations() {
     assert_eq!(css.matches("http://dsh-skin.localhost/").count(), 1);
     assert!(!css.contains("backdrop-filter"));
     assert!(!css.contains(".pI_x6G_centerCol{"));
-    assert!(!css.contains("box-shadow:inset"));
+    assert!(css.contains("[data-chat-flow-kind=\"user\"]"));
     assert!(css.contains("--dsw-alias-bg-layer-1:rgba(255,255,255,0.88) !important"));
 }
 

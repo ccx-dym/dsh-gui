@@ -132,6 +132,8 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
     };
     // schema 1 保留旧字段名，避免现有设置失效；此值只控制壁纸层，不再控制 DSH 面板。
     let image_opacity = f32::from(settings.panel_opacity_percent) / 100.0;
+    let conversation_surface_opacity =
+        f32::from(settings.conversation_surface_opacity_percent) / 100.0;
     let mask_opacity = f32::from(settings.mask_opacity_percent) / 100.0;
     let blur_scale = 1.0 + f32::from(settings.blur_px) / 500.0;
     // 图片与遮罩使用两个固定伪元素：调低图片透明度不会同步淡化遮罩或正文。
@@ -139,11 +141,16 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
         r#"body::before{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:url("http://dsh-skin.localhost/{digest}");background-repeat:no-repeat;background-size:{background_size};background-position:{background_position};filter:blur({blur}px);transform:scale({blur_scale:.3});transform-origin:center;opacity:{image_opacity:.2};will-change:transform,opacity}}body::after{{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:rgba({mask_rgb},{mask_opacity:.2})}}"#,
         blur = settings.blur_px,
     );
+    // DSH 为用户消息提供稳定的语义 flow 与 slot 属性；通过二者的相邻关系定位气泡，
+    // 避免绑定构建时生成的 class。输入框和气泡复用同一组声明，保证共享滑块视觉一致。
+    let conversation_surfaces = format!(
+        r#"[data-composer-card]{{background:rgba({surface_rgb},{conversation_surface_opacity:.2}) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}[data-chat-flow-kind="user"] [data-slot="conversation.message.images"]+div{{background:rgba({surface_rgb},{conversation_surface_opacity:.2}) !important;border:1px solid rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}"#,
+    );
     // 零值精确保留实验前的透明皮肤层级；只有正值才增加玻璃滤镜和装饰，
     // 因此升级旧设置不会在未授权保存时改变主窗口视觉。
     let glass_surfaces = if settings.glass_blur_px == 0 {
         format!(
-            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.88) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.88) !important;--dsw-specific-sidebar-fill:transparent !important;--dsh-desktop-border-opacity:0.88 !important}}[data-composer-card]{{background:transparent !important}}"#,
+            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.88) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.88) !important;--dsw-specific-sidebar-fill:transparent !important;--dsh-desktop-border-opacity:0.88 !important}}{conversation_surfaces}"#,
         )
     } else {
         let glass_blur_px = settings.glass_blur_px;
@@ -152,7 +159,7 @@ fn adapter_script_for_page(settings: &SkinSettings, page_token: u64) -> Option<S
         // fixed 设置抽屉以窄列为包含块。滤镜统一放在正文后的全窗口遮罩层，各表面
         // 只保留经过版本门禁验证的半透明染色和边缘装饰。
         format!(
-            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.50) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.74) !important;--dsw-specific-sidebar-fill:rgba({surface_rgb},0.18) !important;--dsh-desktop-border-opacity:0.58 !important}}body::after{{backdrop-filter:{glass_filter};-webkit-backdrop-filter:{glass_filter}}}.pI_x6G_centerCol{{background:rgba({surface_rgb},0.20) !important}}.pI_x6G_sidebarCol{{background:rgba({surface_rgb},0.30) !important;box-shadow:inset -1px 0 0 rgba(255,255,255,0.18),12px 0 36px rgba(0,0,0,0.12)}}.pI_x6G_detailsCol{{background:rgba({surface_rgb},0.34) !important;box-shadow:inset 1px 0 0 rgba(255,255,255,0.16),-12px 0 36px rgba(0,0,0,0.10)}}[data-composer-card]{{background:rgba({surface_rgb},0.36) !important;border-color:rgba(255,255,255,0.56) !important;box-shadow:inset 0 1px 0 rgba(255,255,255,0.20),0 18px 48px rgba(0,0,0,0.18)}}#dsh-desktop-titlebar{{background:rgba({surface_rgb},0.24);border-bottom:1px solid rgba(255,255,255,0.42);box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 30px rgba(0,0,0,0.12)}}"#,
+            r#":root,#root{{--dsw-alias-bg-base:transparent !important;--dsw-alias-bg-layer-1:rgba({surface_rgb},0.50) !important;--dsw-alias-bg-layer-2:rgba({surface_rgb},0.74) !important;--dsw-specific-sidebar-fill:rgba({surface_rgb},0.18) !important;--dsh-desktop-border-opacity:0.58 !important}}body::after{{backdrop-filter:{glass_filter};-webkit-backdrop-filter:{glass_filter}}}.pI_x6G_centerCol{{background:rgba({surface_rgb},0.20) !important}}.pI_x6G_sidebarCol{{background:rgba({surface_rgb},0.30) !important;box-shadow:inset -1px 0 0 rgba(255,255,255,0.18),12px 0 36px rgba(0,0,0,0.12)}}.pI_x6G_detailsCol{{background:rgba({surface_rgb},0.34) !important;box-shadow:inset 1px 0 0 rgba(255,255,255,0.16),-12px 0 36px rgba(0,0,0,0.10)}}{conversation_surfaces}#dsh-desktop-titlebar{{background:rgba({surface_rgb},0.24);border-bottom:1px solid rgba(255,255,255,0.42);box-shadow:inset 0 1px 0 rgba(255,255,255,0.16),0 10px 30px rgba(0,0,0,0.12)}}"#,
         )
     };
 

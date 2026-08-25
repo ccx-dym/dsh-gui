@@ -18,6 +18,7 @@ const savedEnvelope: SkinStateEnvelopeWire = {
     mask_tone: "light",
     mask_opacity_percent: 22,
     panel_opacity_percent: 88,
+    conversation_surface_opacity_percent: 85,
   },
 };
 
@@ -29,20 +30,28 @@ describe("皮肤草稿 reducer", () => {
       glassBlurPx: 99.8,
       maskOpacityPercent: -4,
       imageOpacityPercent: -1,
+      conversationSurfaceOpacityPercent: -1,
     });
 
     expect(state.draft.blurPx).toBe(32);
     expect(state.draft.glassBlurPx).toBe(32);
     expect(state.draft.maskOpacityPercent).toBe(0);
     expect(state.draft.imageOpacityPercent).toBe(0);
+    expect(state.draft.conversationSurfaceOpacityPercent).toBe(0);
 
     const maximum = reduceSkinDraft(state, {
       type: "visuals",
       imageOpacityPercent: 101,
+      conversationSurfaceOpacityPercent: 101,
     });
     expect(maximum.draft.imageOpacityPercent).toBe(100);
+    expect(maximum.draft.conversationSurfaceOpacityPercent).toBe(100);
     expect(skinDraftToWire(maximum.draft).panel_opacity_percent).toBe(100);
     expect(skinDraftToWire(maximum.draft).glass_blur_px).toBe(32);
+    expect(
+      skinDraftToWire(maximum.draft)
+        .conversation_surface_opacity_percent,
+    ).toBe(100);
   });
 
   it("选图只更新本地草稿且不改变已提交 revision", () => {

@@ -48,6 +48,7 @@ fn fixture_protocol(name: &str) -> ProtocolFixture {
                 mask_tone: MaskTone::Light,
                 mask_opacity_percent: 22,
                 panel_opacity_percent: 88,
+                conversation_surface_opacity_percent: 85,
             },
         )
         .expect("register active image");
@@ -160,6 +161,7 @@ fn rejects_registered_file_larger_than_the_protocol_read_bound() {
                 mask_tone: MaskTone::Light,
                 mask_opacity_percent: 22,
                 panel_opacity_percent: 88,
+                conversation_surface_opacity_percent: 85,
             },
         )
         .expect("register oversize fixture");

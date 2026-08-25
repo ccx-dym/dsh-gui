@@ -86,6 +86,8 @@ pub struct SkinDraft {
     pub mask_opacity_percent: u8,
     /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
     pub panel_opacity_percent: u8,
+    /// 输入框与用户消息气泡共用的表面不透明度百分比。
+    pub conversation_surface_opacity_percent: u8,
 }
 
 /// 已提交且可注入主窗口的皮肤设置。
@@ -103,6 +105,8 @@ pub struct SkinSettings {
     pub mask_opacity_percent: u8,
     /// schema 1 兼容字段；当前语义为背景图片不透明度百分比。
     pub panel_opacity_percent: u8,
+    /// 输入框与用户消息气泡共用的表面不透明度百分比。
+    pub conversation_surface_opacity_percent: u8,
 }
 
 impl Default for SkinSettings {
@@ -117,6 +121,7 @@ impl Default for SkinSettings {
             mask_tone: MaskTone::Light,
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,
+            conversation_surface_opacity_percent: 85,
         }
     }
 }
@@ -133,6 +138,7 @@ impl From<SkinDraft> for SkinSettings {
             mask_tone: value.mask_tone,
             mask_opacity_percent: value.mask_opacity_percent,
             panel_opacity_percent: value.panel_opacity_percent,
+            conversation_surface_opacity_percent: value.conversation_surface_opacity_percent,
         }
     }
 }

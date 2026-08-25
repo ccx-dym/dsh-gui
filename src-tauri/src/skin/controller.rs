@@ -368,6 +368,7 @@ mod tests {
             mask_tone: MaskTone::Light,
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,
+            conversation_surface_opacity_percent: 85,
         }
     }
 
@@ -383,6 +384,7 @@ mod tests {
             mask_tone: defaults.mask_tone,
             mask_opacity_percent: defaults.mask_opacity_percent,
             panel_opacity_percent: defaults.panel_opacity_percent,
+            conversation_surface_opacity_percent: defaults.conversation_surface_opacity_percent,
         }
     }
 

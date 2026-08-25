@@ -19,6 +19,7 @@ const envelope = {
     mask_tone: "dark" as const,
     mask_opacity_percent: 34,
     panel_opacity_percent: 82,
+    conversation_surface_opacity_percent: 85,
   },
 };
 
@@ -161,6 +162,31 @@ describe("外观设置", () => {
     dispose();
   });
 
+  it("输入框与我的消息共用一个不透明度滑块", async () => {
+    const root = document.querySelector<HTMLElement>("#app")!;
+    const dispose = await initializeAppearance(root, bridge());
+    const slider = root.querySelector<HTMLInputElement>(
+      "#skin-conversation-surface-opacity",
+    )!;
+    const output = root.querySelector<HTMLOutputElement>(
+      "output[for='skin-conversation-surface-opacity']",
+    )!;
+
+    expect(
+      root.querySelector("label[for='skin-conversation-surface-opacity']")
+        ?.textContent,
+    ).toBe("输入框与我的消息不透明度");
+    expect(slider.min).toBe("0");
+    expect(slider.max).toBe("100");
+    expect(slider.value).toBe("85");
+
+    slider.value = "73";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(output.textContent).toBe("73%");
+    dispose();
+  });
+
   it("关闭沉浸模式隐藏背景和遮罩并可在原节点恢复", () => {
     const root = document.querySelector<HTMLElement>("#app")!;
     const enabled = createInitialSkinState(envelope);
@@ -230,6 +256,7 @@ describe("外观设置", () => {
         blur_px: 12,
         glass_blur_px: 0,
         panel_opacity_percent: 82,
+        conversation_surface_opacity_percent: 85,
       }),
     });
     expect(root.querySelector<HTMLButtonElement>("[data-action='save']")?.disabled).toBe(true);

@@ -8,12 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
+const PREVIOUS_SCHEMA_VERSION: u8 = 2;
 const LEGACY_SCHEMA_VERSION: u8 = 1;
 const MAX_BLUR_PX: u8 = 32;
 const MAX_GLASS_BLUR_PX: u8 = 32;
 const MAX_MASK_OPACITY_PERCENT: u8 = 80;
 const MAX_IMAGE_OPACITY_PERCENT: u8 = 100;
+const MAX_CONVERSATION_SURFACE_OPACITY_PERCENT: u8 = 100;
 const DIGEST_LENGTH: usize = 64;
 const REGISTERED_EXTENSIONS: [&str; 3] = ["png", "jpg", "webp"];
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -102,6 +104,28 @@ struct PersistedSkinStateV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PersistedSkinStateV2 {
+    schema: u8,
+    revision: u64,
+    settings: SkinSettingsV2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkinSettingsV2 {
+    immersive: bool,
+    image_digest: Option<String>,
+    fit: SkinFit,
+    position: SkinPosition,
+    blur_px: u8,
+    glass_blur_px: u8,
+    mask_tone: MaskTone,
+    mask_opacity_percent: u8,
+    panel_opacity_percent: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SkinSettingsV1 {
     immersive: bool,
     image_digest: Option<String>,
@@ -117,6 +141,15 @@ struct SkinSettingsV1 {
 struct LoadedSkinState {
     envelope: SkinStateEnvelope,
     target_guard: Option<SettingsFileGuard>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SkinVisualFields {
+    blur_px: u8,
+    glass_blur_px: u8,
+    mask_opacity_percent: u8,
+    image_opacity_percent: u8,
+    conversation_surface_opacity_percent: u8,
 }
 
 /// 串行化 revision 更新并原子持久化的皮肤设置仓库。
@@ -202,6 +235,7 @@ impl SkinStore {
                 mask_tone: defaults.mask_tone,
                 mask_opacity_percent: defaults.mask_opacity_percent,
                 panel_opacity_percent: defaults.panel_opacity_percent,
+                conversation_surface_opacity_percent: defaults.conversation_surface_opacity_percent,
             },
         )
     }
@@ -251,6 +285,30 @@ impl SkinStore {
                         mask_tone: settings.mask_tone,
                         mask_opacity_percent: settings.mask_opacity_percent,
                         panel_opacity_percent: settings.panel_opacity_percent,
+                        conversation_surface_opacity_percent: 85,
+                    },
+                }
+            }
+            schema if schema == u64::from(PREVIOUS_SCHEMA_VERSION) => {
+                let PersistedSkinStateV2 {
+                    schema,
+                    revision,
+                    settings,
+                } = serde_json::from_value(value).map_err(|_| SkinError::CorruptSettings)?;
+                debug_assert_eq!(schema, PREVIOUS_SCHEMA_VERSION);
+                SkinStateEnvelope {
+                    revision,
+                    settings: SkinSettings {
+                        immersive: settings.immersive,
+                        image_digest: settings.image_digest,
+                        fit: settings.fit,
+                        position: settings.position,
+                        blur_px: settings.blur_px,
+                        glass_blur_px: settings.glass_blur_px,
+                        mask_tone: settings.mask_tone,
+                        mask_opacity_percent: settings.mask_opacity_percent,
+                        panel_opacity_percent: settings.panel_opacity_percent,
+                        conversation_surface_opacity_percent: 85,
                     },
                 }
             }
@@ -285,10 +343,13 @@ impl SkinStore {
         self.validate_fields(
             settings.immersive,
             settings.image_digest.as_deref(),
-            settings.blur_px,
-            settings.glass_blur_px,
-            settings.mask_opacity_percent,
-            settings.panel_opacity_percent,
+            SkinVisualFields {
+                blur_px: settings.blur_px,
+                glass_blur_px: settings.glass_blur_px,
+                mask_opacity_percent: settings.mask_opacity_percent,
+                image_opacity_percent: settings.panel_opacity_percent,
+                conversation_surface_opacity_percent: settings.conversation_surface_opacity_percent,
+            },
         )
     }
 
@@ -296,10 +357,13 @@ impl SkinStore {
         self.validate_fields(
             draft.immersive,
             draft.image_digest.as_deref(),
-            draft.blur_px,
-            draft.glass_blur_px,
-            draft.mask_opacity_percent,
-            draft.panel_opacity_percent,
+            SkinVisualFields {
+                blur_px: draft.blur_px,
+                glass_blur_px: draft.glass_blur_px,
+                mask_opacity_percent: draft.mask_opacity_percent,
+                image_opacity_percent: draft.panel_opacity_percent,
+                conversation_surface_opacity_percent: draft.conversation_surface_opacity_percent,
+            },
         )
     }
 
@@ -307,16 +371,15 @@ impl SkinStore {
         &self,
         immersive: bool,
         image_digest: Option<&str>,
-        blur_px: u8,
-        glass_blur_px: u8,
-        mask_opacity_percent: u8,
-        panel_opacity_percent: u8,
+        visual: SkinVisualFields,
     ) -> Result<(), SkinError> {
-        if blur_px > MAX_BLUR_PX
-            || glass_blur_px > MAX_GLASS_BLUR_PX
-            || mask_opacity_percent > MAX_MASK_OPACITY_PERCENT
+        if visual.blur_px > MAX_BLUR_PX
+            || visual.glass_blur_px > MAX_GLASS_BLUR_PX
+            || visual.mask_opacity_percent > MAX_MASK_OPACITY_PERCENT
             // schema 1 的字段名为 panel_opacity_percent；新版本保留该键并将其解释为图片透明度。
-            || panel_opacity_percent > MAX_IMAGE_OPACITY_PERCENT
+            || visual.image_opacity_percent > MAX_IMAGE_OPACITY_PERCENT
+            || visual.conversation_surface_opacity_percent
+                > MAX_CONVERSATION_SURFACE_OPACITY_PERCENT
             || image_digest.is_some_and(|digest| !is_canonical_digest(digest))
         {
             return Err(SkinError::InvalidSettings);

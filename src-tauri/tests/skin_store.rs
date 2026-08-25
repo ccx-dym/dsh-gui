@@ -34,6 +34,7 @@ fn valid_draft() -> SkinDraft {
         mask_tone: MaskTone::Light,
         mask_opacity_percent: 24,
         panel_opacity_percent: 86,
+        conversation_surface_opacity_percent: 85,
     }
 }
 
@@ -117,7 +118,7 @@ fn glass_blur_defaults_to_zero_and_rejects_values_above_32px() {
 }
 
 #[test]
-fn schema_one_loads_without_writing_and_next_save_upgrades_to_schema_two() {
+fn schema_one_loads_without_writing_and_next_save_upgrades_to_current_schema() {
     let (store, root) = fixture_store("schema-one-migration");
     let path = root.join("settings").join("skin.json");
     fs::write(&path, persisted_json(7, valid_settings_json())).expect("应写入 schema 1 夹具");
@@ -143,14 +144,39 @@ fn schema_one_loads_without_writing_and_next_save_upgrades_to_schema_two() {
                 mask_tone: settings.mask_tone,
                 mask_opacity_percent: settings.mask_opacity_percent,
                 panel_opacity_percent: settings.panel_opacity_percent,
+                conversation_surface_opacity_percent: settings.conversation_surface_opacity_percent,
             },
         )
         .expect("显式保存应升级设置");
 
     let disk_after_save: serde_json::Value =
         serde_json::from_slice(&fs::read(&path).expect("应读取新设置")).expect("应解析新设置");
-    assert_eq!(disk_after_save["schema"], 2);
+    assert_eq!(disk_after_save["schema"], 3);
     assert_eq!(disk_after_save["settings"]["glass_blur_px"], 0);
+    assert_eq!(
+        disk_after_save["settings"]["conversation_surface_opacity_percent"],
+        85
+    );
+}
+
+#[test]
+fn schema_two_loads_with_default_conversation_surface_opacity() {
+    let (store, root) = fixture_store("schema-two-conversation-surface-default");
+    fs::write(
+        root.join("settings").join("skin.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 2,
+            "revision": 9,
+            "settings": valid_settings_v2_json(),
+        }))
+        .expect("应编码 schema 2 夹具"),
+    )
+    .expect("应写入 schema 2 夹具");
+
+    let loaded = store.load().expect("schema 2 应迁移到当前内存模型");
+    let settings = serde_json::to_value(loaded.settings).expect("设置应可序列化");
+
+    assert_eq!(settings["conversation_surface_opacity_percent"], 85);
 }
 
 #[test]
@@ -257,6 +283,10 @@ fn visual_bounds_and_noncanonical_digests_are_rejected() {
         },
         SkinDraft {
             panel_opacity_percent: 101,
+            ..valid_draft()
+        },
+        SkinDraft {
+            conversation_surface_opacity_percent: 101,
             ..valid_draft()
         },
         SkinDraft {

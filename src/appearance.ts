@@ -80,6 +80,8 @@ interface AppearanceViewRefs {
   maskOutput: HTMLOutputElement;
   imageOpacity: HTMLInputElement;
   imageOpacityOutput: HTMLOutputElement;
+  conversationSurfaceOpacity: HTMLInputElement;
+  conversationSurfaceOpacityOutput: HTMLOutputElement;
   status: HTMLElement;
   choose: HTMLButtonElement;
   save: HTMLButtonElement;
@@ -171,20 +173,20 @@ function patchAppearanceView(
   // hidden 同时关闭背景本体及其遮罩伪元素，不留下半透明覆盖层。
   refs.background.hidden = !state.draft.immersive;
   refs.content.style.filter = "";
+  const conversationSurfaceOpacity =
+    state.draft.conversationSurfaceOpacityPercent / 100;
+  const conversationSurfaceRgb =
+    state.draft.maskTone === "dark" ? "22, 28, 38" : "255, 255, 255";
+  refs.content.style.background = `rgba(${conversationSurfaceRgb}, ${conversationSurfaceOpacity})`;
   const glassBlur = state.draft.glassBlurPx;
   if (glassBlur === 0) {
     refs.content.style.removeProperty("backdrop-filter");
     (refs.content.style as WebkitBackdropStyle).webkitBackdropFilter = "";
-    refs.content.style.background = "transparent";
     refs.content.style.boxShadow = "none";
   } else {
     const glassFilter = `blur(${glassBlur}px) saturate(1.28)`;
     refs.content.style.setProperty("backdrop-filter", glassFilter);
     (refs.content.style as WebkitBackdropStyle).webkitBackdropFilter = glassFilter;
-    refs.content.style.background =
-      state.draft.maskTone === "dark"
-        ? "rgba(22, 28, 38, 0.36)"
-        : "rgba(255, 255, 255, 0.36)";
     refs.content.style.boxShadow =
       "inset 0 1px 0 rgba(255, 255, 255, 0.20), 0 18px 48px rgba(0, 0, 0, 0.18)";
   }
@@ -201,6 +203,10 @@ function patchAppearanceView(
   refs.maskOutput.textContent = `${state.draft.maskOpacityPercent}%`;
   refs.imageOpacity.value = String(state.draft.imageOpacityPercent);
   refs.imageOpacityOutput.textContent = `${state.draft.imageOpacityPercent}%`;
+  refs.conversationSurfaceOpacity.value = String(
+    state.draft.conversationSurfaceOpacityPercent,
+  );
+  refs.conversationSurfaceOpacityOutput.textContent = `${state.draft.conversationSurfaceOpacityPercent}%`;
 
   const hasImage = state.draft.imageDigest !== null;
   refs.imageNote.firstChild!.textContent = hasImage
@@ -404,6 +410,14 @@ export function renderAppearance(
       100,
       "image-opacity",
     ),
+    createSlider(
+      "skin-conversation-surface-opacity",
+      "输入框与我的消息不透明度",
+      state.draft.conversationSurfaceOpacityPercent,
+      0,
+      100,
+      "conversation-surface-opacity",
+    ),
     status,
     actions,
   );
@@ -429,6 +443,12 @@ export function renderAppearance(
     maskOutput: root.querySelector<HTMLOutputElement>("output[for='skin-mask']")!,
     imageOpacity: root.querySelector<HTMLInputElement>("#skin-image-opacity")!,
     imageOpacityOutput: root.querySelector<HTMLOutputElement>("output[for='skin-image-opacity']")!,
+    conversationSurfaceOpacity: root.querySelector<HTMLInputElement>(
+      "#skin-conversation-surface-opacity",
+    )!,
+    conversationSurfaceOpacityOutput: root.querySelector<HTMLOutputElement>(
+      "output[for='skin-conversation-surface-opacity']",
+    )!,
     status,
     choose,
     save,
@@ -478,6 +498,9 @@ export async function initializeAppearance(
     if (event.target.dataset.control === "mask") dispatch({ type: "visuals", maskOpacityPercent: value });
     if (event.target.dataset.control === "image-opacity") {
       dispatch({ type: "visuals", imageOpacityPercent: value });
+    }
+    if (event.target.dataset.control === "conversation-surface-opacity") {
+      dispatch({ type: "visuals", conversationSurfaceOpacityPercent: value });
     }
   };
 

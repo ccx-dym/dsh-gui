@@ -320,6 +320,7 @@ describe("启动页", () => {
             mask_tone: "light",
             mask_opacity_percent: 22,
             panel_opacity_percent: 88,
+            conversation_surface_opacity_percent: 85,
           },
         };
       }

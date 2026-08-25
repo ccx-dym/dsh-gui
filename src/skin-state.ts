@@ -22,6 +22,7 @@ export interface SkinSettingsWire {
   mask_tone: MaskTone;
   mask_opacity_percent: number;
   panel_opacity_percent: number;
+  conversation_surface_opacity_percent: number;
 }
 
 export interface SkinStateEnvelopeWire {
@@ -48,6 +49,7 @@ export interface SkinDraft {
   maskTone: MaskTone;
   maskOpacityPercent: number;
   imageOpacityPercent: number;
+  conversationSurfaceOpacityPercent: number;
 }
 
 export interface SkinEditorState {
@@ -71,6 +73,7 @@ export type SkinDraftAction =
       glassBlurPx?: number;
       maskOpacityPercent?: number;
       imageOpacityPercent?: number;
+      conversationSurfaceOpacityPercent?: number;
     }
   | { type: "image-selected" | "preview-image"; image: SkinImageView }
   | { type: "state-received"; envelope: SkinStateEnvelopeWire }
@@ -101,6 +104,11 @@ function draftFromWire(settings: SkinSettingsWire): SkinDraft {
     maskOpacityPercent: clampInteger(settings.mask_opacity_percent, 0, 80),
     // 保留旧 wire 字段名以兼容已经落盘的 schema 1 设置，领域语义改为图片不透明度。
     imageOpacityPercent: clampInteger(settings.panel_opacity_percent, 0, 100),
+    conversationSurfaceOpacityPercent: clampInteger(
+      settings.conversation_surface_opacity_percent,
+      0,
+      100,
+    ),
   };
 }
 
@@ -115,6 +123,11 @@ export function skinDraftToWire(draft: SkinDraft): SkinSettingsWire {
     mask_tone: draft.maskTone,
     mask_opacity_percent: clampInteger(draft.maskOpacityPercent, 0, 80),
     panel_opacity_percent: clampInteger(draft.imageOpacityPercent, 0, 100),
+    conversation_surface_opacity_percent: clampInteger(
+      draft.conversationSurfaceOpacityPercent,
+      0,
+      100,
+    ),
   };
 }
 
@@ -167,6 +180,10 @@ export function reduceSkinDraft(
             action.imageOpacityPercent === undefined
               ? state.draft.imageOpacityPercent
               : clampInteger(action.imageOpacityPercent, 0, 100),
+          conversationSurfaceOpacityPercent:
+            action.conversationSurfaceOpacityPercent === undefined
+              ? state.draft.conversationSurfaceOpacityPercent
+              : clampInteger(action.conversationSurfaceOpacityPercent, 0, 100),
         },
       };
     case "image-selected":
